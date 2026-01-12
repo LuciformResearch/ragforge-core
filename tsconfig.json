@@ -14,8 +14,10 @@
     "moduleResolution": "node",
     "resolveJsonModule": true,
     "paths": {
-      "@luciformresearch/codeparsers": ["./packages/codeparsers/src/index.ts"],
-      "@luciformresearch/codeparsers/*": ["./packages/codeparsers/src/*"]
+      "@luciformresearch/ragforge": ["./src/index.ts"],
+      "@luciformresearch/ragforge/*": ["./src/*"],
+      "@luciformresearch/codeparsers": ["./packages/codeparsers/dist/types/index.d.ts"],
+      "@luciformresearch/codeparsers/*": ["./packages/codeparsers/dist/types/*"]
     }
   },
   "include": ["src/**/*", "cli/**/*"],
