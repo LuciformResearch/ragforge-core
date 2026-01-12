@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "paths": {
+      "@luciformresearch/codeparsers": ["./packages/codeparsers/src/index.ts"],
+      "@luciformresearch/codeparsers/*": ["./packages/codeparsers/src/*"]
+    }
+  },
+  "include": ["src/**/*", "cli/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/test-*.ts", "packages"]
+}

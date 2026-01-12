@@ -1,0 +1,279 @@
+import { INeo4jClient } from '../database';
+import { IStructuredLLMExecutor } from '../llm';
+import { Document, RecursiveCharacterTextSplitter } from 'llamaindex'; // Import LlamaIndex components
+import { tika } from '@nisyaban/tika-server'; // Tika for parsing
+import path from 'node:path'; // For path manipulation
+
+/**
+ * Defines the schema for entities and relationships to be extracted from documents.
+ * This should be user-configurable in a real implementation.
+ */
+export interface GraphExtractionSchema {
+  entities: { label: string; properties: { name: string; type: string }[] }[];
+  relations: { label: string; source: string; target: string }[];
+}
+
+/**
+ * Expected output structure from the LLM for graph extraction.
+ */
+export interface ExtractedGraphData {
+  extractedEntities: Array<{ label: string; properties: Record<string, any> }>;
+  extractedRelationships: Array<{ 
+    source: { label: string; name: string }; // To identify source node
+    type: string;
+    target: { label: string; name: string }; // To identify target node
+    properties?: Record<string, any>;
+  }>;
+}
+
+
+/**
+ * A pipeline for ingesting documents, processing them using GraphRAG techniques,
+ * and storing the resulting knowledge graph in Neo4j.
+ */
+export class DocumentIngestionPipeline {
+  private neo4jClient: INeo4jClient;
+  private structuredLlmExecutor: IStructuredLLMExecutor;
+  private schema: GraphExtractionSchema;
+
+  constructor(
+    neo4jClient: INeo4jClient,
+    structuredLlmExecutor: IStructuredLLMExecutor,
+    schema: GraphExtractionSchema
+  ) {
+    this.neo4jClient = neo4jClient;
+    this.structuredLlmExecutor = structuredLlmExecutor;
+    this.schema = schema;
+  }
+
+  /**
+   * Runs the entire ingestion pipeline for a given document file path.
+   * @param filePath The path to the document to ingest.
+   */
+  async run(filePath: string): Promise<void> {
+    console.log(`Starting ingestion for: ${filePath}`);
+
+    // Étape 1: Parser le document pour extraire le texte brut avec Tika.
+    const rawText = await this.parseDocument(filePath);
+    console.log(`Document parsed with Tika. Extracted ${rawText.length} characters.`);
+
+    // Étape 2: Diviser le texte en "chunks" (morceaux) avec LlamaIndex.
+    const chunks = this.chunkText(rawText, filePath);
+    console.log(`Text divided into ${chunks.length} chunks.`);
+
+    // Étape 3: Pour chaque chunk, extraire les entités et relations via le LLM.
+    for (const chunk of chunks) {
+      // Utilise le IStructuredLLMExecutor pour l'extraction.
+      const graphEntities: ExtractedGraphData = await this.extractGraphFromChunk(chunk);
+      
+      // Étape 4: Stocker les chunks, entités, et relations dans Neo4j.
+      // Utilise le INeo4jClient pour écrire dans la base de données.
+      await this.storeGraphData(filePath, chunk, graphEntities);
+    }
+
+    // Étape 5: Créer l'index vectoriel sur les chunks pour la recherche sémantique.
+    await this.createVectorIndex();
+    console.log('Vector index created.');
+
+    console.log(`Ingestion finished for: ${filePath}`);
+  }
+
+  private async parseDocument(filePath: string): Promise<string> {
+    console.log(`[Tika] Parsing document from ${filePath}...`);
+    try {
+      // The tika library will start the tika-server.jar in the background
+      // on first use and communicate with it.
+      const text = await tika.text(filePath);
+      return text;
+    } catch (error) {
+      console.error(`Tika parsing failed for file: ${filePath}`, error);
+      throw error;
+    }
+  }
+
+  private chunkText(text: string, sourcePath: string): Document[] {
+    console.log('[LlamaIndex] Chunking text...');
+    
+    // Create a single LlamaIndex Document from the raw text
+    const document = new Document({
+      text: text,
+      metadata: {
+        filePath: sourcePath,
+        fileName: path.basename(sourcePath),
+      }
+    });
+
+    const splitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 1000,
+      chunkOverlap: 200,
+    });
+    
+    return splitter.splitDocuments([document]);
+  }
+
+  private async extractGraphFromChunk(chunk: Document): Promise<ExtractedGraphData> {
+    console.log('[Step 3] Extracting graph from chunk via IStructuredLLMExecutor.');
+    
+    // Dynamically construct JSON schema based on GraphExtractionSchema
+    const llmOutputSchema = {
+      type: 'object',
+      properties: {
+        extractedEntities: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', enum: this.schema.entities.map(e => e.label) },
+              properties: { type: 'object', additionalProperties: true }
+            },
+            required: ['label', 'properties']
+          }
+        },
+        extractedRelationships: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              source: { type: 'object', properties: { label: { type: 'string', enum: this.schema.entities.map(e => e.label) }, name: { type: 'string' } }, required: ['label', 'name'] },
+              target: { type: 'object', properties: { label: { type: 'string', enum: this.schema.entities.map(e => e.label) }, name: { type: 'string' } }, required: ['label', 'name'] },
+              type: { type: 'string', enum: this.schema.relations.map(r => r.label) },
+              properties: { type: 'object', additionalProperties: true }
+            },
+            required: ['source', 'target', 'type']
+          }
+        }
+      },
+      required: ['extractedEntities', 'extractedRelationships'],
+      additionalProperties: false
+    };
+
+    const extractionPrompt = `
+      You are an expert in extracting structured information from text.
+      Extract all relevant entities and relationships from the following text based on the provided Graph Extraction Schema and the target JSON output schema.
+      Focus on identifying entities and their key properties, and all meaningful relationships between them.
+
+      Graph Extraction Schema:
+      ${JSON.stringify(this.schema, null, 2)}
+
+      Text to analyze:
+      "${chunk.text}"
+
+      The output MUST be a JSON object conforming to the target JSON output schema below.
+      Ensure all extracted entities and relationships adhere strictly to the labels and types defined in the Graph Extraction Schema.
+
+      Target JSON Output Schema:
+      ${JSON.stringify(llmOutputSchema, null, 2)}
+
+      JSON Output:
+    `;
+    
+    return this.structuredLlmExecutor.generateStructured<ExtractedGraphData>(
+      extractionPrompt,
+      llmOutputSchema, // Pass the dynamically generated JSON schema
+      { model: 'gemini-1.5-flash' } // Example option, model might come from config
+    );
+  }
+
+  private async storeGraphData(sourcePath: string, chunk: Document, graphData: ExtractedGraphData): Promise<void> {
+    console.log('[Step 4] Storing graph data in Neo4j via INeo4jClient.');
+    
+    const cypherParts: string[] = [];
+    const params: Record<string, any> = {
+      sourcePath,
+      chunkId: chunk.id_,
+      chunkText: chunk.text,
+      embedding: null, // Placeholder for actual embedding, to be set in a later step
+    };
+
+    // MERGE Document and Chunk nodes, and link them
+    cypherParts.push(`
+      MERGE (d:Document {path: $sourcePath})
+      ON CREATE SET d.createdAt = datetime()
+      SET d.lastIngestedAt = datetime()
+
+      MERGE (c:Chunk {id: $chunkId})
+      ON CREATE SET c.createdAt = datetime()
+      SET c.text = $chunkText, c.embedding = $embedding
+      MERGE (d)-[:CONTAINS_CHUNK]->(c)
+    `);
+
+    // Add extracted entities
+    if (graphData.extractedEntities) {
+      graphData.extractedEntities.forEach((entity, index) => {
+        const entityNodeName = `e${index}`;
+        const entityLabel = entity.label;
+        const entityProps = entity.properties;
+
+        // Basic validation for entityLabel (Cypher labels must not contain special chars, etc.)
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(entityLabel)) {
+          console.warn(`Skipping entity with invalid label: ${entityLabel}`);
+          return;
+        }
+        
+        cypherParts.push(`
+          MERGE (${entityNodeName}:${entityLabel} {name: $${entityNodeName}Name})
+          ON CREATE SET ${entityNodeName}.createdAt = datetime()
+          SET ${entityNodeName} += $${entityNodeName}Props
+          MERGE (c)-[:HAS_ENTITY]->(${entityNodeName})
+        `);
+        params[`${entityNodeName}Name`] = entityProps.name; // Assuming 'name' is the primary identifier
+        params[`${entityNodeName}Props`] = entityProps;
+      });
+    }
+
+    // Add extracted relationships
+    if (graphData.extractedRelationships) {
+      graphData.extractedRelationships.forEach((rel, index) => {
+        const sourceNodeName = `src${index}`;
+        const targetNodeName = `tgt${index}`;
+        const sourceLabel = rel.source.label;
+        const sourceName = rel.source.name;
+        const targetLabel = rel.target.label;
+        const targetName = rel.target.name;
+        const relationshipType = rel.type;
+        const relProps = rel.properties || {};
+
+        // Basic validation for labels and relationshipType
+        if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(sourceLabel) || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(targetLabel) || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(relationshipType)) {
+          console.warn(`Skipping relationship with invalid labels or type: ${sourceLabel}-${relationshipType}-${targetLabel}`);
+          return;
+        }
+
+        cypherParts.push(`
+          MERGE (${sourceNodeName}:${sourceLabel} {name: $${sourceNodeName}Name})
+          MERGE (${targetNodeName}:${targetLabel} {name: $${targetNodeName}Name})
+          MERGE (${sourceNodeName})-[r${index}:${relationshipType}]->(${targetNodeName})
+          ON CREATE SET r${index}.createdAt = datetime()
+          SET r${index} += $r${index}Props
+        `);
+        params[`${sourceNodeName}Name`] = sourceName;
+        params[`${targetNodeName}Name`] = targetName;
+        params[`r${index}Props`] = relProps;
+      });
+    }
+
+    const finalCypher = cypherParts.join('\n');
+    await this.neo4jClient.run(finalCypher, params);
+  }
+
+  private async createVectorIndex(): Promise<void> {
+    console.log('[Step 5] Creating vector index via INeo4jClient.');
+    const cypher = `
+      CREATE VECTOR INDEX 
+chunkEmbeddings
+ IF NOT EXISTS
+      FOR (c:Chunk) ON (c.embedding) OPTIONS {
+        indexConfig: {
+          
+vector.dimensions
+: 768, // Gemini embedding dimension (check actual dimension of embedding model)
+          
+vector.similarity_function
+: 'cosine'
+        }
+      }
+    `;
+    await this.neo4jClient.run(cypher);
+    return Promise.resolve();
+  }
+}

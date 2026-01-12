@@ -1,0 +1,441 @@
+/**
+ * Document Source Adapter
+ *
+ * Parses documents (PDF, DOCX, Markdown, etc.) into Neo4j graph structure
+ * using LlamaIndex for document loading and chunking.
+ */
+
+import { globby } from 'globby';
+import { createHash } from 'crypto';
+import * as path from 'path';
+import { readFileSync, statSync } from 'fs';
+import {
+  SimpleDirectoryReader,
+  Document as LlamaDocument,
+  SentenceSplitter,
+  type BaseNode,
+  type TextNode,
+} from 'llamaindex';
+import {
+  SourceAdapter,
+  type SourceConfig,
+  type ParseOptions,
+  type ParseResult,
+  type ParsedNode,
+  type ParsedRelationship,
+  type ParsedGraph,
+  type ValidationResult,
+  type ParseProgress
+} from './types.js';
+import { UniqueIDHelper } from '../utils/UniqueIDHelper.js';
+import { getLocalTimestamp } from '../utils/timestamp.js';
+
+/**
+ * Document-specific source configuration
+ */
+export interface DocumentSourceConfig extends SourceConfig {
+  type: 'document';
+  adapter: 'llamaindex';
+  options?: {
+    /** Chunk size in characters/tokens */
+    chunk_size?: number;
+    /** Overlap between chunks */
+    chunk_overlap?: number;
+    /** Chunking strategy */
+    chunking_strategy?: 'fixed_size' | 'semantic' | 'sentence' | 'paragraph';
+    /** Preserve sentence boundaries */
+    preserve_sentences?: boolean;
+    /** Extract document metadata */
+    extract_metadata?: boolean;
+    /** Additional LlamaIndex options */
+    [key: string]: any;
+  };
+}
+
+/**
+ * Supported document types
+ */
+const SUPPORTED_EXTENSIONS = [
+  '.pdf',
+  '.docx',
+  '.doc',
+  '.md',
+  '.markdown',
+  '.txt',
+  '.html',
+  '.htm',
+  '.rtf',
+];
+
+/**
+ * Adapter for parsing document sources (PDFs, DOCX, Markdown, etc.)
+ */
+export class DocumentSourceAdapter extends SourceAdapter {
+  readonly type = 'document';
+  readonly adapterName = 'llamaindex';
+  private uuidCache: Map<string, Map<string, string>>; // filePath -> (key -> uuid)
+
+  constructor() {
+    super();
+    this.uuidCache = new Map();
+  }
+
+  /**
+   * Validate source configuration
+   */
+  async validate(config: SourceConfig): Promise<ValidationResult> {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    if (config.type !== 'document') {
+      errors.push(`Invalid source type: ${config.type}. Expected 'document'`);
+    }
+
+    if (!config.root) {
+      warnings.push('No root directory specified. Will use current working directory');
+    }
+
+    if (!config.include || config.include.length === 0) {
+      warnings.push('No include patterns specified. Will parse all documents in root directory');
+    }
+
+    // Validate options
+    const options = config.options as DocumentSourceConfig['options'];
+    if (options) {
+      if (options.chunk_size && options.chunk_size < 50) {
+        warnings.push('chunk_size is very small (<50 chars). This may create too many chunks.');
+      }
+
+      if (options.chunk_overlap && options.chunk_overlap >= (options.chunk_size || 1000)) {
+        errors.push('chunk_overlap must be less than chunk_size');
+      }
+
+      if (options.chunking_strategy && !['fixed_size', 'semantic', 'sentence', 'paragraph'].includes(options.chunking_strategy)) {
+        errors.push(`Invalid chunking_strategy: ${options.chunking_strategy}`);
+      }
+    }
+
+    return {
+      valid: errors.length === 0,
+      errors: errors.length > 0 ? errors : undefined,
+      warnings: warnings.length > 0 ? warnings : undefined,
+    };
+  }
+
+  /**
+   * Parse documents into Neo4j graph structure
+   */
+  async parse(options: ParseOptions): Promise<ParseResult> {
+    const startTime = Date.now();
+    const { source } = options;
+    const config = source as DocumentSourceConfig;
+
+    // Get default options
+    const chunkSize = config.options?.chunk_size ?? 500;
+    const chunkOverlap = config.options?.chunk_overlap ?? 50;
+    const chunkingStrategy = config.options?.chunking_strategy ?? 'sentence';
+    const preserveSentences = config.options?.preserve_sentences ?? true;
+
+    // Discover files
+    const rootDir = path.resolve(config.root || process.cwd());
+    const includePatterns = config.include || ['**/*'];
+    const excludePatterns = config.exclude || ['**/node_modules/**', '**/.git/**'];
+
+    options.onProgress?.({
+      phase: 'discovering',
+      filesProcessed: 0,
+      totalFiles: 0,
+      percentComplete: 0,
+    });
+
+    // Find matching files
+    const files = await globby(includePatterns, {
+      cwd: rootDir,
+      ignore: excludePatterns,
+      absolute: true,
+    });
+
+    // Filter by supported extensions
+    const documentFiles = files.filter(file => {
+      const ext = path.extname(file).toLowerCase();
+      return SUPPORTED_EXTENSIONS.includes(ext);
+    });
+
+    if (documentFiles.length === 0) {
+      return {
+        graph: {
+          nodes: [],
+          relationships: [],
+          metadata: {
+            filesProcessed: 0,
+            nodesGenerated: 0,
+            relationshipsGenerated: 0,
+            parseTimeMs: Date.now() - startTime,
+            warnings: ['No document files found matching the include patterns'],
+          },
+        },
+        isIncremental: false,
+      };
+    }
+
+    // Parse documents
+    options.onProgress?.({
+      phase: 'parsing',
+      filesProcessed: 0,
+      totalFiles: documentFiles.length,
+      percentComplete: 0,
+    });
+
+    const nodes: ParsedNode[] = [];
+    const relationships: ParsedRelationship[] = [];
+    const warnings: string[] = [];
+
+    for (let i = 0; i < documentFiles.length; i++) {
+      const filePath = documentFiles[i];
+      const relPath = path.relative(rootDir, filePath);
+
+      try {
+        options.onProgress?.({
+          phase: 'parsing',
+          currentFile: relPath,
+          filesProcessed: i,
+          totalFiles: documentFiles.length,
+          percentComplete: Math.round((i / documentFiles.length) * 100),
+        });
+
+        // Parse document
+        const result = await this.parseDocument(filePath, rootDir, {
+          chunkSize,
+          chunkOverlap,
+          chunkingStrategy,
+          preserveSentences,
+        });
+
+        nodes.push(...result.nodes);
+        relationships.push(...result.relationships);
+      } catch (error: any) {
+        warnings.push(`Failed to parse ${relPath}: ${error.message}`);
+      }
+    }
+
+    options.onProgress?.({
+      phase: 'complete',
+      filesProcessed: documentFiles.length,
+      totalFiles: documentFiles.length,
+      percentComplete: 100,
+    });
+
+    return {
+      graph: {
+        nodes,
+        relationships,
+        metadata: {
+          filesProcessed: documentFiles.length,
+          nodesGenerated: nodes.length,
+          relationshipsGenerated: relationships.length,
+          parseTimeMs: Date.now() - startTime,
+          warnings: warnings.length > 0 ? warnings : undefined,
+        },
+      },
+      isIncremental: false,
+    };
+  }
+
+  /**
+   * Parse a single document file
+   */
+  private async parseDocument(
+    filePath: string,
+    rootDir: string,
+    options: {
+      chunkSize: number;
+      chunkOverlap: number;
+      chunkingStrategy: string;
+      preserveSentences: boolean;
+    }
+  ): Promise<{ nodes: ParsedNode[]; relationships: ParsedRelationship[] }> {
+    const nodes: ParsedNode[] = [];
+    const relationships: ParsedRelationship[] = [];
+
+    // Get file metadata
+    const stats = statSync(filePath);
+    const relPath = path.relative(rootDir, filePath);
+    const ext = path.extname(filePath).toLowerCase().substring(1); // Remove leading dot
+    const fileName = path.basename(filePath, path.extname(filePath));
+
+    // Load document with LlamaIndex
+    const reader = new SimpleDirectoryReader();
+    const documents = await reader.loadData({
+      directoryPath: path.dirname(filePath),
+      // Note: LlamaIndex SimpleDirectoryReader loads all files in directory
+      // We'll filter to only our target file
+    });
+
+    // Filter to only our target file
+    const targetDoc = documents.find(doc => {
+      const docPath = doc.metadata?.file_path || doc.metadata?.filename || '';
+      return docPath === filePath || path.basename(docPath) === path.basename(filePath);
+    });
+
+    if (!targetDoc) {
+      throw new Error(`Document not loaded by LlamaIndex: ${filePath}`);
+    }
+
+    // Calculate content hash
+    const contentHash = createHash('md5').update(targetDoc.text).digest('hex');
+
+    // Generate Document UUID
+    const documentUuid = UniqueIDHelper.generateUUID('Document', relPath);
+
+    // Extract document metadata
+    const documentMetadata = targetDoc.metadata || {};
+    const title = documentMetadata.title || fileName;
+    const author = documentMetadata.author || undefined;
+    const createdAt = documentMetadata.created_at || stats.birthtime.toISOString();
+    const modifiedAt = documentMetadata.modified_at || stats.mtime.toISOString();
+
+    // Count words and pages (approximate)
+    const wordCount = targetDoc.text.split(/\s+/).filter(w => w.length > 0).length;
+    const pageCount = documentMetadata.page_count || Math.ceil(wordCount / 300); // Approx 300 words/page
+
+    // Create Document node
+    const documentNode: ParsedNode = {
+      labels: ['Document'],
+      id: documentUuid,
+      properties: {
+        uuid: documentUuid,
+        title,
+        path: relPath,
+        type: ext,
+        content_hash: contentHash,
+        author,
+        created_at: createdAt,
+        modified_at: modifiedAt,
+        word_count: wordCount,
+        page_count: pageCount,
+        language: documentMetadata.language || 'en',
+        ingested_at: getLocalTimestamp(),
+      },
+    };
+
+    nodes.push(documentNode);
+
+    // Chunk document
+    const chunks = await this.chunkDocument(targetDoc, options);
+
+    // Create Chunk nodes and relationships
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const chunkUuid = UniqueIDHelper.generateUUID('Chunk', `${relPath}:chunk-${i}`);
+
+      const chunkNode: ParsedNode = {
+        labels: ['Chunk'],
+        id: chunkUuid,
+        properties: {
+          uuid: chunkUuid,
+          content: chunk.text,
+          chunk_index: i,
+          start_char: chunk.start_char,
+          end_char: chunk.end_char,
+          word_count: chunk.text.split(/\s+/).filter(w => w.length > 0).length,
+          document_path: relPath,
+          ingested_at: getLocalTimestamp(),
+        },
+      };
+
+      nodes.push(chunkNode);
+
+      // Document CONTAINS Chunk
+      relationships.push({
+        type: 'CONTAINS',
+        from: documentUuid,
+        to: chunkUuid,
+        properties: {
+          position: i,
+        },
+      });
+
+      // Chunk IN_DOCUMENT Document
+      relationships.push({
+        type: 'IN_DOCUMENT',
+        from: chunkUuid,
+        to: documentUuid,
+      });
+
+      // Sequential linking: NEXT_CHUNK
+      if (i > 0) {
+        const prevChunkUuid = UniqueIDHelper.generateUUID('Chunk', `${relPath}:chunk-${i - 1}`);
+        relationships.push({
+          type: 'NEXT_CHUNK',
+          from: prevChunkUuid,
+          to: chunkUuid,
+        });
+      }
+    }
+
+    return { nodes, relationships };
+  }
+
+  /**
+   * Chunk document using LlamaIndex node parsers
+   */
+  private async chunkDocument(
+    document: LlamaDocument,
+    options: {
+      chunkSize: number;
+      chunkOverlap: number;
+      chunkingStrategy: string;
+      preserveSentences: boolean;
+    }
+  ): Promise<Array<{ text: string; start_char: number; end_char: number }>> {
+    // Use SentenceSplitter for most strategies
+    // (LlamaIndex supports different separators and chunking logic)
+    const splitter = new SentenceSplitter({
+      chunkSize: options.chunkSize,
+      chunkOverlap: options.chunkOverlap,
+      // paragraphSeparator: options.chunkingStrategy === 'paragraph' ? '\n\n' : undefined,
+      // sentenceSeparator: options.chunkingStrategy === 'sentence' ? '. ' : undefined,
+    });
+
+    // Split document into nodes
+    const nodes = splitter.getNodesFromDocuments([document]);
+
+    // Convert to our chunk format
+    const chunks: Array<{ text: string; start_char: number; end_char: number }> = [];
+    let currentOffset = 0;
+
+    for (const node of nodes) {
+      const textNode = node as TextNode;
+      const text = textNode.text;
+
+      chunks.push({
+        text,
+        start_char: currentOffset,
+        end_char: currentOffset + text.length,
+      });
+
+      currentOffset += text.length;
+    }
+
+    return chunks;
+  }
+
+  /**
+   * Get or generate UUID for a node
+   */
+  private getOrGenerateUUID(filePath: string, entityType: string, key: string): string {
+    if (!this.uuidCache.has(filePath)) {
+      this.uuidCache.set(filePath, new Map());
+    }
+
+    const fileCache = this.uuidCache.get(filePath)!;
+    const cacheKey = `${entityType}:${key}`;
+
+    if (!fileCache.has(cacheKey)) {
+      const uuid = UniqueIDHelper.generateUUID(entityType, key);
+      fileCache.set(cacheKey, uuid);
+    }
+
+    return fileCache.get(cacheKey)!;
+  }
+}

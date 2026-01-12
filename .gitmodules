@@ -1,0 +1,3 @@
+[submodule "packages/codeparsers"]
+	path = packages/codeparsers
+	url = git@github.com:LuciformResearch/LR_CodeParsers.git
