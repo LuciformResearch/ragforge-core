@@ -116,6 +116,11 @@ export {
   type FilterOperator,
   type ServiceSearchResult,
   type ServiceSearchResultSet,
+  // Grep types
+  type GrepOptions,
+  type GrepMatch,
+  type GrepResult,
+  type GrepResultSet,
 } from './search-service.js';
 
 // Formatters

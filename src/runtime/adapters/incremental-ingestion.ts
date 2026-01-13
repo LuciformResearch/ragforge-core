@@ -9,8 +9,10 @@ import type { Neo4jClient } from '../client/neo4j-client.js';
 import type { ParsedGraph, ParsedNode, ParsedRelationship, SourceConfig, SourceAdapter } from './types.js';
 import { UniversalSourceAdapter } from './universal-source-adapter.js';
 import { ChangeTracker } from './change-tracker.js';
-import { isStructuralNode } from '../../utils/node-schema.js';
+import { isStructuralNode, CONTENT_NODE_LABELS } from '../../utils/node-schema.js';
 import { addSchemaVersion } from '../../utils/schema-version.js';
+import { parserRegistry } from '../../ingestion/parser-registry.js';
+import { registerAllParsers, areParsersRegistered } from '../../ingestion/parsers/index.js';
 import { createHash } from 'crypto';
 import fg from 'fast-glob';
 import * as pathModule from 'path';
@@ -35,6 +37,43 @@ import {
   type BatchResult as FileProcessorBatchResult,
 } from '../../brain/file-processor.js';
 import { STATE_PROPERTIES as P } from '../../ingestion/state-types.js';
+
+/**
+ * Extract unified content fields (_name, _content, _description) from a node.
+ * Uses parserRegistry to get the appropriate FieldExtractors for each node type.
+ */
+function extractUnifiedFields(
+  labels: string[],
+  props: Record<string, unknown>
+): { _name?: string; _content?: string; _description?: string } {
+  const contentLabels = labels.filter(l => CONTENT_NODE_LABELS.has(l));
+
+  for (const label of contentLabels.reverse()) {
+    const nodeDef = parserRegistry.getNodeType(label);
+    if (nodeDef?.fields) {
+      const unified: { _name?: string; _content?: string; _description?: string } = {};
+
+      const name = nodeDef.fields.name(props);
+      if (name && name.length > 0) {
+        unified._name = name;
+      }
+
+      const content = nodeDef.fields.content(props);
+      if (content && content.length > 0) {
+        unified._content = content;
+      }
+
+      const description = nodeDef.fields.description?.(props);
+      if (description && description.length > 0) {
+        unified._description = description;
+      }
+
+      return unified;
+    }
+  }
+
+  return {};
+}
 
 export interface IncrementalStats {
   unchanged: number;
@@ -95,6 +134,11 @@ export class IncrementalIngestionManager {
 
   constructor(private client: Neo4jClient) {
     this.changeTracker = new ChangeTracker(client);
+
+    // Register all parsers to populate nodeTypeMap for extractUnifiedFields
+    if (!areParsersRegistered()) {
+      registerAllParsers();
+    }
   }
 
   /**
@@ -617,6 +661,14 @@ export class IncrementalIngestionManager {
 
       // Add schemaVersion to content nodes (for detecting schema changes)
       addSchemaVersion(node.labels, props);
+
+      // Extract unified fields (_name, _content, _description) for content nodes
+      // This enables single fulltext index and simplified grep/regex search
+      const isContentNode = node.labels.some(l => CONTENT_NODE_LABELS.has(l));
+      if (isContentNode) {
+        const unified = extractUnifiedFields(node.labels, props);
+        Object.assign(props, unified);
+      }
 
       if (!nodesByLabel.has(labels)) {
         nodesByLabel.set(labels, []);

@@ -707,78 +707,31 @@ export class BrainManager {
   private async ensureFullTextIndexes(): Promise<void> {
     if (!this.neo4jClient) return;
 
-    console.log('[Brain] Ensuring full-text indexes...');
+    console.log('[Brain] Ensuring unified full-text index...');
 
-    // Full-text index configurations
-    // Each index covers specific node types and their text fields
-    // Aligned with MULTI_EMBED_CONFIGS for consistency
-    const fullTextIndexes = [
-      {
-        name: 'scope_fulltext',
-        labels: ['Scope'],
-        properties: ['source', 'name', 'signature', 'docstring'], // +docstring for descriptions
-      },
-      {
-        name: 'file_fulltext',
-        labels: ['File'],
-        properties: ['path', 'source'], // File nodes with source code
-      },
-      {
-        name: 'datafile_fulltext',
-        labels: ['DataFile'],
-        properties: ['path', 'rawContent'], // JSON, YAML, etc.
-      },
-      {
-        name: 'document_fulltext',
-        labels: ['DocumentFile', 'PDFDocument', 'WordDocument', 'SpreadsheetDocument'],
-        properties: ['textContent', 'file', 'title'], // +title
-      },
-      {
-        name: 'markdown_fulltext',
-        labels: ['MarkdownDocument', 'MarkdownSection'],
-        properties: ['textContent', 'title', 'file', 'ownContent', 'content'], // +ownContent, content
-      },
-      {
-        name: 'media_fulltext',
-        labels: ['MediaFile', 'ImageFile', 'ThreeDFile'],
-        properties: ['textContent', 'description', 'file', 'path'], // +description, path
-      },
-      {
-        name: 'webpage_fulltext',
-        labels: ['WebPage'],
-        properties: ['textContent', 'title', 'url', 'metaDescription'], // +metaDescription
-      },
-      {
-        name: 'codeblock_fulltext',
-        labels: ['CodeBlock'],
-        properties: ['code', 'language'],
-      },
+    // Single unified fulltext index on _name, _content, _description
+    // These unified fields are extracted by GraphMerger.extractUnifiedFields()
+    // from the original type-specific fields (source, code, textContent, etc.)
+    const allContentLabels = [
+      'Scope', 'File', 'DataFile', 'DocumentFile', 'PDFDocument', 'WordDocument',
+      'SpreadsheetDocument', 'MarkdownDocument', 'MarkdownSection', 'MediaFile',
+      'ImageFile', 'ThreeDFile', 'WebPage', 'CodeBlock', 'VueSFC', 'SvelteComponent',
+      'Stylesheet', 'GenericFile', 'PackageJson', 'DataSection', 'WebDocument',
     ];
 
-    let created = 0;
-    let existed = 0;
+    try {
+      const labelsPart = allContentLabels.join('|');
+      const query = `CREATE FULLTEXT INDEX unified_fulltext IF NOT EXISTS FOR (n:${labelsPart}) ON EACH [n._name, n._content, n._description]`;
 
-    for (const config of fullTextIndexes) {
-      try {
-        // Neo4j full-text index syntax:
-        // CREATE FULLTEXT INDEX name IF NOT EXISTS FOR (n:Label1|Label2) ON EACH [n.prop1, n.prop2]
-        const labelsPart = config.labels.join('|');
-        const propsPart = config.properties.map(p => `n.${p}`).join(', ');
-
-        const query = `CREATE FULLTEXT INDEX ${config.name} IF NOT EXISTS FOR (n:${labelsPart}) ON EACH [${propsPart}]`;
-
-        await this.neo4jClient.run(query);
-        created++;
-      } catch (err: any) {
-        if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
-          existed++;
-        } else {
-          console.warn(`[Brain] Full-text index creation warning for ${config.name}: ${err.message}`);
-        }
+      await this.neo4jClient.run(query);
+      console.log('[Brain] Unified full-text index ensured');
+    } catch (err: any) {
+      if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
+        console.log('[Brain] Unified full-text index already exists');
+      } else {
+        console.warn(`[Brain] Full-text index creation warning: ${err.message}`);
       }
     }
-
-    console.log(`[Brain] Full-text indexes ensured (${created} created, ${existed} already existed)`);
   }
 
   /**

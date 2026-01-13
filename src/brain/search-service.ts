@@ -88,6 +88,8 @@ export interface SearchOptions {
   // Post-processing
   /** Glob pattern to filter results by file path */
   glob?: string;
+  /** Regex patterns to exclude from results (applied to file path) */
+  excludePatterns?: string[];
 }
 
 /**
@@ -133,6 +135,70 @@ export interface ServiceSearchResultSet {
   results: ServiceSearchResult[];
   /** Total count of results */
   totalCount: number;
+}
+
+// ============================================================================
+// Grep Types
+// ============================================================================
+
+/**
+ * Options for grep search
+ */
+export interface GrepOptions {
+  /** Regex pattern to search for */
+  pattern: string;
+  /** Case insensitive search (default: false) */
+  ignoreCase?: boolean;
+  /** Glob pattern to filter files (e.g., **\/*.ts) */
+  glob?: string;
+  /** Maximum number of results (default: 100) */
+  limit?: number;
+  /** Number of context lines before/after match (default: 0) */
+  contextLines?: number;
+  /** Filters to apply */
+  filters?: SearchFilter[];
+}
+
+/**
+ * A single grep match within a file
+ */
+export interface GrepMatch {
+  /** Line number (1-indexed) */
+  line: number;
+  /** The matched line content */
+  content: string;
+  /** The actual matched text */
+  match: string;
+  /** Context lines before the match */
+  contextBefore?: string[];
+  /** Context lines after the match */
+  contextAfter?: string[];
+}
+
+/**
+ * Grep result for a single node (scope/file/section)
+ */
+export interface GrepResult {
+  /** Node properties */
+  node: Record<string, any>;
+  /** File path */
+  filePath: string;
+  /** All matches in this node */
+  matches: GrepMatch[];
+  /** Total lines in the content */
+  totalLines: number;
+}
+
+/**
+ * Grep result set
+ */
+export interface GrepResultSet {
+  /** Results grouped by node */
+  results: GrepResult[];
+  /** Total number of matches across all files */
+  totalMatches: number;
+  /** Number of files with matches */
+  filesMatched: number;
 }
 
 // ============================================================================
@@ -227,6 +293,166 @@ export class SearchService {
       results,
       totalCount: results.length,
     };
+  }
+
+  // ============================================================================
+  // Grep Search
+  // ============================================================================
+
+  /**
+   * Grep search - regex pattern matching on _content field
+   *
+   * Searches indexed content using JavaScript regex (post-query filtering).
+   * Results include line numbers and optional context lines.
+   *
+   * @example
+   * ```typescript
+   * const results = await searchService.grep({
+   *   pattern: 'async function.*Handler',
+   *   glob: '**\/*.ts',
+   *   ignoreCase: true,
+   *   contextLines: 2,
+   * });
+   * ```
+   */
+  async grep(options: GrepOptions): Promise<GrepResultSet> {
+    const {
+      pattern,
+      ignoreCase = false,
+      glob,
+      limit = 100,
+      contextLines = 0,
+      filters = [],
+    } = options;
+
+    // Build regex
+    let regex: RegExp;
+    try {
+      regex = new RegExp(pattern, ignoreCase ? 'gi' : 'g');
+    } catch (err: any) {
+      throw new Error(`Invalid regex pattern: ${err.message}`);
+    }
+
+    // Build filter clause
+    const { filterClause, filterParams } = this.buildFilterClause(filters);
+
+    // Query nodes with _content field
+    // Use CONTAINS for initial filtering if pattern has a simple prefix
+    const simplePrefix = pattern.match(/^[\w]+/)?.[0];
+    const containsFilter = simplePrefix && simplePrefix.length >= 3
+      ? `AND n._content CONTAINS $simplePrefix`
+      : '';
+
+    const cypher = `
+      MATCH (n)
+      WHERE n._content IS NOT NULL ${filterClause} ${containsFilter}
+      RETURN n, labels(n) as labels
+      LIMIT 5000
+    `;
+
+    const params: Record<string, any> = {
+      ...filterParams,
+      ...(simplePrefix ? { simplePrefix } : {}),
+    };
+
+    const result = await this.neo4jClient.run(cypher, params);
+
+    const grepResults: GrepResult[] = [];
+    let totalMatches = 0;
+
+    for (const record of result.records) {
+      const node = record.get('n');
+      const labels = record.get('labels');
+      const content = node.properties._content as string;
+      const filePath = node.properties.absolutePath || node.properties.file || node.properties.path || '';
+
+      // Apply glob filter if specified
+      if (glob && !this.matchGlob(filePath, glob)) {
+        continue;
+      }
+
+      // Split content into lines
+      const lines = content.split('\n');
+      const matches: GrepMatch[] = [];
+
+      // Get startLine from node to compute absolute line numbers
+      const startLine = (node.properties.startLine as number) || 1;
+
+      // Reset regex for each file
+      regex.lastIndex = 0;
+
+      // Search each line
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        regex.lastIndex = 0;
+        const match = regex.exec(line);
+
+        if (match) {
+          const grepMatch: GrepMatch = {
+            line: startLine + i, // Absolute line number in original file
+            content: line,
+            match: match[0],
+          };
+
+          // Add context lines if requested
+          if (contextLines > 0) {
+            grepMatch.contextBefore = lines.slice(
+              Math.max(0, i - contextLines),
+              i
+            );
+            grepMatch.contextAfter = lines.slice(
+              i + 1,
+              Math.min(lines.length, i + 1 + contextLines)
+            );
+          }
+
+          matches.push(grepMatch);
+          totalMatches++;
+
+          // Check if we've hit the limit
+          if (totalMatches >= limit) break;
+        }
+      }
+
+      if (matches.length > 0) {
+        grepResults.push({
+          node: this.stripEmbeddingFields({ ...node.properties, labels }),
+          filePath,
+          matches,
+          totalLines: lines.length,
+        });
+      }
+
+      if (totalMatches >= limit) break;
+    }
+
+    return {
+      results: grepResults,
+      totalMatches,
+      filesMatched: grepResults.length,
+    };
+  }
+
+  /**
+   * Simple glob matcher for grep results
+   */
+  private matchGlob(filePath: string, pattern: string): boolean {
+    // Convert glob to regex
+    let regexPattern = pattern
+      .replace(/\./g, '\\.')
+      .replace(/\*\*/g, '<<<GLOBSTAR>>>')
+      .replace(/\*/g, '[^/]*')
+      .replace(/<<<GLOBSTAR>>>/g, '.*')
+      .replace(/\?/g, '.');
+
+    // Handle brace expansion
+    regexPattern = regexPattern.replace(/\{([^}]+)\}/g, (_, group) => {
+      const alternatives = group.split(',').map((s: string) => s.trim());
+      return `(${alternatives.join('|')})`;
+    });
+
+    const regex = new RegExp(regexPattern);
+    return regex.test(filePath);
   }
 
   // ============================================================================
@@ -585,7 +811,8 @@ export class SearchService {
   // ============================================================================
 
   /**
-   * Full-text search using Neo4j Lucene indexes (BM25)
+   * Full-text search using unified Neo4j Lucene index (BM25)
+   * Uses single unified_fulltext index on _name, _content, _description fields
    */
   private async fullTextSearch(
     query: string,
@@ -599,37 +826,23 @@ export class SearchService {
   ): Promise<ServiceSearchResult[]> {
     const { filterClause, params, limit, minScore, fuzzyDistance = 1 } = options;
 
-    // Full-text index names
-    const fullTextIndexes = [
-      'scope_fulltext',
-      'file_fulltext',
-      'datafile_fulltext',
-      'document_fulltext',
-      'markdown_fulltext',
-      'media_fulltext',
-      'webpage_fulltext',
-      'codeblock_fulltext',
-    ];
-
     // Escape Lucene special characters
     const escapedQuery = query.replace(/[+\-&|!(){}[\]^"~*?:\\/]/g, '\\$&');
 
-    // Build Lucene query with fuzzy matching
+    // Build Lucene query with field boosting and fuzzy matching
+    // _name (signatures/titles) get 3x boost, _description gets 2x boost, _content is baseline
     const words = escapedQuery.split(/\s+/).filter(w => w.length > 0);
-    const luceneQuery = fuzzyDistance === 0
-      ? words.join(' ')
-      : words.map(w => `${w}~${fuzzyDistance}`).join(' ');
+    const fuzzy = fuzzyDistance > 0 ? `~${fuzzyDistance}` : '';
+    const luceneQuery = words.map(w =>
+      `(_name:${w}${fuzzy}^3 OR _description:${w}${fuzzy}^2 OR _content:${w}${fuzzy})`
+    ).join(' AND ');
 
-    // Build UNION ALL query
-    const unionClauses = fullTextIndexes.map(indexName => `
-      CALL db.index.fulltext.queryNodes('${indexName}', $luceneQuery)
+    // Single query on unified fulltext index
+    const cypher = `
+      CALL db.index.fulltext.queryNodes('unified_fulltext', $luceneQuery)
       YIELD node AS n, score
       WHERE true ${filterClause}
       RETURN n, score
-    `);
-
-    const cypher = `
-      ${unionClauses.join('\nUNION ALL\n')}
       ORDER BY score DESC
       LIMIT $limit
     `;
@@ -638,20 +851,15 @@ export class SearchService {
       const result = await this.neo4jClient.run(cypher, {
         luceneQuery,
         ...params,
-        limit: neo4j.int(limit * 2),
+        limit: neo4j.int(limit),
       });
 
       const allResults: ServiceSearchResult[] = [];
-      const seenUuids = new Set<string>();
 
       for (const record of result.records) {
         const node = record.get('n');
         const rawNode = { ...node.properties, labels: node.labels };
-        const uuid = rawNode.uuid;
         const score = record.get('score');
-
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
 
         if (minScore !== undefined && score < minScore) continue;
 
@@ -660,98 +868,15 @@ export class SearchService {
           score,
           filePath: rawNode.absolutePath || rawNode.file || rawNode.path,
         });
-
-        if (allResults.length >= limit) break;
       }
 
       return allResults;
     } catch (err: any) {
-      // Fallback to parallel individual queries
       if (this.verbose) {
-        console.debug(`[SearchService] UNION query failed, using fallback: ${err.message}`);
+        console.debug(`[SearchService] Full-text search failed: ${err.message}`);
       }
-      return this.fullTextSearchFallback(luceneQuery, options);
+      return [];
     }
-  }
-
-  /**
-   * Fallback for full-text search when UNION fails
-   */
-  private async fullTextSearchFallback(
-    luceneQuery: string,
-    options: {
-      filterClause: string;
-      params: Record<string, any>;
-      limit: number;
-      minScore?: number;
-    }
-  ): Promise<ServiceSearchResult[]> {
-    const { filterClause, params, limit, minScore } = options;
-
-    const fullTextIndexes = [
-      'scope_fulltext',
-      'file_fulltext',
-      'datafile_fulltext',
-      'document_fulltext',
-      'markdown_fulltext',
-      'media_fulltext',
-      'webpage_fulltext',
-      'codeblock_fulltext',
-    ];
-
-    const cypher = `
-      CALL db.index.fulltext.queryNodes($indexName, $luceneQuery)
-      YIELD node AS n, score
-      WHERE true ${filterClause}
-      RETURN n, score
-      ORDER BY score DESC
-      LIMIT $limit
-    `;
-
-    const queryPromises = fullTextIndexes.map(async (indexName) => {
-      try {
-        const result = await this.neo4jClient.run(cypher, {
-          indexName,
-          luceneQuery,
-          ...params,
-          limit: neo4j.int(limit),
-        });
-        return { records: result.records };
-      } catch (err: any) {
-        if (this.verbose && !err.message?.includes('does not exist')) {
-          console.debug(`[SearchService] Full-text search failed for ${indexName}: ${err.message}`);
-        }
-        return { records: [] };
-      }
-    });
-
-    const queryResults = await Promise.all(queryPromises);
-
-    const allResults: ServiceSearchResult[] = [];
-    const seenUuids = new Set<string>();
-
-    for (const { records } of queryResults) {
-      for (const record of records) {
-        const node = record.get('n');
-        const rawNode = { ...node.properties, labels: node.labels };
-        const uuid = rawNode.uuid;
-        const score = record.get('score');
-
-        if (seenUuids.has(uuid)) continue;
-        seenUuids.add(uuid);
-
-        if (minScore !== undefined && score < minScore) continue;
-
-        allResults.push({
-          node: this.stripEmbeddingFields(rawNode),
-          score,
-          filePath: rawNode.absolutePath || rawNode.file || rawNode.path,
-        });
-      }
-    }
-
-    allResults.sort((a, b) => b.score - a.score);
-    return allResults.slice(0, limit);
   }
 
   // ============================================================================
@@ -909,10 +1034,21 @@ export class SearchService {
 
   /**
    * Apply glob pattern filter to results
+   * Supports: *, **, ?, {a,b,c} brace expansion
    */
   private applyGlobFilter(results: ServiceSearchResult[], pattern: string): ServiceSearchResult[] {
-    // Simple glob matching (supports * and **)
-    const regexPattern = pattern
+    // Expand brace patterns like {ts,tsx,js} to (ts|tsx|js)
+    let regexPattern = pattern;
+
+    // Handle brace expansion: {a,b,c} -> (a|b|c)
+    regexPattern = regexPattern.replace(/\{([^}]+)\}/g, (_, group) => {
+      const alternatives = group.split(',').map((s: string) => s.trim());
+      return `(${alternatives.join('|')})`;
+    });
+
+    // Handle glob patterns
+    regexPattern = regexPattern
+      .replace(/\./g, '\\.') // Escape dots
       .replace(/\*\*/g, '<<<GLOBSTAR>>>')
       .replace(/\*/g, '[^/]*')
       .replace(/<<<GLOBSTAR>>>/g, '.*')
