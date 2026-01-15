@@ -21,6 +21,7 @@ import type {
   ParseOutput,
   ChunkingConfig,
 } from './parser-types.js';
+import { setParserRegistryRef } from './parser-types.js';
 
 // ============================================================
 // FIELD MAPPING (auto-generated)
@@ -453,6 +454,9 @@ export class ParserRegistry {
  */
 export const parserRegistry = new ParserRegistry();
 
+// Initialize the registry reference for createNodeFromRegistry()
+setParserRegistryRef(parserRegistry);
+
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
@@ -534,46 +538,29 @@ export interface RecordEmbeddingExtractors {
 
 /**
  * Get embedding extractors for a label that work with Neo4j records.
- * Wraps the FieldExtractors from parser definitions.
+ *
+ * IMPORTANT: These extractors read directly from normalized fields (_name, _content, _description)
+ * that are stored on nodes. The FieldExtractors from parsers are used at node CREATION time
+ * to generate these normalized fields from raw properties.
  *
  * @param label - Node label (e.g., 'Scope', 'MarkdownSection')
  * @returns Extractors that take Neo4j records and return text
  */
-export function getRecordExtractors(label: string): RecordEmbeddingExtractors {
-  const nodeDef = parserRegistry.getNodeType(label);
-
-  if (!nodeDef) {
-    // Fallback for unknown/unregistered types
-    return {
-      name: (r) => {
-        const node = recordToObject(r);
-        return node.signature || node.title || node.name || node.path || '';
-      },
-      content: (r) => {
-        const node = recordToObject(r);
-        return node.source || node.content || node.textContent || '';
-      },
-      description: (r) => {
-        const node = recordToObject(r);
-        return node.docstring || node.description || '';
-      },
-    };
-  }
-
-  const fields = nodeDef.fields;
-
+export function getRecordExtractors(_label: string): RecordEmbeddingExtractors {
+  // Always read from normalized fields - these are set at node creation time
+  // by createContentNode/createNodeFromRegistry using the parser's FieldExtractors
   return {
     name: (r) => {
       const node = recordToObject(r);
-      return fields.name(node) || '';
+      return node._name || '';
     },
     content: (r) => {
       const node = recordToObject(r);
-      return fields.content(node) || '';
+      return node._content || '';
     },
     description: (r) => {
       const node = recordToObject(r);
-      return fields.description?.(node) || '';
+      return node._description || '';
     },
   };
 }

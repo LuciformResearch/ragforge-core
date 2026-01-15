@@ -1,0 +1,20 @@
+[Unit]
+Description=GLiNER Entity Extraction Service
+After=network.target
+
+[Service]
+Type=simple
+# IMPORTANT: Update User, WorkingDirectory, and Python path to match your installation
+User=luciedefraiteur
+WorkingDirectory=/home/luciedefraiteur/LR_CodeRag/community-docs/packages/ragforge-core/services/gliner_service
+Environment=PATH=/home/luciedefraiteur/miniconda3/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/luciedefraiteur/LR_CodeRag/community-docs/packages/ragforge-core/services
+Environment=GLINER_HOST=0.0.0.0
+Environment=GLINER_PORT=6971
+Environment=GLINER_DEVICE=cpu
+ExecStart=/home/luciedefraiteur/miniconda3/bin/python3 -m uvicorn gliner_service.main:app --host 0.0.0.0 --port 6971
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

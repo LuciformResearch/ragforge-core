@@ -1725,7 +1725,7 @@ export class ConversationStorage {
         // Skip nodes without line info (required for code context)
         if (node.startLine == null || node.endLine == null) continue;
 
-        const content = node.source || '';
+        const content = node._content || '';
         const charCount = content.length;
         const nodeType = node.type || 'unknown';
 
@@ -3311,7 +3311,7 @@ This directory is ${cwdStats.dominantType === 'code' ? 'primarily code files' : 
             if (cumulativeChars >= options.maxChars) break;
 
             const node = searchResult.node;
-            const content = node.source || node.content || '';
+            const content = node._content || '';
             const charCount = content.length;
             const score = searchResult.score || 0.5;
 

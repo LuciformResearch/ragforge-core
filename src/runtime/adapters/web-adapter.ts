@@ -25,6 +25,11 @@ import {
   type ParsedGraph,
   type ValidationResult,
 } from './types.js';
+import {
+  createNodeFromRegistry,
+  registerAllParsers,
+  areParsersRegistered,
+} from '../../ingestion/index.js';
 
 // ============================================
 // Types
@@ -65,6 +70,11 @@ export class WebAdapter {
    * Crawl and parse website into Neo4j graph structure
    */
   async parse(options: ParseOptions): Promise<ParseResult> {
+    // Ensure parsers are registered for createNodeFromRegistry
+    if (!areParsersRegistered()) {
+      registerAllParsers();
+    }
+
     const config = options.source;
 
     if (!config.web?.url) {
@@ -294,23 +304,21 @@ export class WebAdapter {
                           page.metaTags['og:description'] ||
                           page.textContent.slice(0, 200);
 
-      nodes.push({
-        labels: ['WebPage'],
-        id: pageId,
-        properties: {
-          uuid: pageId,
-          url: page.url,
-          title: page.title,
-          description,
-          textContent: page.textContent,
-          headingCount: page.headings.length,
-          linkCount: page.links.length,
-          depth: page.depth,
-          crawledAt: page.fetchedAt,
-          // Store headings as JSON string for vector search
-          headingsJson: JSON.stringify(page.headings),
-        },
-      });
+      // Build raw props - createNodeFromRegistry normalizes to _name, _content, _description
+      const webPageProps: Record<string, unknown> = {
+        uuid: pageId,
+        url: page.url,
+        title: page.title,
+        // Raw content fields - will be extracted to _content/_description then removed
+        description,
+        textContent: page.textContent,
+        headingCount: page.headings.length,
+        linkCount: page.links.length,
+        depth: page.depth,
+        crawledAt: page.fetchedAt,
+        headingsJson: JSON.stringify(page.headings),
+      };
+      nodes.push(createNodeFromRegistry('WebPage', pageId, webPageProps));
 
       // Website -> WebPage relationship
       relationships.push({

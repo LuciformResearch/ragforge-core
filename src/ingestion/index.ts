@@ -66,10 +66,22 @@ export type {
   ParserNodeLabels,
   NodeTypeMap,
   ParseStats,
+  // Normalized properties
+  NormalizedNodeProps,
 } from './parser-types.js';
 
-// Re-export the SYSTEM_PROPS constant
-export { SYSTEM_PROPS } from './parser-types.js';
+// Re-export constants and node builders
+export {
+  SYSTEM_PROPS,
+  RAW_CONTENT_PROPERTIES,
+  MAX_RAW_CONTENT_SIZE,
+  shouldStoreRawContent,
+  getRawContentProp,
+  createContentNode,
+  createStructuralNode,
+  createNodeFromRegistry,
+  setParserRegistryRef,
+} from './parser-types.js';
 
 // Parser registry (auto-generates FIELD_MAPPING and embed configs)
 export {
@@ -147,3 +159,37 @@ export {
   type LinkOptions,
   type LinkStats,
 } from './reference-linker.js';
+
+// ============================================================
+// ENTITY EXTRACTION (GLiNER integration)
+// ============================================================
+
+// Entity extraction client and transform hook
+export {
+  // Client
+  EntityExtractionClient,
+  getEntityExtractionClient,
+  resetEntityExtractionClient,
+  // Transform (for orchestrator)
+  createEntityExtractionTransform,
+  // Deduplication
+  deduplicateEntities,
+  findFuzzyDuplicates,
+  findEmbeddingDuplicates,
+  calculateSimilarity,
+  cosineSimilarity,
+  buildLLMResolutionPrompt,
+  // Types
+  type EntityExtractionConfig,
+  type EntityExtractionTransformOptions,
+  type ExtractedEntity,
+  type ExtractedRelation,
+  type ExtractionResult,
+  type DomainPreset,
+  type DuplicatePair,
+  type DeduplicationResult,
+  type DeduplicationConfig,
+  // Constants
+  DEFAULT_ENTITY_EXTRACTION_CONFIG,
+  DOMAIN_PRESETS,
+} from './entity-extraction/index.js';

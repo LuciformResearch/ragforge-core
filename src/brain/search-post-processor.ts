@@ -87,6 +87,9 @@ export interface GraphNode {
   parentLabel?: string;
   score: number | null;
   isSearchResult: boolean;
+  // Entity-specific fields (from GLiNER extraction)
+  entityType?: string;
+  confidence?: number;
 }
 
 /**
@@ -313,16 +316,19 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
     if (!nodeUuid) continue;
 
     // Add this result to graph nodes
-    // Note: MarkdownSection uses 'title' not 'name', and type comes from labels array
+    // Note: MarkdownSection uses 'title' not 'name', Entity uses '_name', type comes from labels array
     graphNodes.set(nodeUuid, {
       uuid: nodeUuid,
-      name: r.node?.name || r.node?.title || r.node?.heading || r.node?.signature || 'unnamed',
-      type: r.node?.type || r.node?.nodeType || r.node?.labels?.[0] || 'unknown',
+      name: r.node?._name || r.node?.name || r.node?.title || r.node?.heading || r.node?.signature || 'unnamed',
+      type: r.node?.entityType || r.node?.type || r.node?.nodeType || r.node?.labels?.[0] || 'unknown',
       file: r.node?.absolutePath || r.node?.file,
       startLine: r.node?.startLine,
       endLine: r.node?.endLine,
       score: r.score,
       isSearchResult: true,
+      // Entity-specific fields (from GLiNER extraction)
+      entityType: r.node?.entityType,
+      confidence: r.node?.confidence,
     });
   }
 
@@ -341,14 +347,15 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
 
     try {
       // Query outgoing and incoming relationships with full node properties
+      // Note: Entity nodes use _name instead of name, and entityType instead of type
       const queries = [
         {
           query: `
             MATCH (n {uuid: $uuid})-[rel]->(related)
             RETURN type(rel) as relationType,
                    related.uuid as relatedUuid,
-                   coalesce(related.name, related.title, related.signature) as relatedName,
-                   coalesce(related.type, labels(related)[0]) as relatedType,
+                   coalesce(related._name, related.name, related.title, related.signature) as relatedName,
+                   coalesce(related.entityType, related.type, labels(related)[0]) as relatedType,
                    coalesce(related.absolutePath, related.file) as relatedFile,
                    related.signature as relatedSignature,
                    related.docstring as relatedDocstring,
@@ -357,7 +364,9 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
                    related.absolutePath as relatedAbsolutePath,
                    related.relativePath as relatedRelativePath,
                    related.parentUuid as relatedParentUuid,
-                   related.parentLabel as relatedParentLabel
+                   related.parentLabel as relatedParentLabel,
+                   related.entityType as entityType,
+                   related.confidence as confidence
             LIMIT $limit
           `,
           isOutgoing: true,
@@ -367,8 +376,8 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
             MATCH (n {uuid: $uuid})<-[rel]-(related)
             RETURN type(rel) as relationType,
                    related.uuid as relatedUuid,
-                   coalesce(related.name, related.title, related.signature) as relatedName,
-                   coalesce(related.type, labels(related)[0]) as relatedType,
+                   coalesce(related._name, related.name, related.title, related.signature) as relatedName,
+                   coalesce(related.entityType, related.type, labels(related)[0]) as relatedType,
                    coalesce(related.absolutePath, related.file) as relatedFile,
                    related.signature as relatedSignature,
                    related.docstring as relatedDocstring,
@@ -377,7 +386,9 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
                    related.absolutePath as relatedAbsolutePath,
                    related.relativePath as relatedRelativePath,
                    related.parentUuid as relatedParentUuid,
-                   related.parentLabel as relatedParentLabel
+                   related.parentLabel as relatedParentLabel,
+                   related.entityType as entityType,
+                   related.confidence as confidence
             LIMIT $limit
           `,
           isOutgoing: false,
@@ -400,6 +411,9 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
           const relatedRelativePath = record.get('relatedRelativePath') as string | undefined;
           const relatedParentUuid = record.get('relatedParentUuid') as string | undefined;
           const relatedParentLabel = record.get('relatedParentLabel') as string | undefined;
+          // Entity-specific fields (from GLiNER extraction)
+          const entityType = record.get('entityType') as string | undefined;
+          const confidence = record.get('confidence') as number | undefined;
 
           // Add related node if not already present
           if (!graphNodes.has(relatedUuid)) {
@@ -418,6 +432,9 @@ export async function exploreRelationships<T extends ProcessableSearchResult>(
               parentLabel: relatedParentLabel,
               score: null,
               isSearchResult: false,
+              // Entity-specific fields
+              entityType,
+              confidence,
             });
           }
 
@@ -515,8 +532,8 @@ export async function summarizeSearchResults<T extends ProcessableSearchResult>(
       : node.startLine
         ? `${node.startLine}`
         : 'N/A';
-    const content = node.source || node.content || '';
-    const description = node.docstring || node.description || '';
+    const content = node._content || '';
+    const description = node._description || '';
     return `[${i + 1}] ${node.type || 'unknown'}: ${node.name || 'unnamed'}
 uuid: ${node.uuid || 'unknown'}
 file: ${absolutePath}

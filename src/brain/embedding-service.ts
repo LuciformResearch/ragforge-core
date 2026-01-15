@@ -226,9 +226,9 @@ export function hashContent(text: string): string {
  * This ensures gradual migration to the new parser system.
  */
 function buildEmbeddingConfigs(label: string, hasDescription: boolean = true): EmbeddingFieldConfig[] {
-  // Use parser-registry extractors if parsers are registered
-  // Otherwise fall back to legacy node-schema extractors
-  const extractors = areParsersRegistered()
+  // Helper to get extractors lazily at runtime (not at module load time)
+  // This ensures parsers are registered before extractors are used
+  const getExtractors = () => areParsersRegistered()
     ? getRecordExtractors(label)
     : getRecordEmbeddingExtractors(label);
 
@@ -236,7 +236,8 @@ function buildEmbeddingConfigs(label: string, hasDescription: boolean = true): E
     {
       propertyName: 'embedding_name',
       hashProperty: 'embedding_name_hash',
-      textExtractor: extractors.name,
+      // Lazy evaluation - get extractors at runtime when actually embedding
+      textExtractor: (record) => getExtractors().name(record),
     },
   ];
 
@@ -245,14 +246,14 @@ function buildEmbeddingConfigs(label: string, hasDescription: boolean = true): E
   configs.push({
     propertyName: 'embedding_content',
     hashProperty: 'embedding_content_hash',
-    textExtractor: extractors.content,
+    textExtractor: (record) => getExtractors().content(record),
   });
 
   if (hasDescription) {
     configs.push({
       propertyName: 'embedding_description',
       hashProperty: 'embedding_description_hash',
-      textExtractor: extractors.description,
+      textExtractor: (record) => getExtractors().description(record),
     });
   }
 
@@ -273,8 +274,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'Scope',
     query: `MATCH (s:Scope {projectId: $projectId})
-            RETURN s.uuid AS uuid, s.name AS name, s.signature AS signature,
-                   s.source AS source, s.docstring AS docstring,
+            RETURN s.uuid AS uuid, s._name AS _name, s._content AS _content, s._description AS _description,
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_description_hash AS embedding_description_hash,
@@ -287,8 +287,8 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'File',
     query: `MATCH (f:File {projectId: $projectId})
-            WHERE f.source IS NOT NULL
-            RETURN f.uuid AS uuid, f.path AS path, f.name AS name, f.source AS source,
+            WHERE f._rawContent IS NOT NULL
+            RETURN f.uuid AS uuid, f._name AS _name, f._rawContent AS _content,
                    f.embedding_name_hash AS embedding_name_hash,
                    f.embedding_content_hash AS embedding_content_hash,
                    f.embedding_provider AS embedding_provider,
@@ -299,8 +299,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'MarkdownDocument',
     query: `MATCH (m:MarkdownDocument {projectId: $projectId})
-            RETURN m.uuid AS uuid, m.file AS file, m.title AS title,
-                   m.frontMatter AS frontMatter,
+            RETURN m.uuid AS uuid, m._name AS _name, m._content AS _content, m._description AS _description,
                    m.embedding_name_hash AS embedding_name_hash,
                    m.embedding_content_hash AS embedding_content_hash,
                    m.embedding_description_hash AS embedding_description_hash,
@@ -312,7 +311,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'MarkdownSection',
     query: `MATCH (s:MarkdownSection {projectId: $projectId})
-            RETURN s.uuid AS uuid, s.title AS title, s.content AS content, s.ownContent AS ownContent,
+            RETURN s.uuid AS uuid, s._name AS _name, s._content AS _content,
                    s.startLine AS startLine, s.endLine AS endLine, s.pageNum AS pageNum,
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
@@ -324,8 +323,8 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'CodeBlock',
     query: `MATCH (c:CodeBlock {projectId: $projectId})
-            WHERE c.code IS NOT NULL AND size(c.code) > 10
-            RETURN c.uuid AS uuid, c.language AS language, c.code AS code,
+            WHERE c._content IS NOT NULL AND size(c._content) > 10
+            RETURN c.uuid AS uuid, c._name AS _name, c._content AS _content,
                    c.startLine AS startLine, c.endLine AS endLine,
                    c.embedding_name_hash AS embedding_name_hash,
                    c.embedding_content_hash AS embedding_content_hash,
@@ -337,8 +336,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'DataFile',
     query: `MATCH (d:DataFile {projectId: $projectId})
-            RETURN d.uuid AS uuid, d.path AS path, d.file AS file,
-                   d.rawContent AS rawContent, d.preview AS preview, d.structure AS structure,
+            RETURN d.uuid AS uuid, d._name AS _name, d._content AS _content,
                    d.embedding_name_hash AS embedding_name_hash,
                    d.embedding_content_hash AS embedding_content_hash,
                    d.embedding_provider AS embedding_provider,
@@ -349,8 +347,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'WebPage',
     query: `MATCH (w:WebPage {projectId: $projectId})
-            RETURN w.uuid AS uuid, w.url AS url, w.title AS title, w.textContent AS textContent,
-                   w.metaDescription AS metaDescription, w.description AS description,
+            RETURN w.uuid AS uuid, w._name AS _name, w._content AS _content, w._description AS _description,
                    w.embedding_name_hash AS embedding_name_hash,
                    w.embedding_content_hash AS embedding_content_hash,
                    w.embedding_description_hash AS embedding_description_hash,
@@ -362,9 +359,8 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'MediaFile',
     query: `MATCH (m:MediaFile {projectId: $projectId})
-            WHERE m.textContent IS NOT NULL OR m.description IS NOT NULL
-            RETURN m.uuid AS uuid, m.path AS path, m.file AS file,
-                   m.textContent AS textContent, m.ocrText AS ocrText, m.description AS description,
+            WHERE m._content IS NOT NULL OR m._description IS NOT NULL
+            RETURN m.uuid AS uuid, m._name AS _name, m._content AS _content, m._description AS _description,
                    m.embedding_name_hash AS embedding_name_hash,
                    m.embedding_content_hash AS embedding_content_hash,
                    m.embedding_description_hash AS embedding_description_hash,
@@ -376,9 +372,8 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'ThreeDFile',
     query: `MATCH (t:ThreeDFile {projectId: $projectId})
-            WHERE t.textContent IS NOT NULL OR t.description IS NOT NULL
-            RETURN t.uuid AS uuid, t.path AS path, t.file AS file,
-                   t.textContent AS textContent, t.description AS description,
+            WHERE t._content IS NOT NULL OR t._description IS NOT NULL
+            RETURN t.uuid AS uuid, t._name AS _name, t._content AS _content, t._description AS _description,
                    t.embedding_name_hash AS embedding_name_hash,
                    t.embedding_content_hash AS embedding_content_hash,
                    t.embedding_description_hash AS embedding_description_hash,
@@ -390,9 +385,8 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'DocumentFile',
     query: `MATCH (d:DocumentFile {projectId: $projectId})
-            WHERE d.textContent IS NOT NULL
-            RETURN d.uuid AS uuid, d.file AS file, d.path AS path, d.format AS format,
-                   d.textContent AS textContent, d.extractedText AS extractedText, d.title AS title,
+            WHERE d._content IS NOT NULL
+            RETURN d.uuid AS uuid, d._name AS _name, d._content AS _content, d._description AS _description,
                    d.embedding_name_hash AS embedding_name_hash,
                    d.embedding_content_hash AS embedding_content_hash,
                    d.embedding_description_hash AS embedding_description_hash,
@@ -400,6 +394,19 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    d.embedding_model AS embedding_model,
                    d.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('DocumentFile', true),
+  },
+  // Entity extraction (GLiNER)
+  {
+    label: 'Entity',
+    query: `MATCH (e:Entity {projectId: $projectId})
+            RETURN e.uuid AS uuid, e._name AS _name, e._content AS _content,
+                   e.entityType AS entityType, e.normalized AS normalized,
+                   e.embedding_name_hash AS embedding_name_hash,
+                   e.embedding_content_hash AS embedding_content_hash,
+                   e.embedding_provider AS embedding_provider,
+                   e.embedding_model AS embedding_model,
+                   e.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('Entity', false), // No separate description
   },
 ];
 
@@ -760,6 +767,17 @@ export class EmbeddingService {
   }
 
   /**
+   * Generate embeddings for a batch of texts (without storing).
+   * Useful for entity deduplication and other use cases.
+   */
+  async embedBatch(texts: string[]): Promise<number[][]> {
+    if (!this.embeddingProvider) {
+      throw new Error('No embedding provider configured');
+    }
+    return await this.embeddingProvider.embed(texts);
+  }
+
+  /**
    * Generate embedding for a single text and store it on a node
    */
   async embedSingleNode(uuid: string, text: string): Promise<boolean> {
@@ -984,7 +1002,7 @@ export class EmbeddingService {
           parentUuid: t.parentUuid,
           projectId,
           chunkIndex: t.chunkIndex,
-          text: t.text,
+          _content: t.text,
           startChar: t.startChar,
           endChar: t.endChar,
           startLine: t.startLine,
@@ -1005,7 +1023,7 @@ export class EmbeddingService {
              parentUuid: chunk.parentUuid,
              parentLabel: $parentLabel,
              chunkIndex: chunk.chunkIndex,
-             text: chunk.text,
+             _content: chunk._content,
              startChar: chunk.startChar,
              endChar: chunk.endChar,
              startLine: chunk.startLine,

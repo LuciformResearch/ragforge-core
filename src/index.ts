@@ -358,6 +358,34 @@ export type {
   FileChange,
   IngestionStats,
   ReingestOptions,
+  // Entity extraction types
+  EntityExtractionConfig,
+  EntityExtractionTransformOptions,
+  ExtractedEntity,
+  ExtractedRelation,
+  ExtractionResult,
+  DomainPreset,
+  // Deduplication types
+  DuplicatePair,
+  DeduplicationResult,
+  DeduplicationConfig,
+} from './ingestion/index.js';
+
+// Entity extraction (GLiNER integration)
+export {
+  EntityExtractionClient,
+  getEntityExtractionClient,
+  resetEntityExtractionClient,
+  createEntityExtractionTransform,
+  DEFAULT_ENTITY_EXTRACTION_CONFIG,
+  DOMAIN_PRESETS,
+  // Deduplication
+  deduplicateEntities,
+  findFuzzyDuplicates,
+  findEmbeddingDuplicates,
+  calculateSimilarity,
+  cosineSimilarity,
+  buildLLMResolutionPrompt,
 } from './ingestion/index.js';
 
 // ============================================

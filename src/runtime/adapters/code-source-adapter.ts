@@ -95,6 +95,13 @@ import {
   type DOCXInfo,
 } from './document-file-parser.js';
 import { DEFAULT_EXCLUDE_PATTERNS } from '../../ingestion/constants.js';
+import {
+  createNodeFromRegistry,
+  createStructuralNode,
+  registerAllParsers,
+  areParsersRegistered,
+  getRawContentProp,
+} from '../../ingestion/index.js';
 
 const execAsync = promisify(exec);
 
@@ -368,6 +375,11 @@ export class CodeSourceAdapter extends SourceAdapter {
     const startTime = Date.now();
     const config = options.source as CodeSourceConfig;
 
+    // Ensure parsers are registered for createNodeFromRegistry
+    if (!areParsersRegistered()) {
+      registerAllParsers();
+    }
+
     // Detect project information
     const projectRoot = config.root || process.cwd();
     const projectInfo = await this.detectProjectInfo(projectRoot);
@@ -618,7 +630,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     dataFiles: Map<string, DataFileInfo>;
     mediaFiles: Map<string, MediaFileInfo>;
     documentFiles: Map<string, DocumentFileInfo>;
-    fileMetadata: Map<string, { rawContentHash: string; mtime: string }>;
+    fileMetadata: Map<string, { rawContentHash: string; mtime: string; rawContent?: string }>;
   }> {
     const codeFiles = new Map<string, ScopeFileAnalysis>();
     const htmlFiles = new Map<string, HTMLParseResult>();
@@ -632,8 +644,8 @@ export class CodeSourceAdapter extends SourceAdapter {
     const dataFiles = new Map<string, DataFileInfo>();
     const mediaFiles = new Map<string, MediaFileInfo>();
     const documentFiles = new Map<string, DocumentFileInfo>();
-    // Pre-computed file metadata (hash + mtime) to avoid re-reading files in buildGraph
-    const fileMetadata = new Map<string, { rawContentHash: string; mtime: string }>();
+    // Pre-computed file metadata (hash + mtime + optional raw content) to avoid re-reading files in buildGraph
+    const fileMetadata = new Map<string, { rawContentHash: string; mtime: string; rawContent?: string }>();
 
     // Use p-limit for parallel processing (10 concurrent files)
     const limit = pLimit(10);
@@ -728,11 +740,12 @@ export class CodeSourceAdapter extends SourceAdapter {
           console.log(`   📖 Read ${file} (${content.length} chars)`);
         }
 
-        // Pre-compute file metadata (hash + mtime)
+        // Pre-compute file metadata (hash + mtime + optional raw content)
         const rawContentHash = createHash('sha256').update(content).digest('hex');
         fileMetadata.set(file, {
           rawContentHash,
-          mtime
+          mtime,
+          rawContent: getRawContentProp(content),
         });
 
         // Handle package.json files
@@ -944,7 +957,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       dataFiles: Map<string, DataFileInfo>;
       mediaFiles: Map<string, MediaFileInfo>;
       documentFiles: Map<string, DocumentFileInfo>;
-      fileMetadata: Map<string, { rawContentHash: string; mtime: string }>;
+      fileMetadata: Map<string, { rawContentHash: string; mtime: string; rawContent?: string }>;
     },
     config: CodeSourceConfig,
     resolver: ImportResolver,
@@ -1035,7 +1048,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const fileName = path.basename(filePath);
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash, mtime, rawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1049,6 +1062,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           extension: '.json',
           ...(rawContentHash && { rawContentHash }),
           ...(mtime && { mtime }),
+          ...(rawContent && { _rawContent: rawContent }),
         }
       });
 
@@ -1113,74 +1127,71 @@ export class CodeSourceAdapter extends SourceAdapter {
         // Extract TypeScript-specific metadata (Phase 3)
         const tsMetadata = (scope as any).languageSpecific?.typescript;
 
-        nodes.push({
-          labels: ['Scope'],
-          id: uuid,
-          properties: {
-            uuid,
-            name: scope.name,
-            type: scope.type,
-            file: relPath, // Use relative path
-            absolutePath: filePath, // Canonical identifier
-            language: config.adapter, // NEW: language (typescript/python)
-            startLine: scope.startLine,
-            endLine: scope.endLine,
-            linesOfCode: scope.linesOfCode || (scope.endLine - scope.startLine + 1),
-            source: scope.content || '',
-            signature: this.extractSignature(scope),
-            hash: this.hashScope(scope),
-            // Additional properties from ScopeInfo
-            ...(scope.returnType && { returnType: scope.returnType }),
-            ...(scope.parameters && scope.parameters.length > 0 && {
-              parameters: JSON.stringify(scope.parameters)
-            }),
-            ...(scope.parent && { parent: scope.parent }),
-            ...(parentUuid && { parentUUID: parentUuid }), // parentUUID
-            ...(scope.depth !== undefined && { depth: scope.depth }),
-            ...(scope.modifiers && scope.modifiers.length > 0 && {
-              modifiers: scope.modifiers.join(',')
-            }),
-            ...(scope.complexity !== undefined && { complexity: scope.complexity }),
+        // Build raw properties - createNodeFromRegistry will normalize to _name, _content, _description
+        const rawProps: Record<string, unknown> = {
+          uuid,
+          name: scope.name,
+          type: scope.type,
+          file: relPath,
+          absolutePath: filePath,
+          language: config.adapter,
+          startLine: scope.startLine,
+          endLine: scope.endLine,
+          linesOfCode: scope.linesOfCode || (scope.endLine - scope.startLine + 1),
+          // Raw content fields - will be extracted to _content/_description then removed
+          source: scope.content || '',
+          signature: this.extractSignature(scope),
+          hash: this.hashScope(scope),
+          // Additional properties from ScopeInfo
+          ...(scope.returnType && { returnType: scope.returnType }),
+          ...(scope.parameters && scope.parameters.length > 0 && {
+            parameters: JSON.stringify(scope.parameters)
+          }),
+          ...(scope.parent && { parent: scope.parent }),
+          ...(parentUuid && { parentUUID: parentUuid }),
+          ...(scope.depth !== undefined && { depth: scope.depth }),
+          ...(scope.modifiers && scope.modifiers.length > 0 && {
+            modifiers: scope.modifiers.join(',')
+          }),
+          ...(scope.complexity !== undefined && { complexity: scope.complexity }),
+          // Phase 3: Heritage clauses (extends/implements)
+          ...(tsMetadata?.heritageClauses && tsMetadata.heritageClauses.length > 0 && {
+            heritageClauses: JSON.stringify(tsMetadata.heritageClauses),
+            extends: tsMetadata.heritageClauses
+              .filter((c: any) => c.clause === 'extends')
+              .flatMap((c: any) => c.types)
+              .join(','),
+            implements: tsMetadata.heritageClauses
+              .filter((c: any) => c.clause === 'implements')
+              .flatMap((c: any) => c.types)
+              .join(',')
+          }),
+          // Phase 3: Generic parameters
+          ...(tsMetadata?.genericParameters && tsMetadata.genericParameters.length > 0 && {
+            genericParameters: JSON.stringify(tsMetadata.genericParameters),
+            generics: tsMetadata.genericParameters.map((g: any) => g.name).join(',')
+          }),
+          // Phase 3: Decorators (TypeScript)
+          ...(tsMetadata?.decoratorDetails && tsMetadata.decoratorDetails.length > 0 && {
+            decoratorDetails: JSON.stringify(tsMetadata.decoratorDetails),
+            decorators: tsMetadata.decoratorDetails.map((d: any) => d.name).join(',')
+          }),
+          // Phase 3: Enum members
+          ...(tsMetadata?.enumMembers && tsMetadata.enumMembers.length > 0 && {
+            enumMembers: JSON.stringify(tsMetadata.enumMembers)
+          }),
+          // Python-specific
+          ...((scope as any).decorators && (scope as any).decorators.length > 0 && {
+            decorators: (scope as any).decorators.join(',')
+          }),
+          ...((scope as any).docstring && { docstring: (scope as any).docstring }),
+          // For constants/variables
+          ...(scope.value && { value: scope.value })
+        };
 
-            // Phase 3: Heritage clauses (extends/implements)
-            ...(tsMetadata?.heritageClauses && tsMetadata.heritageClauses.length > 0 && {
-              heritageClauses: JSON.stringify(tsMetadata.heritageClauses),
-              extends: tsMetadata.heritageClauses
-                .filter((c: any) => c.clause === 'extends')
-                .flatMap((c: any) => c.types)
-                .join(','),
-              implements: tsMetadata.heritageClauses
-                .filter((c: any) => c.clause === 'implements')
-                .flatMap((c: any) => c.types)
-                .join(',')
-            }),
-
-            // Phase 3: Generic parameters
-            ...(tsMetadata?.genericParameters && tsMetadata.genericParameters.length > 0 && {
-              genericParameters: JSON.stringify(tsMetadata.genericParameters),
-              generics: tsMetadata.genericParameters.map((g: any) => g.name).join(',')
-            }),
-
-            // Phase 3: Decorators (TypeScript)
-            ...(tsMetadata?.decoratorDetails && tsMetadata.decoratorDetails.length > 0 && {
-              decoratorDetails: JSON.stringify(tsMetadata.decoratorDetails),
-              decorators: tsMetadata.decoratorDetails.map((d: any) => d.name).join(',')
-            }),
-
-            // Phase 3: Enum members
-            ...(tsMetadata?.enumMembers && tsMetadata.enumMembers.length > 0 && {
-              enumMembers: JSON.stringify(tsMetadata.enumMembers)
-            }),
-
-            // Python-specific
-            ...((scope as any).decorators && (scope as any).decorators.length > 0 && {
-              decorators: (scope as any).decorators.join(',')
-            }),
-            ...((scope as any).docstring && { docstring: (scope as any).docstring }),
-            // For constants/variables
-            ...(scope.value && { value: scope.value })
-          }
-        });
+        // Create node with normalized properties (_name, _content, _description)
+        // Raw content fields (source, docstring) are removed automatically
+        nodes.push(createNodeFromRegistry('Scope', uuid, rawProps));
 
         // Create HAS_PARENT relationship if parent exists
         if (parentUuid) {
@@ -1208,7 +1219,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const contentHash = createHash('sha256').update(analysis.scopes.map(s => s.content || '').join('')).digest('hex');
 
       // Use pre-computed file metadata (computed during parallel parsing)
-      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash, mtime, rawContent } = fileMetadata.get(filePath) || {};
 
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       nodes.push({
@@ -1223,6 +1234,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash,
           ...(rawContentHash && { rawContentHash }),
           ...(mtime && { mtime }),
+          ...(rawContent && { _rawContent: rawContent }),
           ...(analysis.totalLines && { lineCount: analysis.totalLines }),
         }
       });
@@ -1409,7 +1421,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash, mtime, rawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1424,6 +1436,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: doc.hash,
           ...(rawContentHash && { rawContentHash }),
           ...(mtime && { mtime }),
+          ...(rawContent && { _rawContent: rawContent }),
         }
       });
 
@@ -1593,7 +1606,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash, mtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash, mtime, rawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1608,6 +1621,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: stylesheet.hash,
           ...(rawContentHash && { rawContentHash }),
           ...(mtime && { mtime }),
+          ...(rawContent && { _rawContent: rawContent }),
         }
       });
 
@@ -1734,7 +1748,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: scssRawHash, mtime: scssMtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash: scssRawHash, mtime: scssMtime, rawContent: scssRawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1749,6 +1763,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: stylesheet.hash,
           ...(scssRawHash && { rawContentHash: scssRawHash }),
           ...(scssMtime && { mtime: scssMtime }),
+          ...(scssRawContent && { _rawContent: scssRawContent }),
         }
       });
 
@@ -1808,7 +1823,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.vue';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: vueRawHash, mtime: vueMtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash: vueRawHash, mtime: vueMtime, rawContent: vueRawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1823,6 +1838,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: sfc.hash,
           ...(vueRawHash && { rawContentHash: vueRawHash }),
           ...(vueMtime && { mtime: vueMtime }),
+          ...(vueRawContent && { _rawContent: vueRawContent }),
         }
       });
 
@@ -1881,7 +1897,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = '.svelte';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: svelteRawHash, mtime: svelteMtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash: svelteRawHash, mtime: svelteMtime, rawContent: svelteRawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1896,6 +1912,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: component.hash,
           ...(svelteRawHash && { rawContentHash: svelteRawHash }),
           ...(svelteMtime && { mtime: svelteMtime }),
+          ...(svelteRawContent && { _rawContent: svelteRawContent }),
         }
       });
 
@@ -1958,7 +1975,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: mdRawHash, mtime: mdMtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash: mdRawHash, mtime: mdMtime, rawContent: mdRawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -1973,6 +1990,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: doc.hash,
           ...(mdRawHash && { rawContentHash: mdRawHash }),
           ...(mdMtime && { mtime: mdMtime }),
+          ...(mdRawContent && { _rawContent: mdRawContent }),
         }
       });
 
@@ -1998,23 +2016,20 @@ export class CodeSourceAdapter extends SourceAdapter {
           // Compute hash from code for incremental ingestion
           const blockHash = createHash('sha256').update(block.code || '').digest('hex').slice(0, 16);
 
-          nodes.push({
-            labels: ['CodeBlock'],
-            id: blockId,
-            properties: {
-              uuid: blockId,
-              projectId,
-              file: relPath,
-              absolutePath: filePath,
-              language: block.language || 'text',
-              code: block.code,
-              rawText: block.code, // For unified search
-              hash: blockHash, // Required for incremental ingestion
-              startLine: block.startLine,
-              endLine: block.endLine,
-              index: i
-            }
-          });
+          // Build raw props - createNodeFromRegistry normalizes to _name, _content, _description
+          const codeBlockProps: Record<string, unknown> = {
+            uuid: blockId,
+            projectId,
+            file: relPath,
+            absolutePath: filePath,
+            language: block.language || 'text',
+            code: block.code, // Will be extracted to _content then removed
+            hash: blockHash,
+            startLine: block.startLine,
+            endLine: block.endLine,
+            index: i
+          };
+          nodes.push(createNodeFromRegistry('CodeBlock', blockId, codeBlockProps));
 
           relationships.push({
             type: 'CONTAINS_CODE',
@@ -2031,29 +2046,25 @@ export class CodeSourceAdapter extends SourceAdapter {
           // Compute hash from content for incremental ingestion
           const sectionHash = createHash('sha256').update(section.content || '').digest('hex').slice(0, 16);
 
-          nodes.push({
-            labels: ['MarkdownSection'],
-            id: sectionId,
-            properties: {
-              uuid: sectionId,
-              projectId,
-              file: relPath,
-              absolutePath: filePath,
-              title: section.title,
-              level: section.level,
-              slug: section.slug,
-              // Store both full content and own content for different search needs
-              content: section.content,
-              ownContent: section.ownContent,
-              // rawText for unified search compatibility
-              rawText: section.content,
-              hash: sectionHash, // Required for incremental ingestion
-              startLine: section.startLine,
-              endLine: section.endLine,
-              ...(section.parentTitle && { parentTitle: section.parentTitle }),
-              indexedAt: getLocalTimestamp()
-            }
-          });
+          // Build raw props - createNodeFromRegistry normalizes to _name, _content, _description
+          const sectionProps: Record<string, unknown> = {
+            uuid: sectionId,
+            projectId,
+            file: relPath,
+            absolutePath: filePath,
+            title: section.title,
+            level: section.level,
+            slug: section.slug,
+            // Raw content fields - will be extracted to _content then removed
+            content: section.content,
+            ownContent: section.ownContent,
+            hash: sectionHash,
+            startLine: section.startLine,
+            endLine: section.endLine,
+            ...(section.parentTitle && { parentTitle: section.parentTitle }),
+            indexedAt: getLocalTimestamp()
+          };
+          nodes.push(createNodeFromRegistry('MarkdownSection', sectionId, sectionProps));
 
           relationships.push({
             type: 'HAS_SECTION',
@@ -2110,7 +2121,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: genericRawHash, mtime: genericMtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash: genericRawHash, mtime: genericMtime, rawContent: genericRawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2125,6 +2136,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: genericResult.hash,
           ...(genericRawHash && { rawContentHash: genericRawHash }),
           ...(genericMtime && { mtime: genericMtime }),
+          ...(genericRawContent && { _rawContent: genericRawContent }),
         }
       });
 
@@ -2192,7 +2204,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = fileName.includes('.') ? fileName.substring(fileName.lastIndexOf('.')) : '';
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
-      const { rawContentHash: dataRawHash, mtime: dataMtime } = fileMetadata.get(filePath) || {};
+      const { rawContentHash: dataRawHash, mtime: dataMtime, rawContent: dataRawContent } = fileMetadata.get(filePath) || {};
 
       nodes.push({
         labels: ['File'],
@@ -2207,6 +2219,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: dataInfo.hash,
           ...(dataRawHash && { rawContentHash: dataRawHash }),
           ...(dataMtime && { mtime: dataMtime }),
+          ...(dataRawContent && { _rawContent: dataRawContent }),
         }
       });
 
@@ -2390,6 +2403,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       });
 
       // Create File node for media file
+      // Note: Binary files (images/audio/video) don't have _rawContent
       const fileName = getLastSegment(relPath);
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
@@ -2486,11 +2500,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       });
 
       // Create File node for document file
+      // For binary documents (PDF/DOCX), use extracted text as _rawContent
       const fileName = getLastSegment(relPath);
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
       const extension = path.extname(relPath);
       const fileUuid = UniqueIDHelper.GenerateFileUUID(filePath);
       const { rawContentHash: docRawHash, mtime: docMtime } = fileMetadata.get(filePath) || {};
+      const docRawContent = getRawContentProp(docInfo.textContent);
 
       nodes.push({
         labels: ['File'],
@@ -2505,6 +2521,7 @@ export class CodeSourceAdapter extends SourceAdapter {
           contentHash: docInfo.hash,
           ...(docRawHash && { rawContentHash: docRawHash }),
           ...(docMtime && { mtime: docMtime }),
+          ...(docRawContent && { _rawContent: docRawContent }),
         }
       });
 
@@ -2607,21 +2624,20 @@ export class CodeSourceAdapter extends SourceAdapter {
   ): void {
     const sectionId = UniqueIDHelper.GenerateDataSectionUUID(absolutePath, section.path);
 
-    nodes.push({
-      labels: ['DataSection'],
-      id: sectionId,
-      properties: {
-        uuid: sectionId,
-        path: section.path,
-        key: section.key,
-        content: section.content.length > 10000
-          ? section.content.substring(0, 10000) + '...[truncated]'
-          : section.content,
-        depth: section.depth,
-        valueType: section.valueType,
-        childCount: section.children?.length ?? 0
-      }
-    });
+    // Build raw props - createNodeFromRegistry normalizes to _name, _content, _description
+    const dataSectionProps: Record<string, unknown> = {
+      uuid: sectionId,
+      path: section.path,
+      key: section.key,
+      // Raw content - will be extracted to _content then removed
+      content: section.content.length > 10000
+        ? section.content.substring(0, 10000) + '...[truncated]'
+        : section.content,
+      depth: section.depth,
+      valueType: section.valueType,
+      childCount: section.children?.length ?? 0
+    };
+    nodes.push(createNodeFromRegistry('DataSection', sectionId, dataSectionProps));
 
     // Link to parent (DataFile or parent DataSection)
     relationships.push({

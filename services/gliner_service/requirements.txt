@@ -1,0 +1,19 @@
+# GLiNER Entity Extraction Service
+
+# GLiNER2 - NER model
+gliner2>=0.1.0
+
+# API server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Data validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Configuration
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+
+# Utilities
+httpx>=0.28.0  # For health checks

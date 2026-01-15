@@ -1497,6 +1497,10 @@ async function summarizeBrainSearchResults(
       absolutePath?: string;
       startLine?: number;
       endLine?: number;
+      // Normalized properties (preferred)
+      _content?: string;
+      _description?: string;
+      // Legacy properties (deprecated)
       content?: string;
       source?: string;
       description?: string;
@@ -1536,8 +1540,8 @@ async function summarizeBrainSearchResults(
       : node.startLine
         ? `${node.startLine}`
         : 'N/A';
-    const content = node.source || node.content || '';
-    const description = node.docstring || node.description || '';
+    const content = node._content || '';
+    const description = node._description || '';
     return `[${i + 1}] ${node.type || 'unknown'}: ${node.name || 'unnamed'}
 uuid: ${node.uuid || 'unknown'}
 file: ${absolutePath}

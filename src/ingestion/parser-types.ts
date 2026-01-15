@@ -506,6 +506,230 @@ export interface ContentParser {
 }
 
 // ============================================================
+// NORMALIZED NODE PROPERTIES
+// ============================================================
+
+/**
+ * Normalized content properties that ALL content nodes must have.
+ * These are the ONLY text properties used for embeddings and entity extraction.
+ * Raw properties (content, text, body, source, etc.) are removed after extraction.
+ */
+export interface NormalizedNodeProps {
+  /** Searchable name/title/signature */
+  _name: string;
+  /** Main content (code, text, etc.) - null for container nodes */
+  _content: string | null;
+  /** Description/documentation - null if none */
+  _description: string | null;
+}
+
+/**
+ * Raw content properties that should be removed after normalization.
+ * These are parser-specific and replaced by _name, _content, _description.
+ */
+export const RAW_CONTENT_PROPERTIES = [
+  'content',      // Generic content
+  'text',         // Text content
+  'body',         // Body content
+  'source',       // Source code
+  'rawText',      // Raw text (markdown)
+  'rawContent',   // Raw content (data files)
+  'textContent',  // Text content (web/media)
+  'ownContent',   // Own content (sections)
+  'code',         // Code (code blocks)
+  'description',  // Description (without underscore)
+  'docstring',    // Docstring (code)
+  'templateSource', // Vue/Svelte template
+] as const;
+
+// ============================================================
+// FILE NODE RAW CONTENT
+// ============================================================
+
+/**
+ * Maximum size for _rawContent on File nodes (100KB).
+ * Files larger than this won't have _rawContent stored.
+ */
+export const MAX_RAW_CONTENT_SIZE = 100 * 1024;
+
+/**
+ * Check if raw content should be stored on a File node.
+ * Returns true if content exists and is under the size limit.
+ *
+ * @param content - File content string
+ * @returns true if _rawContent should be stored
+ */
+export function shouldStoreRawContent(content: string | undefined | null): boolean {
+  return !!content && content.length <= MAX_RAW_CONTENT_SIZE;
+}
+
+/**
+ * Get _rawContent property for a File node.
+ * Returns the content if it should be stored, undefined otherwise.
+ *
+ * @param content - File content string
+ * @returns content string or undefined
+ */
+export function getRawContentProp(content: string | undefined | null): string | undefined {
+  return shouldStoreRawContent(content) ? content! : undefined;
+}
+
+// ============================================================
+// CONTENT NODE CREATION
+// ============================================================
+
+/**
+ * Create a content node with normalized properties.
+ *
+ * This is the ONLY way to create content nodes - it ensures:
+ * 1. _name, _content, _description are always set
+ * 2. Raw content properties are removed
+ * 3. Consistency across all parsers
+ *
+ * @param label - Primary node label (e.g., 'Scope', 'MarkdownSection')
+ * @param id - Node ID (becomes uuid)
+ * @param rawProps - Raw properties from parser
+ * @param fieldExtractors - Functions to extract normalized fields
+ * @param additionalLabels - Optional additional labels
+ * @returns ParserNode with normalized properties
+ *
+ * @example
+ * ```typescript
+ * const node = createContentNode(
+ *   'MarkdownSection',
+ *   sectionId,
+ *   { title: 'Introduction', content: 'Some text...', file: 'readme.md' },
+ *   markdownSectionFieldExtractors
+ * );
+ * // Result: { _name: 'Introduction', _content: 'Some text...', _description: null, title: 'Introduction', file: 'readme.md' }
+ * // Note: 'content' property is removed, replaced by '_content'
+ * ```
+ */
+export function createContentNode(
+  label: string,
+  id: string,
+  rawProps: Record<string, unknown>,
+  fieldExtractors: FieldExtractors,
+  additionalLabels: string[] = []
+): ParserNode {
+  // Extract normalized fields using the field extractors
+  const _name = fieldExtractors.name(rawProps) || '';
+  const _content = fieldExtractors.content(rawProps);
+  const _description = fieldExtractors.description?.(rawProps) ?? null;
+
+  // Build final properties: normalized fields + raw props (minus raw content)
+  const properties: Record<string, unknown> = {
+    ...rawProps,
+    _name,
+    _content,
+    _description,
+  };
+
+  // Remove raw content properties - they're now in normalized fields
+  for (const rawProp of RAW_CONTENT_PROPERTIES) {
+    delete properties[rawProp];
+  }
+
+  return {
+    labels: [label, ...additionalLabels],
+    id,
+    properties,
+  };
+}
+
+/**
+ * Create a structural node (File, Directory, Project) without content normalization.
+ * These nodes don't have embeddable content, just metadata.
+ *
+ * For File nodes that should have raw content for agent access, pass _rawContent in props.
+ *
+ * @param label - Node label
+ * @param id - Node ID
+ * @param props - Node properties (can include _rawContent for File nodes)
+ * @param additionalLabels - Optional additional labels
+ */
+export function createStructuralNode(
+  label: string,
+  id: string,
+  props: Record<string, unknown>,
+  additionalLabels: string[] = []
+): ParserNode {
+  return {
+    labels: [label, ...additionalLabels],
+    id,
+    properties: { ...props },
+  };
+}
+
+// Lazy import to avoid circular dependency
+let _parserRegistry: { getNodeType: (label: string) => NodeTypeDefinition | undefined } | null = null;
+
+/**
+ * Set the parser registry reference (called from parser-registry.ts after initialization).
+ * This avoids circular imports.
+ */
+export function setParserRegistryRef(registry: { getNodeType: (label: string) => NodeTypeDefinition | undefined }): void {
+  _parserRegistry = registry;
+}
+
+/**
+ * Create a content node using the parser registry to get field extractors.
+ *
+ * This is the preferred way to create content nodes when you don't have
+ * direct access to the FieldExtractors. It looks up the node type in the
+ * registry and uses its field extractors.
+ *
+ * IMPORTANT: Parsers must be registered before calling this function.
+ * Call registerAllParsers() first if needed.
+ *
+ * @param label - Node label (must be registered in parserRegistry)
+ * @param id - Node ID
+ * @param rawProps - Raw properties from parser
+ * @param additionalLabels - Optional additional labels
+ * @returns ParserNode with normalized properties
+ * @throws Error if label not found in registry or registry not initialized
+ *
+ * @example
+ * ```typescript
+ * // Ensure parsers are registered
+ * registerAllParsers();
+ *
+ * // Create node - extractors are looked up automatically
+ * const node = createNodeFromRegistry('Scope', uuid, {
+ *   name: scope.name,
+ *   source: scope.content,
+ *   signature: extractSignature(scope),
+ *   docstring: scope.docstring,
+ *   file: relPath,
+ *   // ... other props
+ * });
+ * ```
+ */
+export function createNodeFromRegistry(
+  label: string,
+  id: string,
+  rawProps: Record<string, unknown>,
+  additionalLabels: string[] = []
+): ParserNode {
+  if (!_parserRegistry) {
+    throw new Error(
+      `[createNodeFromRegistry] Parser registry not initialized. ` +
+      `Call registerAllParsers() before creating nodes.`
+    );
+  }
+
+  const nodeDef = _parserRegistry.getNodeType(label);
+  if (!nodeDef?.fields) {
+    throw new Error(
+      `[createNodeFromRegistry] No field extractors found for label '${label}'. ` +
+      `Make sure the parser is registered.`
+    );
+  }
+
+  return createContentNode(label, id, rawProps, nodeDef.fields, additionalLabels);
+}
+
+// ============================================================
 // UTILITY TYPES
 // ============================================================
 

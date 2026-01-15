@@ -28,6 +28,7 @@ import type {
   ChunkingConfig,
   DocumentParseOptions,
 } from '../parser-types.js';
+import { createContentNode, getRawContentProp } from '../parser-types.js';
 import {
   parseDocumentFile,
   parsePdfWithVision,
@@ -530,6 +531,10 @@ export class DocumentParser implements ContentParser {
     }
 
     // 1. Create File node
+    // For documents, _rawContent is the concatenated extracted text
+    const fullText = sections.map(s => s.text).join('\n\n');
+    const rawContent = getRawContentProp(fullText);
+
     const fileId = `file:${hashContent(filePath + projectId)}`;
     nodes.push({
       labels: ['File'],
@@ -545,6 +550,7 @@ export class DocumentParser implements ContentParser {
         extension,
         sourceFormat,
         sizeBytes,
+        ...(rawContent && { _rawContent: rawContent }),
       },
       position: { type: 'whole' },
     });
@@ -588,27 +594,27 @@ export class DocumentParser implements ContentParser {
       // Generate fallback title if none provided (and no LLM generation was used)
       const sectionTitle = section.title || `Section ${section.index}`;
 
-      nodes.push({
-        labels: ['MarkdownSection'],
-        id: sectionId,
-        properties: {
-          uuid: sectionId,
-          projectId,
-          sourcePath: filePath,
-          sourceType: 'section',
-          contentHash: hashContent(section.text),
-          file: filePath,
-          title: sectionTitle,
-          titleLevel: section.titleLevel,
-          content: section.text,
-          index: section.index,
-          pageNum: section.pageNum,
-          type: section.type || 'content',
-          slug: this.slugify(sectionTitle),
-        },
-        position: { type: 'whole' },
-        parentId: docId,
-      });
+      // Build raw props - createContentNode normalizes to _name, _content, _description
+      const sectionProps: Record<string, unknown> = {
+        uuid: sectionId,
+        projectId,
+        sourcePath: filePath,
+        sourceType: 'section',
+        contentHash: hashContent(section.text),
+        file: filePath,
+        title: sectionTitle,
+        titleLevel: section.titleLevel,
+        // Raw content - will be extracted to _content then removed
+        content: section.text,
+        index: section.index,
+        pageNum: section.pageNum,
+        type: section.type || 'content',
+        slug: this.slugify(sectionTitle),
+      };
+      const sectionNode = createContentNode('MarkdownSection', sectionId, sectionProps, markdownSectionFieldExtractors);
+      sectionNode.position = { type: 'whole' };
+      sectionNode.parentId = docId;
+      nodes.push(sectionNode);
 
       // Relationship: MarkdownSection -[:IN_DOCUMENT]-> MarkdownDocument
       relationships.push({

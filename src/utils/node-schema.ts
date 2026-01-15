@@ -143,6 +143,7 @@ export const CONTENT_NODE_LABELS = new Set([
   'DataFile',           // JSON, YAML, etc.
   'GenericFile',        // Unknown code files
   'WebDocument',        // HTML documents
+  'Entity',             // Extracted entities (GLiNER)
 ]);
 
 /**
@@ -528,6 +529,13 @@ export const NODE_SCHEMAS: Record<string, NodeTypeSchema> = {
     ],
     description: 'package.json file',
   },
+
+  // Entity extraction (GLiNER)
+  Entity: {
+    required: ['uuid', 'projectId', '_name', 'entityType'],
+    optional: ['_content', 'confidence', 'normalized', 'state', 'embeddingsDirty'],
+    description: 'Extracted entity from content (person, organization, product, etc.)',
+  },
 };
 
 /**
@@ -719,6 +727,14 @@ export const FIELD_MAPPING: Record<string, NodeFieldMapping> = {
     description: (n) => n.description || null,
     location: (n) => n.file || null,
   },
+
+  // Entity extraction (GLiNER)
+  Entity: {
+    title: (n) => n._name || null,
+    content: (n) => n._content || n._name || null,
+    description: (n) => (n.entityType ? `${n.entityType}: ${n._name}` : null),
+    location: (n) => null, // Entities don't have file paths
+  },
 };
 
 /**
@@ -743,8 +759,8 @@ export function getNodeContent(node: Record<string, any>, nodeType: string): str
   if (mapping) {
     return mapping.content(node);
   }
-  // Fallback: try common fields
-  return node.source || node.content || node.textContent || node.code || null;
+  // Fallback: normalized field (all content nodes should have _content)
+  return node._content || null;
 }
 
 /**
@@ -756,8 +772,8 @@ export function getNodeDescription(node: Record<string, any>, nodeType: string):
   if (mapping) {
     return mapping.description(node);
   }
-  // Fallback: try common fields
-  return node.docstring || node.description || node.metaDescription || null;
+  // Fallback: normalized field (all content nodes should have _description)
+  return node._description || null;
 }
 
 /**

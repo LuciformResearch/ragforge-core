@@ -21,6 +21,7 @@ import type {
   FieldExtractors,
   ChunkingConfig,
 } from '../parser-types.js';
+import { getRawContentProp } from '../parser-types.js';
 import {
   parseDataFile,
   isDataFile,
@@ -211,8 +212,8 @@ export class DataParser implements ContentParser {
       const dataFileNode = this.createDataFileNode(dataInfo, input.projectId);
       nodes.push(dataFileNode);
 
-      // Create File wrapper node
-      const fileNode = this.createFileNode(input.filePath, input.projectId);
+      // Create File wrapper node (with _rawContent for text files)
+      const fileNode = this.createFileNode(input.filePath, input.projectId, input.content);
       nodes.push(fileNode);
 
       // Relationship: DataFile -[:IN_FILE]-> File
@@ -359,8 +360,9 @@ export class DataParser implements ContentParser {
   /**
    * Create a File wrapper node
    */
-  private createFileNode(filePath: string, projectId: string): ParserNode {
+  private createFileNode(filePath: string, projectId: string, content?: string): ParserNode {
     const id = `file:${hashContent(filePath + projectId)}`;
+    const rawContent = getRawContentProp(content);
 
     return {
       labels: ['File'],
@@ -374,6 +376,7 @@ export class DataParser implements ContentParser {
         absolutePath: filePath,
         name: path.basename(filePath),
         extension: path.extname(filePath).toLowerCase(),
+        ...(rawContent && { _rawContent: rawContent }),
       },
       position: { type: 'whole' },
     };

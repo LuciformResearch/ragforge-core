@@ -660,6 +660,11 @@ export class BrainManager {
       'CREATE INDEX mediafile_uuid IF NOT EXISTS FOR (n:MediaFile) ON (n.uuid)',
       'CREATE INDEX imagefile_uuid IF NOT EXISTS FOR (n:ImageFile) ON (n.uuid)',
       'CREATE INDEX webpage_uuid IF NOT EXISTS FOR (n:WebPage) ON (n.uuid)',
+      // Entity extraction indexes (GLiNER)
+      'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
+      'CREATE INDEX entity_projectid IF NOT EXISTS FOR (n:Entity) ON (n.projectId)',
+      'CREATE INDEX entity_type IF NOT EXISTS FOR (n:Entity) ON (n.entityType)',
+      'CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n._name)',
       // Index on projectId for fast project-scoped queries
       'CREATE INDEX scope_projectid IF NOT EXISTS FOR (n:Scope) ON (n.projectId)',
       'CREATE INDEX file_projectid IF NOT EXISTS FOR (n:File) ON (n.projectId)',
@@ -717,6 +722,7 @@ export class BrainManager {
       'SpreadsheetDocument', 'MarkdownDocument', 'MarkdownSection', 'MediaFile',
       'ImageFile', 'ThreeDFile', 'WebPage', 'CodeBlock', 'VueSFC', 'SvelteComponent',
       'Stylesheet', 'GenericFile', 'PackageJson', 'DataSection', 'WebDocument',
+      'Entity', // Entity extraction nodes (GLiNER)
     ];
 
     try {

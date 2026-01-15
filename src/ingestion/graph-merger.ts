@@ -19,7 +19,6 @@ import type { Driver, Session } from 'neo4j-driver';
 import { STATE_PROPERTIES as P } from './state-types.js';
 import { computeSchemaHash } from '../utils/schema-version.js';
 import { CONTENT_NODE_LABELS } from '../utils/node-schema.js';
-import { parserRegistry } from './parser-registry.js';
 
 // ============================================================
 // TYPES
@@ -209,10 +208,7 @@ export class GraphMerger {
           const primaryLabel = contentLabels[contentLabels.length - 1] || labels[0];
           props.__schemaVersion__ = computeSchemaHash(primaryLabel, props);
 
-          // Extract unified fields (_name, _content, _description)
-          // This enables single fulltext index and simplified grep
-          const unified = this.extractUnifiedFields(labels, props);
-          Object.assign(props, unified);
+          // Note: _name, _content, _description are now set at parser level via createContentNode()
         }
         return { uuid: node.id, props };
       });
@@ -445,51 +441,6 @@ export class GraphMerger {
     }
   }
 
-  /**
-   * Extract unified content fields (_name, _content, _description) from a node.
-   * Uses parserRegistry to get the appropriate FieldExtractors for each node type.
-   *
-   * This enables:
-   * - Single fulltext index for all node types
-   * - Simplified grep/regex search on _content
-   * - Consistent field names across all content types
-   */
-  private extractUnifiedFields(
-    labels: string[],
-    props: Record<string, unknown>
-  ): { _name?: string; _content?: string; _description?: string } {
-    // Find the most specific content label that has a registered node type
-    const contentLabels = labels.filter(l => CONTENT_NODE_LABELS.has(l));
-
-    for (const label of contentLabels.reverse()) {
-      const nodeDef = parserRegistry.getNodeType(label);
-      if (nodeDef?.fields) {
-        const unified: { _name?: string; _content?: string; _description?: string } = {};
-
-        // Extract name
-        const name = nodeDef.fields.name(props);
-        if (name && name.length > 0) {
-          unified._name = name;
-        }
-
-        // Extract content
-        const content = nodeDef.fields.content(props);
-        if (content && content.length > 0) {
-          unified._content = content;
-        }
-
-        // Extract description
-        const description = nodeDef.fields.description?.(props);
-        if (description && description.length > 0) {
-          unified._description = description;
-        }
-
-        return unified;
-      }
-    }
-
-    return {};
-  }
 }
 
 // ============================================================
