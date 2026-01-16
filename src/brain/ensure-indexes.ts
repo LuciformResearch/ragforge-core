@@ -183,6 +183,12 @@ export async function ensureBaseIndexes(
     'CREATE INDEX directory_path IF NOT EXISTS FOR (n:Directory) ON (n.path)'
   );
 
+  // Relationship indexes (Neo4j 5+)
+  // Index on RELATED_TO.type for fast relation filtering by predicate
+  indexQueries.push(
+    'CREATE INDEX related_to_type IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.type)'
+  );
+
   // Execute all index queries
   for (const query of indexQueries) {
     try {
