@@ -533,7 +533,7 @@ export const NODE_SCHEMAS: Record<string, NodeTypeSchema> = {
   // Entity extraction (GLiNER)
   Entity: {
     required: ['uuid', 'projectId', '_name', 'entityType'],
-    optional: ['_content', 'confidence', 'normalized', 'state', 'embeddingsDirty'],
+    optional: ['_content', 'confidence', 'normalized', 'state', '_state'],
     description: 'Extracted entity from content (person, organization, product, etc.)',
   },
 };

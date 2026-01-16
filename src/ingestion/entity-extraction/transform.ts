@@ -435,8 +435,7 @@ function buildEntityGraph(
             // System properties (required for indexes and embeddings)
             uuid: entityId,
             projectId: projectId,
-            _state: 'linked', // Use _state for state machine compatibility
-            embeddingsDirty: true,
+            _state: 'linked', // Use _state for state machine (needs embedding)
             // Hash for incremental ingestion change detection
             hash: generateEntityHash(canonicalName, entity.type, entity.confidence ?? 0),
             // Use unified field names (canonical name)

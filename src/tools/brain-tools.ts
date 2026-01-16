@@ -2618,7 +2618,7 @@ export function generateMarkFileDirtyTool(): GeneratedToolDefinition {
     description: `Mark a file as "dirty" to force re-ingestion.
 
 Marks all nodes associated with a file (Scope, File, MarkdownSection, CodeBlock, etc.)
-as schemaDirty = true and embeddingsDirty = true. This ensures the file will be
+as schemaDirty = true and _state = 'linked'. This ensures the file will be
 re-ingested on the next ingestion cycle, even if its content hash hasn't changed.
 
 Useful when:
@@ -2716,7 +2716,7 @@ export function generateMarkFileDirtyHandler(ctx: BrainToolsContext) {
       const result = await neo4jClient.run(
         `MATCH (n)
          WHERE (n.file = $relativePath OR n.absolutePath = $absolutePath) AND n.projectId = $projectId
-         SET n.schemaDirty = true, n.embeddingsDirty = true
+         SET n.schemaDirty = true, n._state = 'linked'
          RETURN count(n) AS count`,
         { relativePath, absolutePath, projectId: project.id }
       );

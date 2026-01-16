@@ -69,6 +69,8 @@ export interface ProcessResult {
   error?: string;
   /** New content hash */
   newHash?: string;
+  /** UUIDs of created content nodes (for state machine transitions) */
+  createdNodes?: Array<{ uuid: string; label: string }>;
 }
 
 export interface BatchResult {
@@ -232,25 +234,36 @@ export class FileProcessor {
       // 5. Transition to parsed state
       await this.stateMachine.transition(file.uuid, 'parsed', { contentHash: newHash });
 
-      // 6. Delete old scopes
-      await this.deleteFileScopes(file.absolutePath);
-
-      // 7. Create new scopes (batch)
+      // 6. Create/update scopes (batch with MERGE - incremental)
       let scopesCreated = 0;
+      let scopesSkipped = 0;
       let relationshipsCreated = 0;
+      let createdNodes: Array<{ uuid: string; label: string }> = [];
+      const newNodeUuids = new Set<string>();
 
       if (parseResult?.graph && parseResult.graph.nodes.length > 0) {
-        // Prepare nodes with proper properties
+        // Prepare nodes with proper properties and _contentHash
         const preparedNodes = this.prepareNodes(parseResult.graph.nodes, file.absolutePath);
 
-        // Batch create nodes
-        scopesCreated = await this.createNodesBatch(preparedNodes, file.absolutePath);
+        // Collect UUIDs of nodes from the parse (to detect orphans later)
+        for (const node of preparedNodes) {
+          newNodeUuids.add(node.properties.uuid as string);
+        }
+
+        // Batch create/update nodes using MERGE (skips unchanged nodes)
+        const createResult = await this.createNodesBatch(preparedNodes, file.absolutePath);
+        scopesCreated = createResult.count;
+        scopesSkipped = createResult.skippedCount;
+        createdNodes = createResult.createdNodes;
 
         // Batch create relationships from the graph
         if (parseResult.graph.relationships && parseResult.graph.relationships.length > 0) {
           relationshipsCreated = await this.createRelationshipsBatch(parseResult.graph.relationships);
         }
       }
+
+      // 7. Delete orphan nodes (nodes in DB that are no longer in the parse)
+      const orphansDeleted = await this.deleteOrphanScopes(file.absolutePath, newNodeUuids);
 
       // 8. Transition to relations state
       await this.stateMachine.transition(file.uuid, 'relations');
@@ -282,7 +295,11 @@ export class FileProcessor {
 
       if (this.verbose) {
         const duration = Date.now() - startTime;
-        console.log(`[FileProcessor] Parsed ${fileName}: ${scopesCreated} scopes, ${relationshipsCreated} rels, ${referencesCreated} refs (${duration}ms)`);
+        const changes = scopesCreated > 0 ? `${scopesCreated} changed` : '';
+        const unchanged = scopesSkipped > 0 ? `${scopesSkipped} unchanged` : '';
+        const deleted = orphansDeleted > 0 ? `${orphansDeleted} deleted` : '';
+        const summary = [changes, unchanged, deleted].filter(Boolean).join(', ') || 'no changes';
+        console.log(`[FileProcessor] Parsed ${fileName}: ${summary}, ${relationshipsCreated} rels, ${referencesCreated} refs (${duration}ms)`);
       }
 
       return {
@@ -291,6 +308,7 @@ export class FileProcessor {
         relationshipsCreated,
         referencesCreated,
         newHash,
+        createdNodes,
       };
     } catch (err: any) {
       // Transition to error state
@@ -364,6 +382,293 @@ export class FileProcessor {
       totalRelationshipsCreated,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  /**
+   * Process multiple files through the complete pipeline with ONE adapter.parse() call.
+   *
+   * Optimizations:
+   * - Parallel file reading with pLimit
+   * - Single adapter.parse() call for all files
+   * - Graph splitting by absolutePath
+   * - Batch state transitions
+   * - Parallel node/relationship creation
+   */
+  async processBatchFiles(files: FileInfo[]): Promise<BatchResult> {
+    const startTime = Date.now();
+
+    if (files.length === 0) {
+      return {
+        processed: 0,
+        skipped: 0,
+        deleted: 0,
+        errors: 0,
+        totalScopesCreated: 0,
+        totalRelationshipsCreated: 0,
+        durationMs: 0,
+      };
+    }
+
+    console.log(`[FileProcessor] 🚀 Starting batch processing of ${files.length} files (concurrency=${this.concurrency})`);
+
+    const limit = pLimit(this.concurrency);
+
+    // 1. Parallel: read files + compute hashes
+    const fileData = await Promise.all(
+      files.map(f =>
+        limit(async () => {
+          try {
+            const content = await fs.readFile(f.absolutePath, 'utf-8');
+            const newHash = this.computeHash(content);
+            const storedHash = await this.getStoredHash(f.absolutePath);
+            return { file: f, content, newHash, storedHash, error: null as Error | null, deleted: false };
+          } catch (err: any) {
+            if (err.code === 'ENOENT') {
+              return { file: f, content: null, newHash: null, storedHash: null, error: null, deleted: true };
+            }
+            return { file: f, content: null, newHash: null, storedHash: null, error: err as Error, deleted: false };
+          }
+        })
+      )
+    );
+
+    // 2. Filter: unchanged files, deleted files, error files
+    const toProcess = fileData.filter(d => d.content && d.newHash !== d.storedHash);
+    const skipped = fileData.filter(d => d.content && d.newHash === d.storedHash);
+    const deleted = fileData.filter(d => d.deleted);
+    const errors = fileData.filter(d => d.error);
+
+    // Handle deleted files
+    for (const d of deleted) {
+      await this.deleteFileAndScopes(d.file.absolutePath);
+    }
+
+    // Handle unchanged files - transition directly to linked
+    for (const d of skipped) {
+      await this.stateMachine.transition(d.file.uuid, 'linked', { contentHash: d.newHash! });
+    }
+
+    if (toProcess.length === 0) {
+      return {
+        processed: 0,
+        skipped: skipped.length,
+        deleted: deleted.length,
+        errors: errors.length,
+        totalScopesCreated: 0,
+        totalRelationshipsCreated: 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    console.log(`[FileProcessor] Processing ${toProcess.length} changed files (${skipped.length} skipped, ${deleted.length} deleted)`);
+
+    // 3. Batch transition to 'parsing'
+    await this.stateMachine.transitionBatch(
+      toProcess.map(d => d.file.uuid),
+      'parsing'
+    );
+
+    // 4. ONE adapter.parse() call with ALL files
+    const fileNames = toProcess.map(d => {
+      if (this.projectRoot) {
+        return path.relative(this.projectRoot, d.file.absolutePath);
+      }
+      return path.basename(d.file.absolutePath);
+    });
+
+    // Determine the common root for parsing
+    const parseRoot = this.projectRoot || path.dirname(toProcess[0].file.absolutePath);
+
+    let parseResult;
+    try {
+      console.log(`[FileProcessor] 🔄 Calling adapter.parse() with ${fileNames.length} files`);
+      parseResult = await this.adapter.parse({
+        source: {
+          type: 'code',
+          root: parseRoot,
+          include: fileNames,
+        },
+        projectId: this.projectId,
+      });
+    } catch (err: any) {
+      console.error(`[FileProcessor] ❌ Batch parse failed: ${err.message}`);
+      // Transition all files to error state
+      for (const d of toProcess) {
+        await this.stateMachine.transition(d.file.uuid, 'error', {
+          errorType: 'parse',
+          errorMessage: err.message,
+        });
+      }
+      return {
+        processed: 0,
+        skipped: skipped.length,
+        deleted: deleted.length,
+        errors: toProcess.length,
+        totalScopesCreated: 0,
+        totalRelationshipsCreated: 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    // 5. Batch transition to 'parsed'
+    await this.stateMachine.transitionBatch(
+      toProcess.map(d => d.file.uuid),
+      'parsed'
+    );
+
+    // 6. Split graph by absolutePath
+    const graphsByFile = this.splitGraphByFile(parseResult?.graph);
+
+    // 7. Parallel: create nodes/relationships per file
+    const processResults = await Promise.all(
+      toProcess.map(d =>
+        limit(async () => {
+          try {
+            const fileGraph = graphsByFile.get(d.file.absolutePath);
+            let scopesCreated = 0;
+            let relationshipsCreated = 0;
+            const newNodeUuids = new Set<string>();
+
+            if (fileGraph && fileGraph.nodes.length > 0) {
+              const preparedNodes = this.prepareNodes(fileGraph.nodes, d.file.absolutePath);
+
+              // Collect UUIDs for orphan detection
+              for (const node of preparedNodes) {
+                newNodeUuids.add(node.properties.uuid as string);
+              }
+
+              const createResult = await this.createNodesBatch(preparedNodes, d.file.absolutePath);
+              scopesCreated = createResult.count;
+
+              if (fileGraph.relationships && fileGraph.relationships.length > 0) {
+                relationshipsCreated = await this.createRelationshipsBatch(fileGraph.relationships);
+              }
+            }
+
+            // Delete orphan nodes
+            await this.deleteOrphanScopes(d.file.absolutePath, newNodeUuids);
+
+            // Update file hash
+            await this.updateFileHash(d.file.absolutePath, d.newHash!, d.content!.split('\n').length);
+
+            // Process references
+            let referencesCreated = 0;
+            try {
+              referencesCreated = await this.processFileReferences(d.file.absolutePath, d.content!, d.file.uuid);
+            } catch (err: any) {
+              if (this.verbose) {
+                console.warn(`[FileProcessor] Error processing references: ${err.message}`);
+              }
+            }
+
+            return { file: d.file, scopesCreated, relationshipsCreated, referencesCreated, error: null };
+          } catch (err: any) {
+            return { file: d.file, scopesCreated: 0, relationshipsCreated: 0, referencesCreated: 0, error: err };
+          }
+        })
+      )
+    );
+
+    // Separate successes and failures
+    const successes = processResults.filter(r => !r.error);
+    const failures = processResults.filter(r => r.error);
+
+    // Handle failures
+    for (const { file, error } of failures) {
+      if (error) {
+        await this.stateMachine.transition(file.uuid, 'error', {
+          errorType: 'parse',
+          errorMessage: error.message,
+        });
+      }
+    }
+
+    // 8. Batch transition successful files to 'linked'
+    if (successes.length > 0) {
+      // Transition to 'relations' first, then 'linked'
+      await this.stateMachine.transitionBatch(
+        successes.map(s => s.file.uuid),
+        'relations'
+      );
+      await this.stateMachine.transitionBatch(
+        successes.map(s => s.file.uuid),
+        'linked'
+      );
+    }
+
+    // Notify that files were linked
+    if (this.config.onFileLinked) {
+      for (const { file } of successes) {
+        try {
+          await this.config.onFileLinked(file.absolutePath);
+        } catch (err: any) {
+          if (this.verbose) {
+            console.warn(`[FileProcessor] Error in onFileLinked: ${err.message}`);
+          }
+        }
+      }
+    }
+
+    // Aggregate results
+    let totalScopesCreated = 0;
+    let totalRelationshipsCreated = 0;
+    for (const r of successes) {
+      totalScopesCreated += r.scopesCreated;
+      totalRelationshipsCreated += r.relationshipsCreated;
+    }
+
+    const result = {
+      processed: successes.length,
+      skipped: skipped.length,
+      deleted: deleted.length,
+      errors: errors.length + failures.length,
+      totalScopesCreated,
+      totalRelationshipsCreated,
+      durationMs: Date.now() - startTime,
+    };
+
+    console.log(`[FileProcessor] ✅ Batch complete: ${result.processed} processed, ${result.skipped} skipped, ${result.errors} errors (${result.durationMs}ms)`);
+
+    return result;
+  }
+
+  /**
+   * Split a parsed graph by file absolutePath
+   */
+  private splitGraphByFile(graph?: ParsedGraph): Map<string, { nodes: ParsedNode[]; relationships: ParsedRelationship[] }> {
+    const byFile = new Map<string, { nodes: ParsedNode[]; relationships: ParsedRelationship[] }>();
+
+    if (!graph) return byFile;
+
+    // Group nodes by absolutePath
+    for (const node of graph.nodes) {
+      const absPath = node.properties.absolutePath as string;
+      if (!absPath) continue;
+      if (!byFile.has(absPath)) {
+        byFile.set(absPath, { nodes: [], relationships: [] });
+      }
+      byFile.get(absPath)!.nodes.push(node);
+    }
+
+    // Map node ID to file for relationship routing
+    const nodeToFile = new Map<string, string>();
+    for (const [file, data] of byFile) {
+      for (const node of data.nodes) {
+        nodeToFile.set(node.id, file);
+      }
+    }
+
+    // Route relationships to source node's file
+    if (graph.relationships) {
+      for (const rel of graph.relationships) {
+        const file = nodeToFile.get(rel.from);
+        if (file && byFile.has(file)) {
+          byFile.get(file)!.relationships.push(rel);
+        }
+      }
+    }
+
+    return byFile;
   }
 
   /**
@@ -468,11 +773,22 @@ export class FileProcessor {
   // ============================================
 
   /**
-   * Create nodes in batch using UNWIND
-   * Much faster than creating one by one
+   * Create or update nodes in batch using MERGE
+   *
+   * Incremental strategy:
+   * - Uses MERGE with deterministic UUIDs (no duplicates)
+   * - Compares _contentHash to skip unchanged nodes
+   * - Only sets _state='linked' on new/changed nodes (needs embedding)
+   * - Preserves existing state for unchanged nodes (e.g., 'ready')
+   *
+   * Returns count and list of created/updated nodes (for state machine transitions)
    */
-  private async createNodesBatch(nodes: PreparedNode[], filePath: string): Promise<number> {
-    if (nodes.length === 0) return 0;
+  private async createNodesBatch(nodes: PreparedNode[], filePath: string): Promise<{
+    count: number;
+    createdNodes: Array<{ uuid: string; label: string }>;
+    skippedCount: number;
+  }> {
+    if (nodes.length === 0) return { count: 0, createdNodes: [], skippedCount: 0 };
 
     // Group nodes by label for efficient batch creation
     const nodesByLabel = new Map<string, PreparedNode[]>();
@@ -485,8 +801,10 @@ export class FileProcessor {
     }
 
     let totalCreated = 0;
+    let totalSkipped = 0;
+    const createdNodes: Array<{ uuid: string; label: string }> = [];
 
-    // Create nodes for each label type
+    // Create/update nodes for each label type
     for (const [label, labelNodes] of nodesByLabel) {
       // Skip File and Project nodes - they are already managed elsewhere:
       // - File nodes are created by touchFile() or ensureFileNode()
@@ -498,29 +816,73 @@ export class FileProcessor {
 
       const nodeProps = labelNodes.map(n => ({
         uuid: n.properties.uuid,
+        contentHash: n.properties._contentHash,
         props: n.properties,
       }));
 
-      // Use UNWIND for batch creation
+      // Use MERGE for incremental updates
+      // - ON CREATE: set all properties + _state='linked' (needs embedding)
+      // - ON MATCH: only update if _contentHash changed, reset to 'linked' state
+      // This ensures unchanged nodes keep their state (e.g., 'ready') and embeddings
       const result = await this.neo4jClient.run(`
         UNWIND $nodes AS nodeData
-        CREATE (n:${label})
-        SET n = nodeData.props
+        MERGE (n:${label} {uuid: nodeData.uuid})
+        ON CREATE SET
+          n = nodeData.props,
+          n._state = 'linked',
+          n._linkedAt = datetime(),
+          n._wasCreated = true
+        ON MATCH SET
+          n._wasCreated = false,
+          n._wasUpdated = CASE WHEN n._contentHash <> nodeData.contentHash OR n._contentHash IS NULL THEN true ELSE false END
+        WITH n, nodeData
+        WHERE n._wasCreated = true OR n._wasUpdated = true
+        SET n = nodeData.props,
+            n._state = 'linked',
+            n._linkedAt = datetime()
         WITH n
         MATCH (f:File {absolutePath: $filePath})
-        CREATE (n)-[:DEFINED_IN]->(f)
-        RETURN count(n) AS created
+        MERGE (n)-[:DEFINED_IN]->(f)
+        RETURN n._wasCreated AS wasCreated, n._wasUpdated AS wasUpdated, n.uuid AS uuid
       `, { nodes: nodeProps, filePath });
 
-      const created = result.records[0]?.get('created');
-      totalCreated += (typeof created === 'number' ? created : created?.toNumber?.() || 0);
+      let created = 0;
+      let updated = 0;
+      for (const record of result.records) {
+        const wasCreated = record.get('wasCreated');
+        const wasUpdated = record.get('wasUpdated');
+        const uuid = record.get('uuid');
+
+        if (wasCreated) {
+          created++;
+          createdNodes.push({ uuid, label });
+        } else if (wasUpdated) {
+          updated++;
+          createdNodes.push({ uuid, label }); // Also track updated nodes for state machine
+        }
+      }
+
+      totalCreated += created + updated;
+      totalSkipped += labelNodes.length - (created + updated);
+
+      if (this.verbose && (created > 0 || updated > 0)) {
+        console.log(`[FileProcessor] ${label}: ${created} created, ${updated} updated, ${labelNodes.length - created - updated} unchanged`);
+      }
     }
 
-    return totalCreated;
+    // Clean up temporary flags
+    await this.neo4jClient.run(`
+      MATCH (n)-[:DEFINED_IN]->(:File {absolutePath: $filePath})
+      WHERE n._wasCreated IS NOT NULL OR n._wasUpdated IS NOT NULL
+      REMOVE n._wasCreated, n._wasUpdated
+    `, { filePath });
+
+    return { count: totalCreated, createdNodes, skippedCount: totalSkipped };
   }
 
   /**
-   * Create relationships in batch using UNWIND
+   * Create or update relationships in batch using MERGE
+   * Uses MERGE to avoid duplicate relationships during incremental ingestion
    */
   private async createRelationshipsBatch(relationships: ParsedRelationship[]): Promise<number> {
     if (relationships.length === 0) return 0;
@@ -536,7 +898,7 @@ export class FileProcessor {
 
     let totalCreated = 0;
 
-    // Create relationships for each type
+    // Create/update relationships for each type
     for (const [relType, typeRels] of relsByType) {
       const relData = typeRels.map(r => ({
         from: r.from,
@@ -544,12 +906,13 @@ export class FileProcessor {
         props: r.properties || {},
       }));
 
-      // Use UNWIND for batch creation
+      // Use MERGE to avoid duplicates during incremental ingestion
       const result = await this.neo4jClient.run(`
         UNWIND $rels AS relData
         MATCH (source {uuid: relData.from}), (target {uuid: relData.to})
-        CREATE (source)-[r:${relType}]->(target)
-        SET r = relData.props
+        MERGE (source)-[r:${relType}]->(target)
+        ON CREATE SET r = relData.props
+        ON MATCH SET r += relData.props
         RETURN count(r) AS created
       `, { rels: relData });
 
@@ -566,21 +929,31 @@ export class FileProcessor {
 
   /**
    * Prepare nodes for batch insertion
+   * Computes _contentHash from _name + _content + _description for incrementality
    */
   private prepareNodes(nodes: ParsedNode[], filePath: string): PreparedNode[] {
     const relativePath = this.getRelativePath(filePath);
 
-    return nodes.map(node => ({
-      label: node.labels[0] || 'Scope',
-      properties: {
-        ...node.properties,
-        uuid: node.id || crypto.randomUUID(),
-        projectId: this.projectId,
-        file: relativePath,
-        absolutePath: filePath,
-        embeddingsDirty: true,
-      },
-    }));
+    return nodes.map(node => {
+      // Compute _contentHash from normalized fields for incrementality
+      const _name = node.properties._name as string || '';
+      const _content = node.properties._content as string || '';
+      const _description = node.properties._description as string || '';
+      const _contentHash = this.computeHash(`${_name}|${_content}|${_description}`);
+
+      return {
+        label: node.labels[0] || 'Scope',
+        properties: {
+          ...node.properties,
+          uuid: node.id || crypto.randomUUID(),
+          projectId: this.projectId,
+          file: relativePath,
+          absolutePath: filePath,
+          _contentHash,
+          // Don't set _state here - it will be set to 'linked' only if content changed
+        },
+      };
+    });
   }
 
   /**
@@ -626,7 +999,8 @@ export class FileProcessor {
   }
 
   /**
-   * Delete file scopes
+   * Delete file scopes (all nodes for this file)
+   * @deprecated Use deleteOrphanScopes for incremental ingestion
    */
   private async deleteFileScopes(absolutePath: string): Promise<void> {
     await this.neo4jClient.run(`
@@ -634,6 +1008,42 @@ export class FileProcessor {
       WHERE n.projectId = $projectId
       DETACH DELETE n
     `, { absolutePath, projectId: this.projectId });
+  }
+
+  /**
+   * Delete orphan scopes - nodes in DB that are no longer in the parse
+   * Used for incremental ingestion to clean up deleted sections
+   *
+   * @param absolutePath - File path
+   * @param currentUuids - Set of UUIDs from the current parse
+   * @returns Number of nodes deleted
+   */
+  private async deleteOrphanScopes(absolutePath: string, currentUuids: Set<string>): Promise<number> {
+    if (currentUuids.size === 0) {
+      // No nodes in parse = delete all scopes
+      const result = await this.neo4jClient.run(`
+        MATCH (n)-[:DEFINED_IN]->(f:File {absolutePath: $absolutePath})
+        WHERE n.projectId = $projectId
+        WITH n, n.uuid AS uuid
+        DETACH DELETE n
+        RETURN count(*) AS deleted
+      `, { absolutePath, projectId: this.projectId });
+
+      const deleted = result.records[0]?.get('deleted');
+      return typeof deleted === 'number' ? deleted : deleted?.toNumber?.() || 0;
+    }
+
+    // Delete nodes that are not in the current parse
+    const result = await this.neo4jClient.run(`
+      MATCH (n)-[:DEFINED_IN]->(f:File {absolutePath: $absolutePath})
+      WHERE n.projectId = $projectId AND NOT n.uuid IN $uuids
+      WITH n, n.uuid AS uuid
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    `, { absolutePath, projectId: this.projectId, uuids: Array.from(currentUuids) });
+
+    const deleted = result.records[0]?.get('deleted');
+    return typeof deleted === 'number' ? deleted : deleted?.toNumber?.() || 0;
   }
 
   /**

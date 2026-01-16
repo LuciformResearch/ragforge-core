@@ -120,8 +120,8 @@ async function runSinglePipeline(params: {
   const sourceField = pipeline.source;
   const targetProperty = pipeline.targetProperty;
 
-  // Build query with optional dirty filter
-  const dirtyFilter = onlyDirty ? 'AND n.embeddingsDirty = true' : '';
+  // Build query with optional dirty filter (nodes in 'linked' or 'entities' state need embedding)
+  const dirtyFilter = onlyDirty ? "AND n._state IN ['linked', 'entities']" : '';
   const query = `
     MATCH (n:\`${entity}\`)
     WHERE n.\`${sourceField}\` IS NOT NULL ${dirtyFilter}
@@ -318,20 +318,21 @@ async function runSinglePipeline(params: {
     `Persisting ${payload.length} embedding vector(s) to Neo4j`
   );
 
-  // Persist embeddings and mark as clean if onlyDirty mode
+  // Persist embeddings and mark as 'ready' if onlyDirty mode
   if (onlyDirty) {
     await neo4j.run(
       `UNWIND $rows AS row
        MATCH (n)
        WHERE elementId(n) = row.id
        SET n.\`${targetProperty}\` = row.embedding,
-           n.embeddingsDirty = false`,
+           n._state = 'ready',
+           n._embeddedAt = datetime()`,
       { rows: payload }
     );
     await writeLog(
       'info',
       pipelineId,
-      `Marked ${payload.length} node(s) as clean (embeddingsDirty = false)`
+      `Marked ${payload.length} node(s) as ready (_state = 'ready')`
     );
   } else {
     await neo4j.run(

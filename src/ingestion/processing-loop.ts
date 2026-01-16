@@ -111,6 +111,7 @@ export class ProcessingLoop extends EventEmitter {
    */
   async start(): Promise<void> {
     if (this.isRunning) {
+      console.log('[ProcessingLoop] Already running, skipping start');
       return;
     }
 
@@ -120,9 +121,7 @@ export class ProcessingLoop extends EventEmitter {
 
     this.emit('started');
 
-    if (this.verbose) {
-      console.log('[ProcessingLoop] Started');
-    }
+    console.log('[ProcessingLoop] Started');
 
     // Run recovery if enabled
     if (this.recoverOnStart) {
@@ -175,7 +174,9 @@ export class ProcessingLoop extends EventEmitter {
    * Trigger immediate processing (for external events like file changes)
    */
   triggerProcessing(): void {
+    console.log(`[ProcessingLoop] triggerProcessing called (isRunning=${this.isRunning}, isProcessing=${this.isProcessing})`);
     if (!this.isRunning || this.isProcessing) {
+      console.log('[ProcessingLoop] Skipping trigger - not running or already processing');
       return;
     }
 
@@ -186,6 +187,7 @@ export class ProcessingLoop extends EventEmitter {
     }
 
     this.consecutiveIdleCount = 0;
+    console.log('[ProcessingLoop] Scheduling immediate iteration');
     this.scheduleNextIteration(0);
   }
 
@@ -215,16 +217,22 @@ export class ProcessingLoop extends EventEmitter {
     this.stats.iterations++;
     this.stats.lastIterationAt = new Date();
 
+    console.log(`[ProcessingLoop] Starting iteration #${this.stats.iterations}`);
+
     try {
       // 1. Process discovered files first
+      console.log('[ProcessingLoop] Calling processDiscovered...');
       const discoveredStats = await this.processor.processDiscovered({
         limit: this.batchSize,
       });
+      console.log(`[ProcessingLoop] processDiscovered: processed=${discoveredStats.filesProcessed}, skipped=${discoveredStats.filesSkipped}, errored=${discoveredStats.filesErrored}`);
 
       // 2. Then process linked files (entities + embeddings)
+      console.log('[ProcessingLoop] Calling processLinked...');
       const linkedStats = await this.processor.processLinked({
         limit: this.batchSize,
       });
+      console.log(`[ProcessingLoop] processLinked: processed=${linkedStats.filesProcessed}, entities=${linkedStats.entitiesCreated}, embeddings=${linkedStats.embeddingsGenerated}`);
 
       // Aggregate stats
       const totalProcessed = discoveredStats.filesProcessed + linkedStats.filesProcessed;
@@ -252,9 +260,7 @@ export class ProcessingLoop extends EventEmitter {
         this.currentIntervalMs = this.busyIntervalMs;
         this.consecutiveIdleCount = 0;
 
-        if (this.verbose) {
-          console.log(`[ProcessingLoop] Processed ${totalProcessed} files`);
-        }
+        console.log(`[ProcessingLoop] Iteration complete: processed ${totalProcessed} files, next iteration in ${this.currentIntervalMs}ms`);
       } else {
         // Idle - use exponential backoff
         this.consecutiveIdleCount++;
@@ -262,6 +268,10 @@ export class ProcessingLoop extends EventEmitter {
           this.idleIntervalMs * Math.pow(1.5, this.consecutiveIdleCount),
           this.maxIdleIntervalMs
         );
+        // Only log idle occasionally to avoid spam
+        if (this.consecutiveIdleCount <= 3 || this.consecutiveIdleCount % 10 === 0) {
+          console.log(`[ProcessingLoop] Idle (${this.consecutiveIdleCount}x), next check in ${Math.round(this.currentIntervalMs)}ms`);
+        }
       }
 
     } catch (error: any) {

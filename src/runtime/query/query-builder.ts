@@ -954,7 +954,10 @@ export class QueryBuilder<T = any> {
    * Check if any results have dirty embeddings and warn the user
    */
   private checkDirtyEmbeddings(results: SearchResult<T>[]): void {
-    const dirtyResults = results.filter(r => (r.entity as any)?.embeddingsDirty === true);
+    const dirtyResults = results.filter(r => {
+      const state = (r.entity as any)?._state;
+      return state && state !== 'ready' && state !== 'embedded';
+    });
 
     if (dirtyResults.length > 0) {
       console.warn(`\n⚠️  WARNING: ${dirtyResults.length} of ${results.length} result(s) have stale embeddings!`);

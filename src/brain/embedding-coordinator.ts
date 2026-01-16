@@ -62,7 +62,7 @@ export interface EmbeddingCoordinatorConfig {
 export interface EmbedProjectOptions {
   /** Verbose logging */
   verbose?: boolean;
-  /** Only embed incrementally (nodes with embeddingsDirty=true) */
+  /** Only embed incrementally (nodes with _state='linked' or 'entities') */
   incrementalOnly?: boolean;
   /** Specific embedding types to generate */
   embeddingTypes?: ('name' | 'content' | 'description')[];
@@ -327,10 +327,10 @@ export class EmbeddingCoordinator {
     const linkedFiles = await this.stateMachine.getFilesInState(projectId, 'linked');
     const linkedCount = linkedFiles.length;
 
-    // Count scopes with embeddingsDirty = true
+    // Count scopes with _state in ['linked', 'entities'] (need embeddings)
     const dirtyResult = await this.neo4jClient.run(`
       MATCH (n {projectId: $projectId})
-      WHERE n.embeddingsDirty = true
+      WHERE n._state IN ['linked', 'entities']
       RETURN count(n) as count
     `, { projectId });
 

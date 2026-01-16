@@ -39,7 +39,7 @@ export function computeSchemaHash(nodeType: string, properties?: Record<string, 
     // Exclude metadata fields that vary between nodes
     const metadataFields = new Set([
       'indexedAt', 'projectId', 'uuid', 'hash', 'schemaVersion', 'schemaDirty',
-      'embeddingsDirty', 'embedding', 'embedding_hash', 'embedding_name',
+      'embeddingsDirty', '_state', 'embedding', 'embedding_hash', 'embedding_name',
       'embedding_name_hash', 'embedding_description', 'embedding_description_hash',
       'embedding_content', 'embedding_content_hash', 'parent', 'parentUUID',
       'returnType', 'docstring', 'description',

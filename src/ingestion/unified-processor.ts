@@ -20,6 +20,7 @@
  */
 
 import type { Driver } from 'neo4j-driver';
+import pLimit from 'p-limit';
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import { FileStateMachine, type FileState, type FileStateInfo } from '../brain/file-state-machine.js';
 import { NodeStateMachine } from './node-state-machine.js';
@@ -52,6 +53,10 @@ export interface UnifiedProcessorConfig {
   maxRetries?: number;
   /** Batch size for processing */
   batchSize?: number;
+  /** Concurrency limit for parallel processing (default: 10) */
+  concurrency?: number;
+  /** Pre-configured embedding service (optional, will create one if not provided) */
+  embeddingService?: EmbeddingService;
 }
 
 export interface ProcessingStats {
@@ -100,6 +105,7 @@ export class UnifiedProcessor {
   private verbose: boolean;
   private maxRetries: number;
   private batchSize: number;
+  private concurrency: number;
 
   constructor(config: UnifiedProcessorConfig) {
     this.driver = config.driver;
@@ -109,6 +115,7 @@ export class UnifiedProcessor {
     this.verbose = config.verbose ?? false;
     this.maxRetries = config.maxRetries ?? 3;
     this.batchSize = config.batchSize ?? 10;
+    this.concurrency = config.concurrency ?? 10;
 
     // Initialize state machines
     this.fileStateMachine = new FileStateMachine(config.neo4jClient);
@@ -127,8 +134,11 @@ export class UnifiedProcessor {
       verbose: config.verbose,
     });
 
-    // Initialize embedding service (will use auto-detection from env)
-    this.embeddingService = new EmbeddingService(config.neo4jClient);
+    // Use provided embedding service or create a basic one (without provider config)
+    this.embeddingService = config.embeddingService || new EmbeddingService(config.neo4jClient);
+    if (config.embeddingService) {
+      console.log(`[UnifiedProcessor] Using provided EmbeddingService (canGenerate=${this.embeddingService.canGenerateEmbeddings()})`);
+    }
 
     // Initialize entity extraction client
     this.entityClient = new EntityExtractionClient({
@@ -141,38 +151,72 @@ export class UnifiedProcessor {
   // ============================================
 
   /**
-   * Process all files in 'discovered' state
+   * Process all files in 'discovered' state (batch parsing to 'linked')
+   *
+   * This method uses batch processing for optimal performance:
+   * - Single adapter.parse() call for all files
+   * - Parallel file reading and hash checking
+   * - Batch state transitions
+   *
+   * Files are processed up to 'linked' state. Call processLinked() afterwards
+   * to complete entity extraction and embedding generation.
    */
   async processDiscovered(options?: { limit?: number }): Promise<ProcessingStats> {
     const startTime = Date.now();
-    const limit = options?.limit ?? this.batchSize;
+    const batchLimit = options?.limit ?? this.batchSize;
 
     // Get files in discovered state
+    console.log(`[UnifiedProcessor] Getting files in 'discovered' state for project ${this.projectId}...`);
     const discoveredFiles = await this.fileStateMachine.getFilesInState(
       this.projectId,
       'discovered'
     );
+    console.log(`[UnifiedProcessor] Found ${discoveredFiles.length} files in 'discovered' state`);
 
     if (discoveredFiles.length === 0) {
       return this.emptyStats(startTime);
     }
 
     // Process up to limit files
-    const filesToProcess = discoveredFiles.slice(0, limit);
+    const filesToProcess = discoveredFiles.slice(0, batchLimit);
 
-    if (this.verbose) {
-      console.log(`[UnifiedProcessor] Processing ${filesToProcess.length} discovered files`);
-    }
+    console.log(`[UnifiedProcessor] 🚀 Batch processing ${filesToProcess.length} discovered files (limit: ${batchLimit})`);
 
-    return this.processFiles(filesToProcess);
+    // Convert FileStateInfo to FileInfo for batch processing
+    const fileInfos: FileInfo[] = filesToProcess.map(f => ({
+      absolutePath: this.resolveAbsolutePath(f.file),
+      uuid: f.uuid,
+      state: 'discovered' as const,
+    }));
+
+    // Use batch processing (single adapter.parse() call)
+    const batchResult = await this.fileProcessor.processBatchFiles(fileInfos);
+
+    // Capture metadata before entity extraction (for files that succeeded)
+    // This is done lazily when processLinked() is called
+
+    const stats: ProcessingStats = {
+      filesProcessed: batchResult.processed,
+      filesSkipped: batchResult.skipped,
+      filesErrored: batchResult.errors,
+      scopesCreated: batchResult.totalScopesCreated,
+      entitiesCreated: 0, // Done in processLinked()
+      relationsCreated: 0, // Done in processLinked()
+      embeddingsGenerated: 0, // Done in processLinked()
+      durationMs: Date.now() - startTime,
+    };
+
+    console.log(`[UnifiedProcessor] ✅ Discovered processing: ${stats.filesProcessed} parsed, ${stats.scopesCreated} scopes (${stats.durationMs}ms)`);
+
+    return stats;
   }
 
   /**
-   * Process files in 'linked' state through entity extraction and embedding
+   * Process files in 'linked' state through entity extraction and embedding (parallel with batch transitions)
    */
   async processLinked(options?: { limit?: number }): Promise<ProcessingStats> {
     const startTime = Date.now();
-    const limit = options?.limit ?? this.batchSize;
+    const batchLimit = options?.limit ?? this.batchSize;
 
     // Get files in linked state
     const linkedFiles = await this.fileStateMachine.getFilesInState(
@@ -184,62 +228,215 @@ export class UnifiedProcessor {
       return this.emptyStats(startTime);
     }
 
-    const filesToProcess = linkedFiles.slice(0, limit);
+    const filesToProcess = linkedFiles.slice(0, batchLimit);
 
-    if (this.verbose) {
-      console.log(`[UnifiedProcessor] Processing ${filesToProcess.length} linked files`);
+    console.log(`[UnifiedProcessor] 🚀 Starting parallel linked processing of ${filesToProcess.length} files (concurrency=${this.concurrency})`);
+
+    const limit = pLimit(this.concurrency);
+
+    // Track successful and failed files
+    const successfulFiles: FileStateInfo[] = [];
+    const failedFiles: Array<{ file: FileStateInfo; error: Error }> = [];
+
+    // 1. Batch transition to 'entities'
+    await this.fileStateMachine.transitionBatch(
+      filesToProcess.map(f => f.uuid),
+      'entities'
+    );
+
+    // 2. Parallel entity extraction
+    const entityResults = await Promise.all(
+      filesToProcess.map(file =>
+        limit(async () => {
+          try {
+            const result = await this.extractEntitiesForFile(file.file);
+            return { file, result, error: null };
+          } catch (error: any) {
+            return { file, result: null, error };
+          }
+        })
+      )
+    );
+
+    // Separate successful and failed entity extractions
+    const entitySuccesses: Array<{ file: FileStateInfo; result: { entitiesCreated: number; relationsCreated: number } }> = [];
+    for (const { file, result, error } of entityResults) {
+      if (error) {
+        failedFiles.push({ file, error });
+      } else if (result) {
+        entitySuccesses.push({ file, result });
+        successfulFiles.push(file);
+      }
     }
 
-    const stats: ProcessingStats = {
-      filesProcessed: 0,
-      filesSkipped: 0,
-      filesErrored: 0,
-      scopesCreated: 0,
-      entitiesCreated: 0,
-      relationsCreated: 0,
-      embeddingsGenerated: 0,
-      durationMs: 0,
-    };
-
-    for (const file of filesToProcess) {
-      try {
-        // Entity extraction
-        await this.fileStateMachine.transition(file.uuid, 'entities');
-        const entitiesResult = await this.extractEntitiesForFile(file.file);
-        stats.entitiesCreated += entitiesResult.entitiesCreated;
-        stats.relationsCreated += entitiesResult.relationsCreated;
-
-        // Embedding generation
-        await this.fileStateMachine.transition(file.uuid, 'embedding');
-        const embeddingResult = await this.generateEmbeddingsForFile(file.file);
-        stats.embeddingsGenerated += embeddingResult.embeddingsGenerated;
-
-        // Mark as complete
-        await this.fileStateMachine.transition(file.uuid, 'embedded');
-        stats.filesProcessed++;
-
-      } catch (error: any) {
-        if (this.verbose) {
-          console.error(`[UnifiedProcessor] Error processing ${file.file}: ${error.message}`);
-        }
+    // Handle failed files - transition to error state
+    if (failedFiles.length > 0) {
+      for (const { file, error } of failedFiles) {
         await this.fileStateMachine.transition(file.uuid, 'error', {
           errorType: 'entities',
           errorMessage: error.message,
         });
-        stats.filesErrored++;
+        if (this.verbose) {
+          console.error(`[UnifiedProcessor] Entity extraction failed for ${file.file}: ${error.message}`);
+        }
       }
     }
 
-    stats.durationMs = Date.now() - startTime;
+    if (successfulFiles.length === 0) {
+      return {
+        filesProcessed: 0,
+        filesSkipped: 0,
+        filesErrored: failedFiles.length,
+        scopesCreated: 0,
+        entitiesCreated: 0,
+        relationsCreated: 0,
+        embeddingsGenerated: 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    // 3. Batch transition successful files to 'embedding'
+    await this.fileStateMachine.transitionBatch(
+      successfulFiles.map(f => f.uuid),
+      'embedding'
+    );
+
+    // 4. Generate embeddings ONCE for all nodes (not per-file)
+    // generateEmbeddingsForFile generates embeddings for the entire project,
+    // so we only need to call it once after all files are processed
+    let totalEmbeddings = 0;
+    const embeddingSuccesses: FileStateInfo[] = [];
+    const embeddingFailed: Array<{ file: FileStateInfo; error: Error }> = [];
+
+    try {
+      const embeddingResult = await this.generateEmbeddingsForFile('batch');
+      totalEmbeddings = embeddingResult.embeddingsGenerated;
+      embeddingSuccesses.push(...successfulFiles);
+    } catch (error: any) {
+      // If embedding fails, mark all files as failed
+      for (const file of successfulFiles) {
+        embeddingFailed.push({ file, error });
+        await this.fileStateMachine.transition(file.uuid, 'error', {
+          errorType: 'embed',
+          errorMessage: error.message,
+        });
+        if (this.verbose) {
+          console.error(`[UnifiedProcessor] Embedding failed for ${file.file}: ${error.message}`);
+        }
+      }
+    }
+
+    // 5. Batch transition to 'embedded'
+    if (embeddingSuccesses.length > 0) {
+      await this.fileStateMachine.transitionBatch(
+        embeddingSuccesses.map(f => f.uuid),
+        'embedded'
+      );
+    }
+
+    // Aggregate stats
+    const stats = this.aggregateLinkedStats(
+      entitySuccesses.map(e => e.result),
+      totalEmbeddings,
+      embeddingSuccesses.length,
+      failedFiles.length + embeddingFailed.length,
+      startTime
+    );
+
+    console.log(`[UnifiedProcessor] ✅ Linked processing: ${stats.filesProcessed} files, ${stats.entitiesCreated} entities, ${stats.embeddingsGenerated} embeddings (${stats.durationMs}ms)`);
+
     return stats;
   }
 
   /**
-   * Process specific files through the complete pipeline
+   * Aggregate results from parallel linked processing
+   */
+  private aggregateLinkedStats(
+    entityResults: Array<{ entitiesCreated: number; relationsCreated: number }>,
+    totalEmbeddings: number,
+    filesProcessed: number,
+    filesErrored: number,
+    startTime: number
+  ): ProcessingStats {
+    let entitiesCreated = 0;
+    let relationsCreated = 0;
+
+    for (const result of entityResults) {
+      entitiesCreated += result.entitiesCreated;
+      relationsCreated += result.relationsCreated;
+    }
+
+    return {
+      filesProcessed,
+      filesSkipped: 0,
+      filesErrored,
+      scopesCreated: 0,
+      entitiesCreated,
+      relationsCreated,
+      embeddingsGenerated: totalEmbeddings,
+      durationMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * Process specific files through the complete pipeline (parallel with pLimit)
    */
   async processFiles(files: FileStateInfo[]): Promise<ProcessingStats> {
     const startTime = Date.now();
 
+    if (files.length === 0) {
+      return this.emptyStats(startTime);
+    }
+
+    console.log(`[UnifiedProcessor] 🚀 Starting parallel processing of ${files.length} files (concurrency=${this.concurrency})`);
+
+    const limit = pLimit(this.concurrency);
+
+    // Process all files in parallel with concurrency limit
+    const results = await Promise.all(
+      files.map(file =>
+        limit(async () => {
+          try {
+            return await this.processFile(file);
+          } catch (error: any) {
+            if (this.verbose) {
+              console.error(`[UnifiedProcessor] Error processing ${file.file}: ${error.message}`);
+            }
+            return {
+              status: 'error' as const,
+              scopesCreated: 0,
+              entitiesCreated: 0,
+              relationsCreated: 0,
+              embeddingsGenerated: 0,
+              error: error.message,
+            };
+          }
+        })
+      )
+    );
+
+    // Aggregate results
+    const stats = this.aggregateStats(results, startTime);
+
+    console.log(`[UnifiedProcessor] ✅ Processed ${stats.filesProcessed} files, skipped ${stats.filesSkipped}, errors ${stats.filesErrored} (${stats.durationMs}ms)`);
+
+    return stats;
+  }
+
+  /**
+   * Aggregate results from parallel file processing
+   */
+  private aggregateStats(
+    results: Array<{
+      status: 'processed' | 'skipped' | 'error';
+      scopesCreated: number;
+      entitiesCreated: number;
+      relationsCreated: number;
+      embeddingsGenerated: number;
+      error?: string;
+    }>,
+    startTime: number
+  ): ProcessingStats {
     const stats: ProcessingStats = {
       filesProcessed: 0,
       filesSkipped: 0,
@@ -251,26 +448,17 @@ export class UnifiedProcessor {
       durationMs: 0,
     };
 
-    for (const file of files) {
-      try {
-        const result = await this.processFile(file);
-
-        if (result.status === 'skipped') {
-          stats.filesSkipped++;
-        } else if (result.status === 'error') {
-          stats.filesErrored++;
-        } else {
-          stats.filesProcessed++;
-          stats.scopesCreated += result.scopesCreated;
-          stats.entitiesCreated += result.entitiesCreated;
-          stats.relationsCreated += result.relationsCreated;
-          stats.embeddingsGenerated += result.embeddingsGenerated;
-        }
-      } catch (error: any) {
-        if (this.verbose) {
-          console.error(`[UnifiedProcessor] Error processing ${file.file}: ${error.message}`);
-        }
+    for (const result of results) {
+      if (result.status === 'skipped') {
+        stats.filesSkipped++;
+      } else if (result.status === 'error') {
         stats.filesErrored++;
+      } else {
+        stats.filesProcessed++;
+        stats.scopesCreated += result.scopesCreated;
+        stats.entitiesCreated += result.entitiesCreated;
+        stats.relationsCreated += result.relationsCreated;
+        stats.embeddingsGenerated += result.embeddingsGenerated;
       }
     }
 
@@ -420,11 +608,47 @@ export class UnifiedProcessor {
   }
 
   // ============================================
-  // Entity Extraction
+  // Entity Extraction (Batch Optimized)
   // ============================================
 
   /**
-   * Extract entities and relations for nodes in a file
+   * Get document nodes for a file that need entity extraction
+   */
+  private async getNodesForEntityExtraction(filePath: string): Promise<Array<{
+    uuid: string;
+    content: string;
+    label: string;
+  }>> {
+    const result = await this.neo4jClient.run(
+      `
+      MATCH (n)-[:DEFINED_IN]->(f:File)
+      WHERE f.file = $filePath AND f.projectId = $projectId
+        AND (n:MarkdownSection OR n:MarkdownDocument OR n:WebPage OR n:WebDocument)
+        AND n._content IS NOT NULL
+        AND n._state = 'linked'
+      RETURN n.uuid AS uuid, n._content AS content, labels(n)[0] AS label
+      LIMIT 100
+      `,
+      { filePath, projectId: this.projectId }
+    );
+
+    return result.records
+      .map(r => ({
+        uuid: r.get('uuid'),
+        content: r.get('content'),
+        label: r.get('label'),
+      }))
+      .filter(n => n.content && n.content.length >= 50);
+  }
+
+  /**
+   * Extract entities and relations for nodes in a file (batch optimized)
+   *
+   * Optimizations:
+   * - Parallel GLiNER extraction with pLimit(5)
+   * - Batch entity creation with UNWIND
+   * - Batch relation creation with UNWIND
+   * - Batch MENTIONS relationship creation
    */
   private async extractEntitiesForFile(filePath: string): Promise<{
     entitiesCreated: number;
@@ -439,125 +663,160 @@ export class UnifiedProcessor {
       return { entitiesCreated: 0, relationsCreated: 0 };
     }
 
-    // Get document nodes for this file that need entity extraction
-    const result = await this.neo4jClient.run(
-      `
-      MATCH (n)-[:DEFINED_IN]->(f:File)
-      WHERE f.file = $filePath AND f.projectId = $projectId
-        AND (n:MarkdownSection OR n:MarkdownDocument OR n:WebPage OR n:WebDocument)
-        AND n._content IS NOT NULL
-      RETURN n.uuid AS uuid, n._content AS content, labels(n)[0] AS label
-      LIMIT 100
-      `,
-      { filePath, projectId: this.projectId }
-    );
+    // 1. Get all nodes needing extraction
+    const nodes = await this.getNodesForEntityExtraction(filePath);
 
-    if (result.records.length === 0) {
+    if (nodes.length === 0) {
       return { entitiesCreated: 0, relationsCreated: 0 };
     }
 
-    let entitiesCreated = 0;
-    let relationsCreated = 0;
-
-    // Process each node
-    for (const record of result.records) {
-      const uuid = record.get('uuid');
-      const content = record.get('content');
-      const label = record.get('label');
-
-      if (!content || content.length < 50) continue;
-
-      try {
-        const extractionResult = await this.entityClient.extract(
-          content.slice(0, 5000) // Limit content length
-        );
-
-        // Map to track entity name -> entityId for relation creation
-        const entityNameToId = new Map<string, string>();
-
-        // Create Entity nodes and MENTIONS relationships
-        if (extractionResult.entities && extractionResult.entities.length > 0) {
-          for (const entity of extractionResult.entities) {
-            const normalizedName = entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
-            const entityId = `entity:${entity.type}:${normalizedName}`;
-
-            // Store mapping for relation creation
-            entityNameToId.set(entity.name.toLowerCase(), entityId);
-
-            await this.neo4jClient.run(
-              `
-              MERGE (e:Entity {uuid: $entityId})
-              ON CREATE SET
-                e._name = $name,
-                e._content = null,
-                e._description = $entityType,
-                e.entityType = $entityType,
-                e.confidence = $confidence,
-                e.projectId = $projectId,
-                e.__state__ = 'linked',
-                e.embeddingsDirty = true
-              WITH e
-              MATCH (n {uuid: $sourceUuid})
-              MERGE (n)-[r:MENTIONS]->(e)
-              ON CREATE SET r.confidence = $confidence
-              `,
-              {
-                entityId,
-                name: entity.name,
-                entityType: entity.type,
-                confidence: entity.confidence ?? 0.5,
-                projectId: this.projectId,
-                sourceUuid: uuid,
-              }
+    // 2. Parallel extraction with pLimit(5) for GLiNER concurrency
+    const glinerLimit = pLimit(5);
+    const extractions = await Promise.all(
+      nodes.map(node =>
+        glinerLimit(async () => {
+          try {
+            const result = await this.entityClient.extract(
+              node.content.slice(0, 5000) // Limit content length
             );
-
-            entitiesCreated++;
-          }
-        }
-
-        // Create relations between entities
-        if (extractionResult.relations && extractionResult.relations.length > 0) {
-          for (const relation of extractionResult.relations) {
-            const subjectId = entityNameToId.get(relation.subject.toLowerCase());
-            const objectId = entityNameToId.get(relation.object.toLowerCase());
-
-            // Only create relation if both entities were found
-            if (subjectId && objectId) {
-              await this.neo4jClient.run(
-                `
-                MATCH (subject:Entity {uuid: $subjectId})
-                MATCH (object:Entity {uuid: $objectId})
-                MERGE (subject)-[r:RELATED_TO {type: $predicate}]->(object)
-                ON CREATE SET
-                  r.confidence = $confidence,
-                  r.sourceNodeUuid = $sourceUuid,
-                  r.createdAt = datetime()
-                ON MATCH SET
-                  r.confidence = CASE WHEN r.confidence < $confidence THEN $confidence ELSE r.confidence END
-                `,
-                {
-                  subjectId,
-                  objectId,
-                  predicate: relation.predicate,
-                  confidence: relation.confidence ?? 0.5,
-                  sourceUuid: uuid,
-                }
-              );
-
-              relationsCreated++;
-
-              if (this.verbose) {
-                console.log(`[UnifiedProcessor] Created relation: ${relation.subject} -[${relation.predicate}]-> ${relation.object}`);
-              }
-            } else if (this.verbose) {
-              console.log(`[UnifiedProcessor] Skipped relation (entities not found): ${relation.subject} -[${relation.predicate}]-> ${relation.object}`);
+            return { node, result, error: null };
+          } catch (error: any) {
+            if (this.verbose) {
+              console.warn(`[UnifiedProcessor] Entity extraction failed for ${node.uuid}: ${error.message}`);
             }
+            return { node, result: null, error };
           }
+        })
+      )
+    );
+
+    // Filter successful extractions
+    const successfulExtractions = extractions.filter(e => e.result !== null);
+
+    if (successfulExtractions.length === 0) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 3. Collect all entities with their source info
+    const allEntities: Array<{
+      entityId: string;
+      name: string;
+      entityType: string;
+      confidence: number;
+      sourceUuid: string;
+    }> = [];
+
+    // Track entity name -> entityId for relation creation (per source node)
+    const entityMaps = new Map<string, Map<string, string>>();
+
+    for (const { node, result } of successfulExtractions) {
+      if (!result || !result.entities) continue;
+
+      const nodeEntityMap = new Map<string, string>();
+      entityMaps.set(node.uuid, nodeEntityMap);
+
+      for (const entity of result.entities) {
+        const normalizedName = entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+        const entityId = `entity:${entity.type}:${normalizedName}`;
+
+        nodeEntityMap.set(entity.name.toLowerCase(), entityId);
+
+        allEntities.push({
+          entityId,
+          name: entity.name,
+          entityType: entity.type,
+          confidence: entity.confidence ?? 0.5,
+          sourceUuid: node.uuid,
+        });
+      }
+    }
+
+    // 4. Batch create entities with UNWIND
+    let entitiesCreated = 0;
+    if (allEntities.length > 0) {
+      const entityResult = await this.neo4jClient.run(
+        `
+        UNWIND $entities AS entity
+        MERGE (e:Entity {uuid: entity.entityId})
+        ON CREATE SET
+          e._name = entity.name,
+          e._content = null,
+          e._description = entity.entityType,
+          e.entityType = entity.entityType,
+          e.confidence = entity.confidence,
+          e.projectId = $projectId,
+          e._state = 'linked'
+        WITH e, entity
+        MATCH (n {uuid: entity.sourceUuid})
+        MERGE (n)-[r:MENTIONS]->(e)
+        ON CREATE SET r.confidence = entity.confidence
+        RETURN count(DISTINCT e) AS created
+        `,
+        { entities: allEntities, projectId: this.projectId }
+      );
+
+      entitiesCreated = entityResult.records[0]?.get('created')?.toNumber?.() ||
+                        entityResult.records[0]?.get('created') || 0;
+    }
+
+    // 5. Collect all relations
+    const allRelations: Array<{
+      subjectId: string;
+      objectId: string;
+      predicate: string;
+      confidence: number;
+      sourceUuid: string;
+    }> = [];
+
+    for (const { node, result } of successfulExtractions) {
+      if (!result || !result.relations) continue;
+
+      const nodeEntityMap = entityMaps.get(node.uuid);
+      if (!nodeEntityMap) continue;
+
+      for (const relation of result.relations) {
+        const subjectId = nodeEntityMap.get(relation.subject.toLowerCase());
+        const objectId = nodeEntityMap.get(relation.object.toLowerCase());
+
+        if (subjectId && objectId) {
+          allRelations.push({
+            subjectId,
+            objectId,
+            predicate: relation.predicate,
+            confidence: relation.confidence ?? 0.5,
+            sourceUuid: node.uuid,
+          });
+        } else if (this.verbose) {
+          console.log(`[UnifiedProcessor] Skipped relation (entities not found): ${relation.subject} -[${relation.predicate}]-> ${relation.object}`);
         }
-      } catch (error: any) {
-        if (this.verbose) {
-          console.warn(`[UnifiedProcessor] Entity extraction failed for ${uuid}: ${error.message}`);
-        }
+      }
+    }
+
+    // 6. Batch create relations with UNWIND
+    let relationsCreated = 0;
+    if (allRelations.length > 0) {
+      const relationResult = await this.neo4jClient.run(
+        `
+        UNWIND $relations AS rel
+        MATCH (subject:Entity {uuid: rel.subjectId})
+        MATCH (object:Entity {uuid: rel.objectId})
+        MERGE (subject)-[r:RELATED_TO {type: rel.predicate}]->(object)
+        ON CREATE SET
+          r.confidence = rel.confidence,
+          r.sourceNodeUuid = rel.sourceUuid,
+          r.createdAt = datetime()
+        ON MATCH SET
+          r.confidence = CASE WHEN r.confidence < rel.confidence THEN rel.confidence ELSE r.confidence END
+        RETURN count(r) AS created
+        `,
+        { relations: allRelations }
+      );
+
+      relationsCreated = relationResult.records[0]?.get('created')?.toNumber?.() ||
+                         relationResult.records[0]?.get('created') || 0;
+
+      if (this.verbose && relationsCreated > 0) {
+        console.log(`[UnifiedProcessor] Created ${relationsCreated} entity relations`);
       }
     }
 
@@ -574,6 +833,12 @@ export class UnifiedProcessor {
   private async generateEmbeddingsForFile(filePath: string): Promise<{
     embeddingsGenerated: number;
   }> {
+    // Check if embedding service can generate embeddings
+    if (!this.embeddingService.canGenerateEmbeddings()) {
+      console.log(`[UnifiedProcessor] Skipping embeddings for ${filePath}: no embedding provider configured`);
+      return { embeddingsGenerated: 0 };
+    }
+
     const options: GenerateMultiEmbeddingsOptions = {
       projectId: this.projectId,
       incrementalOnly: true,
@@ -581,14 +846,14 @@ export class UnifiedProcessor {
     };
 
     try {
+      console.log(`[UnifiedProcessor] Generating embeddings for project ${this.projectId}...`);
       const result = await this.embeddingService.generateMultiEmbeddings(options);
+      console.log(`[UnifiedProcessor] Embeddings generated: ${result.totalEmbedded} (name=${result.embeddedByType.name}, content=${result.embeddedByType.content}, description=${result.embeddedByType.description})`);
       return {
         embeddingsGenerated: result.totalEmbedded,
       };
     } catch (error: any) {
-      if (this.verbose) {
-        console.warn(`[UnifiedProcessor] Embedding generation failed: ${error.message}`);
-      }
+      console.warn(`[UnifiedProcessor] Embedding generation failed: ${error.message}`);
       return { embeddingsGenerated: 0 };
     }
   }

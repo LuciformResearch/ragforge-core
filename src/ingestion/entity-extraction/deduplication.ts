@@ -48,6 +48,11 @@ export interface DeduplicationResult {
 }
 
 /**
+ * Entity types to exclude from deduplication (numeric/value types).
+ */
+export const EXCLUDED_DEDUP_TYPES = ['price', 'date', 'quantity', 'amount', 'currency', 'size', 'duration'];
+
+/**
  * Configuration for deduplication.
  */
 export interface DeduplicationConfig {
@@ -71,6 +76,9 @@ export interface DeduplicationConfig {
 
   /** Only compare entities of the same type (default: true) */
   sameTypeOnly?: boolean;
+
+  /** Entity types to exclude from deduplication (default: EXCLUDED_DEDUP_TYPES) */
+  excludeTypes?: string[];
 }
 
 const DEFAULT_CONFIG: DeduplicationConfig = {
@@ -79,6 +87,7 @@ const DEFAULT_CONFIG: DeduplicationConfig = {
   embeddingThreshold: 0.9,
   useLLMFallback: false,
   sameTypeOnly: true,
+  excludeTypes: EXCLUDED_DEDUP_TYPES,
 };
 
 // =============================================================================
@@ -94,25 +103,37 @@ export async function deduplicateEntities(
 ): Promise<DeduplicationResult> {
   const startTime = Date.now();
   const fullConfig = { ...DEFAULT_CONFIG, ...config };
+  const excludeTypes = new Set((fullConfig.excludeTypes || []).map(t => t.toLowerCase()));
 
-  if (entities.length <= 1) {
+  // Separate entities: those to deduplicate vs excluded types (kept as-is)
+  const toDeduplicate: ExtractedEntity[] = [];
+  const excluded: ExtractedEntity[] = [];
+  for (const entity of entities) {
+    if (excludeTypes.has(entity.type.toLowerCase())) {
+      excluded.push(entity);
+    } else {
+      toDeduplicate.push(entity);
+    }
+  }
+
+  if (toDeduplicate.length <= 1) {
     return {
-      entities,
+      entities: [...toDeduplicate, ...excluded],
       canonicalMapping: new Map(),
       duplicates: [],
       stats: {
         originalCount: entities.length,
-        deduplicatedCount: entities.length,
+        deduplicatedCount: toDeduplicate.length + excluded.length,
         duplicatesRemoved: 0,
         processingTimeMs: Date.now() - startTime,
       },
     };
   }
 
-  // Group by type if configured
+  // Group by type if configured (only non-excluded entities)
   const groups = fullConfig.sameTypeOnly
-    ? groupByType(entities)
-    : new Map([['all', entities]]);
+    ? groupByType(toDeduplicate)
+    : new Map([['all', toDeduplicate]]);
 
   const allDuplicates: DuplicatePair[] = [];
   const canonicalMapping = new Map<string, string>();
@@ -175,11 +196,11 @@ export async function deduplicateEntities(
     }
   }
 
-  // Build deduplicated list
+  // Build deduplicated list (only from toDeduplicate, excluded are added as-is)
   const seen = new Set<string>();
   const deduplicatedEntities: ExtractedEntity[] = [];
 
-  for (const entity of entities) {
+  for (const entity of toDeduplicate) {
     const normalized = entity.name.toLowerCase();
     const canonical = canonicalMapping.get(normalized) || entity.name;
     const canonicalNormalized = canonical.toLowerCase();
@@ -193,6 +214,9 @@ export async function deduplicateEntities(
       });
     }
   }
+
+  // Add excluded entities as-is (no deduplication for numeric/value types)
+  deduplicatedEntities.push(...excluded);
 
   return {
     entities: deduplicatedEntities,

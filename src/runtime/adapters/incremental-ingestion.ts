@@ -915,7 +915,7 @@ export class IncrementalIngestionManager {
       await this.ingestNodes(
         allNodesToIngest,
         relevantRelationships,
-        true  // Mark changed nodes as embeddingsDirty
+        true  // Mark changed nodes with _state='linked' for embedding
       );
 
       // 6. Track changes and generate diffs (if enabled)
@@ -1412,7 +1412,7 @@ export class IncrementalIngestionManager {
   }
 
   /**
-   * Mark embeddings as clean for specified scopes
+   * Mark embeddings as clean for specified scopes (transition to 'ready' state)
    * Call this after successfully generating embeddings
    */
   async markEmbeddingsClean(uuids: string[]): Promise<void> {
@@ -1422,21 +1422,21 @@ export class IncrementalIngestionManager {
       `
       MATCH (n:Scope)
       WHERE n.uuid IN $uuids
-      SET n.embeddingsDirty = false
+      SET n._state = 'ready', n._embeddedAt = datetime()
       `,
       { uuids }
     );
   }
 
   /**
-   * Get list of scopes with dirty embeddings
+   * Get list of scopes needing embeddings (_state='linked' or 'entities')
    * Useful for selective embedding regeneration
    */
   async getDirtyScopes(): Promise<Array<{ uuid: string; name: string; file: string }>> {
     const result = await this.client.run(
       `
       MATCH (n:Scope)
-      WHERE n.embeddingsDirty = true
+      WHERE n._state IN ['linked', 'entities']
       RETURN n.uuid AS uuid, n.name AS name, n.file AS file
       `
     );
@@ -1449,13 +1449,13 @@ export class IncrementalIngestionManager {
   }
 
   /**
-   * Count scopes with dirty embeddings
+   * Count scopes needing embeddings
    */
   async countDirtyScopes(): Promise<number> {
     const result = await this.client.run(
       `
       MATCH (n:Scope)
-      WHERE n.embeddingsDirty = true
+      WHERE n._state IN ['linked', 'entities']
       RETURN count(n) AS count
       `
     );
@@ -1464,18 +1464,19 @@ export class IncrementalIngestionManager {
   }
 
   /**
-   * Check if a specific scope has dirty embeddings
+   * Check if a specific scope needs embeddings
    */
   async isScopeDirty(uuid: string): Promise<boolean> {
     const result = await this.client.run(
       `
       MATCH (n:Scope {uuid: $uuid})
-      RETURN n.embeddingsDirty AS dirty
+      RETURN n._state AS state
       `,
       { uuid }
     );
 
-    return result.records[0]?.get('dirty') === true;
+    const state = result.records[0]?.get('state');
+    return state === 'linked' || state === 'entities';
   }
 
   // ============================================
@@ -1791,7 +1792,7 @@ export class IncrementalIngestionManager {
    * 1. Parses only the specified file
    * 2. Deletes scopes that were in the old version but not the new
    * 3. Upserts new/modified scopes
-   * 4. Marks affected scopes as embeddingsDirty
+   * 4. Marks affected scopes as _state='linked' (needs embedding)
    *
    * @param filePath - Absolute path to the file
    * @param sourceConfig - Source configuration (for adapter type, root path)
@@ -1954,7 +1955,7 @@ export class IncrementalIngestionManager {
       await this.ingestNodes(
         [...nodesToUpsert, ...fileNodes],
         relevantRelationships,
-        true // Mark as embeddingsDirty
+        true // Mark as _state='linked' (needs embedding)
       );
     }
 

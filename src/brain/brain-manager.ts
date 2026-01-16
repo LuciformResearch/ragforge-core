@@ -754,6 +754,7 @@ export class BrainManager {
         ? this.config.entityExtraction?.serviceUrl
         : undefined,
       verbose: false,
+      embeddingService: this.embeddingService ?? undefined, // Pass the configured embedding service
     });
 
     this._unifiedProcessors.set(projectId, processor);
@@ -1013,7 +1014,7 @@ export class BrainManager {
    * For each content node type:
    * 1. Compute current schemaVersion from a sample node's properties
    * 2. Find nodes where schemaVersion differs (or is missing)
-   * 3. Mark those nodes as embeddingsDirty for re-processing
+   * 3. Mark those nodes as _state='linked' for re-processing
    */
   /**
    * Parent-child label relationships for schema versioning.
@@ -1068,12 +1069,12 @@ export class BrainManager {
         if (outdatedCount > 0) {
           console.log(`[Brain] Found ${outdatedCount} outdated ${label} nodes (schema changed)`);
 
-          // Mark them as dirty for re-ingestion (excluding nodes with child labels)
+          // Mark them for re-ingestion (excluding nodes with child labels)
           await this.neo4jClient.run(
             `MATCH (n:${label})
              WHERE (n.schemaVersion IS NULL OR n.schemaVersion <> $currentVersion)
              ${exclusionClause}
-             SET n.embeddingsDirty = true, n.schemaDirty = true`,
+             SET n._state = 'linked', n.schemaDirty = true`,
             { currentVersion: currentSchemaVersion }
           );
 
@@ -3273,7 +3274,7 @@ volumes:
            n.embedding_name = COALESCE(n.embedding_name, null),
            n.embedding_description = COALESCE(n.embedding_description, null),
            n.embedding_content = COALESCE(n.embedding_content, null),
-           n.embeddingsDirty = COALESCE(n.embeddingsDirty, null)
+           n._state = COALESCE(n._state, 'linked')
            ${mediaInfo.category === 'image' && 'dimensions' in mediaInfo && mediaInfo.dimensions
         ? ', n.width = $width, n.height = $height'
         : ''}`,
@@ -3382,7 +3383,7 @@ volumes:
                  SET n.textContent = $textContent,
                      n.extractionMethod = 'gemini-vision',
                      n.analyzed = true,
-                     n.embeddingsDirty = true`,
+                     n._state = 'linked'`,
                 { uuid: item.uuid, textContent: description }
               );
 
@@ -3463,7 +3464,7 @@ volumes:
                SET n.textContent = $textContent,
                    n.extractionMethod = '3d-render-describe',
                    n.analyzed = true,
-                   n.embeddingsDirty = true`,
+                   n._state = 'linked'`,
               { uuid: item.uuid, textContent: description }
             );
 
@@ -3531,7 +3532,7 @@ volumes:
                SET n.textContent = $textContent,
                    n.extractionMethod = $extractionMethod,
                    n.analyzed = true,
-                   n.embeddingsDirty = true`,
+                   n._state = 'linked'`,
               {
                 uuid: item.uuid,
                 textContent: docInfo.textContent,
@@ -3560,7 +3561,7 @@ volumes:
       try {
         const result = await this.embeddingService.generateMultiEmbeddings({
           projectId,
-          incrementalOnly: true, // Only process nodes with embeddingsDirty = true
+          incrementalOnly: true, // Only process nodes with _state='linked'
           verbose: false,
         });
         console.log(`[analyzeMediaFiles] Embeddings: ${result.totalEmbedded} generated`);
@@ -3823,7 +3824,7 @@ volumes:
           sizeBytes: $sizeBytes,
           projectId: $projectId,
           indexedAt: $indexedAt,
-          embeddingsDirty: true
+          _state: 'linked'
         })`,
         {
           uuid,
@@ -3846,7 +3847,7 @@ volumes:
     const updates: string[] = [];
     const updateParams: Record<string, any> = { uuid };
 
-    // Track if content changed to auto-mark embeddingsDirty
+    // Track if content changed to auto-mark _state='linked' for re-embedding
     let contentChanged = false;
     if (textContent) {
       updates.push('n.textContent = $textContent');
@@ -3878,9 +3879,9 @@ volumes:
 
     // Mark for embedding regeneration if content changed or explicitly requested
     if (generateEmbeddings || contentChanged) {
-      // Mark node as dirty so embeddings will be regenerated on next ingest
+      // Mark node for re-embedding on next ingest
       await this.neo4jClient.run(
-        'MATCH (n {uuid: $uuid}) SET n.embeddingsDirty = true',
+        "MATCH (n {uuid: $uuid}) SET n._state = 'linked'",
         { uuid }
       );
       console.log(`[BrainManager] Marked node for embedding regeneration: ${uuid}`);
@@ -4694,6 +4695,19 @@ volumes:
     // Check if already watching this exact project
     if (this.activeWatchers.has(projectId)) {
       console.log(`[Brain] Already watching project: ${projectId}`);
+      // Get existing watcher and queue the directory for processing
+      const existingWatcher = this.activeWatchers.get(projectId)!;
+      console.log(`[Brain] Queuing directory ${absolutePath} for processing on existing watcher`);
+      await existingWatcher.queueDirectory(absolutePath);
+      // Trigger ProcessingLoop to process the newly discovered files
+      const loop = this._processingLoops.get(projectId);
+      if (loop) {
+        console.log(`[Brain] Triggering ProcessingLoop for ${projectId}`);
+        loop.triggerProcessing();
+      } else {
+        console.log(`[Brain] No ProcessingLoop found for ${projectId}, starting one`);
+        await this.startProcessingLoop(projectId, existingWatcher.getRoot());
+      }
       return;
     }
 
@@ -4703,9 +4717,18 @@ volumes:
       const watcherRoot = watcher.getRoot();
       if (absolutePath.startsWith(watcherRoot + path.sep)) {
         console.log(`[Brain] Path ${absolutePath} is inside already-watched project ${watcherId}`);
-        console.log(`[Brain] Triggering sync on parent watcher instead of creating new watcher`);
+        console.log(`[Brain] Queuing subdirectory for sync on parent watcher`);
         // Queue the subdirectory for sync on the existing watcher
         await watcher.queueDirectory(absolutePath);
+        // Trigger ProcessingLoop to process the newly discovered files
+        const loop = this._processingLoops.get(watcherId);
+        if (loop) {
+          console.log(`[Brain] Triggering ProcessingLoop for parent ${watcherId}`);
+          loop.triggerProcessing();
+        } else {
+          console.log(`[Brain] No ProcessingLoop found for ${watcherId}, starting one`);
+          await this.startProcessingLoop(watcherId, watcherRoot);
+        }
         return;
       }
     }

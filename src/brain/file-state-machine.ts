@@ -467,8 +467,15 @@ export class FileStateMachine {
     files: Array<{ absolutePath: string; relativePath?: string }>,
     projectId: string
   ): Promise<{ created: number; reset: number; skipped: number }> {
+    console.log(`[FileStateMachine] markDiscoveredBatch: ${files.length} files for project ${projectId}`);
     if (files.length === 0) {
       return { created: 0, reset: 0, skipped: 0 };
+    }
+
+    if (files.length <= 5) {
+      console.log(`[FileStateMachine] Files: ${files.map(f => f.absolutePath).join(', ')}`);
+    } else {
+      console.log(`[FileStateMachine] First 5 files: ${files.slice(0, 5).map(f => f.absolutePath).join(', ')}...`);
     }
 
     const now = new Date().toISOString();
@@ -528,6 +535,7 @@ export class FileStateMachine {
       else if (action === 'skipped') skipped = count;
     }
 
+    console.log(`[FileStateMachine] markDiscoveredBatch result: created=${created}, reset=${reset}, skipped=${skipped}`);
     return { created, reset, skipped };
   }
 
@@ -634,14 +642,14 @@ export class FileStateMigration {
       { projectId }
     );
 
-    // 4. Handle embeddingsDirty on Scopes
+    // 4. Handle scopes that need embeddings (_state = 'linked' or 'entities')
     await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
       WHERE f.state = 'embedded'
         AND EXISTS {
           MATCH (s:Scope)-[:DEFINED_IN]->(f)
-          WHERE s.embeddingsDirty = true
+          WHERE s._state IN ['linked', 'entities']
         }
       SET f.state = 'linked'
     `,

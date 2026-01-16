@@ -396,9 +396,11 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
     embeddings: buildEmbeddingConfigs('DocumentFile', true),
   },
   // Entity extraction (GLiNER)
+  // Exclude numeric/value types from embeddings (prices, dates, quantities, etc.)
   {
     label: 'Entity',
     query: `MATCH (e:Entity {projectId: $projectId})
+            WHERE NOT e.entityType IN ['price', 'date', 'quantity', 'amount', 'currency', 'size', 'duration']
             RETURN e.uuid AS uuid, e._name AS _name, e._content AS _content,
                    e.entityType AS entityType, e.normalized AS normalized,
                    e.embedding_name_hash AS embedding_name_hash,
@@ -1273,10 +1275,8 @@ export class EmbeddingService {
           else if (existingHash !== hash) reason = 'hash_mismatch';
           else if (providerMismatch) reason = `provider_changed:${existingProvider}->${currentProvider}`;
           else if (modelMismatch) reason = `model_changed:${existingModel}->${currentModel}`;
-          // Safely get node name (some types use 'name', others 'title', others 'path')
-          const getField = (field: string) => record.keys?.includes(field) ? record.get(field) : null;
-          const nodeName = getField('name') || getField('title') || getField('path') || uuid.substring(0, 8);
-          console.log(`[EmbeddingService] Need embed (chunked): ${label}.${embeddingType} "${nodeName}" (${reason})`);
+          const textPreview = rawText.substring(0, 60).replace(/\n/g, ' ');
+          console.log(`[EmbeddingService] Need embed (chunked): ${label}.${embeddingType} "${textPreview}..." (${reason})`);
 
           // Create chunks
           const chunks = chunkText(rawText, {
@@ -1288,8 +1288,8 @@ export class EmbeddingService {
           chunkedNodeUuids.add(uuid);
 
           // Get parent's position info for calculating absolute positions
-          const parentStartLine = getField('startLine') as number | null;
-          const parentPageNum = getField('pageNum') as number | null;
+          const parentStartLine = record.get('startLine') as number | null;
+          const parentPageNum = record.get('pageNum') as number | null;
 
           for (const chunk of chunks) {
             // Calculate absolute line numbers if parent has startLine
@@ -1347,10 +1347,8 @@ export class EmbeddingService {
           else if (existingHash !== hash) reason = 'hash_mismatch';
           else if (providerMismatch) reason = `provider_changed:${existingProvider}->${currentProvider}`;
           else if (modelMismatch) reason = `model_changed:${existingModel}->${currentModel}`;
-          // Safely get node name (some types use 'name', others 'title', others 'path')
-          const getField = (field: string) => record.keys?.includes(field) ? record.get(field) : null;
-          const nodeName = getField('name') || getField('title') || getField('path') || uuid.substring(0, 8);
-          console.log(`[EmbeddingService] Need embed: ${label}.${embeddingType} "${nodeName}" (${reason})`);
+          const textPreview = text.substring(0, 60).replace(/\n/g, ' ');
+          console.log(`[EmbeddingService] Need embed: ${label}.${embeddingType} "${textPreview}..." (${reason})`);
 
           tasks.push({
             type: 'small',

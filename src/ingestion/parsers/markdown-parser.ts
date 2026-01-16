@@ -138,7 +138,37 @@ const markdownSectionFieldExtractors: FieldExtractors = {
  */
 const codeBlockFieldExtractors: FieldExtractors = {
   name: (node) => {
+    const code = (node.code as string) || '';
     const language = node.language as string;
+
+    // Try to extract first signature (function, class, etc.)
+    const signaturePatterns = [
+      /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/m,           // function foo
+      /^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=/m,          // const foo =
+      /^(?:export\s+)?class\s+(\w+)/m,                           // class Foo
+      /^(?:export\s+)?interface\s+(\w+)/m,                       // interface Foo
+      /^(?:export\s+)?type\s+(\w+)/m,                            // type Foo
+      /^def\s+(\w+)/m,                                           // python def foo
+      /^class\s+(\w+)/m,                                         // python class Foo
+      /^fn\s+(\w+)/m,                                            // rust fn foo
+      /^pub\s+(?:fn|struct|enum)\s+(\w+)/m,                      // rust pub fn/struct/enum
+      /^func\s+(\w+)/m,                                          // go func foo
+    ];
+
+    for (const pattern of signaturePatterns) {
+      const match = code.match(pattern);
+      if (match?.[1]) {
+        return language ? `${match[1]} (${language})` : match[1];
+      }
+    }
+
+    // Fallback: first non-empty line (truncated)
+    const firstLine = code.split('\n').find(l => l.trim())?.trim();
+    if (firstLine && firstLine.length > 3) {
+      const truncated = firstLine.length > 40 ? firstLine.substring(0, 40) + '...' : firstLine;
+      return language ? `${truncated} (${language})` : truncated;
+    }
+
     return language ? `${language} code block` : 'code block';
   },
 

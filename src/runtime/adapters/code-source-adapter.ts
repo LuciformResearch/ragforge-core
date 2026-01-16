@@ -687,8 +687,8 @@ export class CodeSourceAdapter extends SourceAdapter {
     console.log(`✅ All parsers initialized`);
 
     // Parse single file and return typed result
-    const parseFile = async (file: string): Promise<void> => {
-      console.log(`📄 [${filesProcessed + 1}/${files.length}] ${file}`);
+    const parseFile = async (file: string, index: number): Promise<void> => {
+      console.log(`📄 [${index + 1}/${files.length}] ${file}`);
       try {
         // Handle document files first (PDF, DOCX, XLSX - binary with full text extraction)
         if (isDocumentFile(file)) {
@@ -900,7 +900,7 @@ export class CodeSourceAdapter extends SourceAdapter {
     // Process all files in parallel with concurrency limit
     console.log(`🚀 Starting parallel parsing of ${files.length} files (concurrency: 10)...`);
     await Promise.all(
-      files.map(file => limit(() => parseFile(file)))
+      files.map((file, index) => limit(() => parseFile(file, index)))
     );
     console.log(`✅ Parallel parsing complete. Files processed: ${filesProcessed}/${files.length}`);
 
