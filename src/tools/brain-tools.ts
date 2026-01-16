@@ -1683,8 +1683,7 @@ Extract:
 /**
  * Ensure a project is synced before searching.
  * - Starts watcher if not active (with initial sync)
- * - Flushes pending queue if watcher is active
- * - Waits for any ongoing ingestion
+ * - Waits for ProcessingLoop to complete processing
  */
 export async function ensureProjectSynced(
   brain: BrainManager,
@@ -1692,15 +1691,18 @@ export async function ensureProjectSynced(
 ): Promise<{ waited: boolean; watcherStarted: boolean; flushed: boolean }> {
   const { createLogger } = await import('../runtime/utils/logger.js');
   const log = createLogger('brain_search:ensureProjectSynced');
-  
+
   let waited = false;
   let watcherStarted = false;
-  let flushed = false;
+  const flushed = false; // No longer applicable with new system
+
+  // Get project ID for this path
+  const projectId = brain.getProjectIdForPath(projectPath);
 
   // 1. Check if watcher is active
   const isWatching = brain.isWatching(projectPath);
-  log.debug('Checking watcher status', { projectPath, isWatching });
-  
+  log.debug('Checking watcher status', { projectPath, projectId, isWatching });
+
   if (!isWatching) {
     log.info('Starting watcher', { projectPath });
 
@@ -1717,74 +1719,36 @@ export async function ensureProjectSynced(
       watcherStarted = true;
       waited = true;
 
-      // Wait for initial sync to complete (watcher flushes after scan)
-      log.info('Getting watcher instance', { projectPath });
-      const watcher = brain.getWatcher(projectPath);
-      if (watcher) {
-        log.info('Watcher instance obtained, checking queue');
-        const queue = watcher.getQueue();
-        const initialPending = queue.getPendingCount();
-        const initialQueued = queue.getQueuedCount();
-        log.info('Queue status before wait', { pending: initialPending, queued: initialQueued });
-        
-        log.info('Waiting for initial sync queue to empty');
-        const queueWaitStart = Date.now();
-        // Wait for both locks during initial sync (embeddings will be generated)
-        await waitForQueueEmpty(queue, brain.getIngestionLock(), 300000, brain.getEmbeddingLock()); // 5 minutes
-        const queueWaitDuration = Date.now() - queueWaitStart;
-        log.info('Initial sync queue empty', { duration: queueWaitDuration });
-      } else {
-        log.warn('Watcher instance not found after startWatching', { projectPath });
+      // Wait for ProcessingLoop to complete
+      if (projectId) {
+        log.info('Waiting for processing to complete', { projectId });
+        const waitStart = Date.now();
+        await brain.waitForProcessingComplete(projectId, 300000); // 5 minutes
+        const waitDuration = Date.now() - waitStart;
+        log.info('Processing complete', { duration: waitDuration });
       }
     } catch (err: any) {
       log.error('Failed to start watcher', err, { projectPath });
       // Continue anyway - search will still work, just without auto-ingestion
-      // Don't re-throw to allow other projects to sync
     }
   } else {
-    // 2. Watcher active - check for pending files in queue
-    log.debug('Watcher already active, checking queue');
-    const watcher = brain.getWatcher(projectPath);
-    if (watcher) {
-      const queue = watcher.getQueue();
-      const pendingCount = queue.getPendingCount();
-      const queuedCount = queue.getQueuedCount();
-      const isProcessing = queue.isProcessing();
+    // 2. Watcher active - wait for any ongoing processing
+    log.debug('Watcher already active, checking processing status');
 
-      log.debug('Queue status', { pendingCount, queuedCount, isProcessing });
+    if (projectId) {
+      const isComplete = await brain.isProcessingComplete(projectId);
 
-      if (pendingCount > 0 || queuedCount > 0) {
-        log.info('Flushing queue', { pendingCount, queuedCount });
-
-        // Force immediate flush (don't wait for batch timer)
-        const flushStart = Date.now();
-        await queue.flush();
-        const flushDuration = Date.now() - flushStart;
-        log.debug('Queue flushed', { duration: flushDuration });
-        flushed = true;
-        waited = true;
-
-        // Wait for queue to be completely empty AND ingestion lock released
-        // Note: embedding lock is checked separately in brain_search handler based on semantic flag
-        log.debug('Waiting for queue to be empty');
-        const emptyWaitStart = Date.now();
-        await waitForQueueEmpty(queue, brain.getIngestionLock(), 300000); // 5 minutes, no embedding lock here
-        const emptyWaitDuration = Date.now() - emptyWaitStart;
-        log.debug('Queue empty', { duration: emptyWaitDuration });
-      }
-
-      // 3. Check if ingestion is in progress
-      if (isProcessing) {
-        log.info('Waiting for watcher ingestion to complete');
-        const processWaitStart = Date.now();
-        await waitForQueueEmpty(queue, brain.getIngestionLock(), 300000); // 5 minutes, no embedding lock here
-        const processWaitDuration = Date.now() - processWaitStart;
-        log.debug('Ingestion complete', { duration: processWaitDuration });
+      if (!isComplete) {
+        log.info('Waiting for processing to complete', { projectId });
+        const waitStart = Date.now();
+        await brain.waitForProcessingComplete(projectId, 300000); // 5 minutes
+        const waitDuration = Date.now() - waitStart;
+        log.debug('Processing complete', { duration: waitDuration });
         waited = true;
       }
     }
   }
-  
+
   log.debug('Project sync complete', { waited, watcherStarted, flushed });
 
   return { waited, watcherStarted, flushed };

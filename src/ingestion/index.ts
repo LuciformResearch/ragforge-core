@@ -193,3 +193,24 @@ export {
   DEFAULT_ENTITY_EXTRACTION_CONFIG,
   DOMAIN_PRESETS,
 } from './entity-extraction/index.js';
+
+// ============================================================
+// UNIFIED PROCESSOR (Unification of all ingestion paths)
+// ============================================================
+
+// Unified processor (single pipeline for all files)
+export {
+  UnifiedProcessor,
+  createUnifiedProcessor,
+  type UnifiedProcessorConfig,
+  type ProcessingStats,
+  type RecoveryStats,
+} from './unified-processor.js';
+
+// Processing loop (continuous orchestration)
+export {
+  ProcessingLoop,
+  createProcessingLoop,
+  type ProcessingLoopConfig,
+  type LoopStats,
+} from './processing-loop.js';

@@ -51,11 +51,14 @@ export class NodeStateMachine {
       additionalSets = `, n.${P.parsedAt} = datetime()`;
     } else if (newState === 'linked') {
       additionalSets = `, n.${P.linkedAt} = datetime()`;
+    } else if (newState === 'embedding') {
+      // Set entitiesAt when moving to embedding (entities extraction just completed)
+      additionalSets = `, n.${P.entitiesAt} = datetime()`;
     } else if (newState === 'ready') {
       additionalSets = `, n.${P.embeddedAt} = datetime()`;
     } else if (newState === 'pending') {
       // Reset timestamps when going back to pending
-      additionalSets = `, n.${P.parsedAt} = null, n.${P.linkedAt} = null, n.${P.embeddedAt} = null`;
+      additionalSets = `, n.${P.parsedAt} = null, n.${P.linkedAt} = null, n.${P.entitiesAt} = null, n.${P.embeddedAt} = null`;
     }
 
     const result = await this.neo4jClient.run(
@@ -143,6 +146,7 @@ export class NodeStateMachine {
             n.${P.detectedAt} = COALESCE(n.${P.detectedAt}, datetime($now)),
             n.${P.parsedAt} = CASE WHEN d.state = 'parsed' THEN datetime($now) ELSE n.${P.parsedAt} END,
             n.${P.linkedAt} = CASE WHEN d.state = 'linked' THEN datetime($now) ELSE n.${P.linkedAt} END,
+            n.${P.entitiesAt} = CASE WHEN d.state = 'embedding' THEN datetime($now) ELSE n.${P.entitiesAt} END,
             n.${P.embeddedAt} = CASE WHEN d.state = 'ready' THEN datetime($now) ELSE n.${P.embeddedAt} END
         RETURN count(n) AS count
         `,
@@ -205,6 +209,7 @@ export class NodeStateMachine {
              n.${P.detectedAt} AS detectedAt,
              n.${P.parsedAt} AS parsedAt,
              n.${P.linkedAt} AS linkedAt,
+             n.${P.entitiesAt} AS entitiesAt,
              n.${P.embeddedAt} AS embeddedAt,
              n.${P.contentHash} AS contentHash,
              n.${P.embeddingProvider} AS embeddingProvider,
@@ -246,6 +251,7 @@ export class NodeStateMachine {
       parsed: 0,
       linking: 0,
       linked: 0,
+      entities: 0,
       embedding: 0,
       ready: 0,
       skip: 0,
@@ -380,6 +386,7 @@ export class NodeStateMachine {
             n.${P.retryCount} = 0,
             n.${P.parsedAt} = null,
             n.${P.linkedAt} = null,
+            n.${P.entitiesAt} = null,
             n.${P.embeddedAt} = null
         RETURN count(n) AS count
         `,
@@ -447,6 +454,7 @@ export class NodeStateMachine {
              n.${P.detectedAt} AS detectedAt,
              n.${P.parsedAt} AS parsedAt,
              n.${P.linkedAt} AS linkedAt,
+             n.${P.entitiesAt} AS entitiesAt,
              n.${P.embeddedAt} AS embeddedAt,
              n.${P.contentHash} AS contentHash,
              n.${P.embeddingProvider} AS embeddingProvider,
@@ -486,6 +494,7 @@ export class NodeStateMachine {
     const errorsByType: Record<StateErrorType, number> = {
       parse: 0,
       link: 0,
+      entities: 0,
       embed: 0,
     };
     for (const record of errorResult.records) {
@@ -547,6 +556,9 @@ export class NodeStateMachine {
 
     const linkedAt = record.get('linkedAt');
     if (linkedAt) info.linkedAt = linkedAt.toStandardDate?.() || linkedAt;
+
+    const entitiesAt = record.get('entitiesAt');
+    if (entitiesAt) info.entitiesAt = entitiesAt.toStandardDate?.() || entitiesAt;
 
     const embeddedAt = record.get('embeddedAt');
     if (embeddedAt) info.embeddedAt = embeddedAt.toStandardDate?.() || embeddedAt;

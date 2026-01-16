@@ -29,9 +29,14 @@ import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-ada
 import type { ParseResult } from '../runtime/adapters/types.js';
 import { formatLocalDate } from '../runtime/utils/timestamp.js';
 import { EmbeddingService, MULTI_EMBED_CONFIGS, type EmbeddingProviderConfig } from './embedding-service.js';
+import {
+  ensureBaseIndexes,
+  ensureFulltextIndexes,
+  ensureVectorIndexes as ensureVectorIndexesCentralized,
+} from './ensure-indexes.js';
 import { SearchService, type SearchOptions, type ServiceSearchResult } from './search-service.js';
 import { TouchedFilesWatcher, type ProcessingStats as TouchedFilesStats } from './touched-files-watcher.js';
-import type { FileState } from './file-state-machine.js';
+import { FileStateMachine, type FileState } from './file-state-machine.js';
 import { CONTENT_NODE_LABELS } from '../utils/node-schema.js';
 import { computeSchemaHash } from '../utils/schema-version.js';
 import { FileWatcher, type FileWatcherConfig } from '../runtime/adapters/file-watcher.js';
@@ -52,7 +57,23 @@ import {
   type StateCounts,
   registerAllParsers,
   areParsersRegistered,
+  // Metadata preservation (UUID/embedding reuse)
+  MetadataPreserver,
+  // Unified processor (new pipeline)
+  UnifiedProcessor,
+  createUnifiedProcessor,
+  type UnifiedProcessorConfig,
+  type ProcessingStats,
+  // Processing loop (continuous orchestration)
+  ProcessingLoop,
+  createProcessingLoop,
+  type LoopStats,
 } from '../ingestion/index.js';
+import {
+  EntityExtractionClient,
+  createEntityExtractionTransform,
+  type EntityExtractionConfig,
+} from '../ingestion/entity-extraction/index.js';
 
 const execAsync = promisify(exec);
 
@@ -194,6 +215,20 @@ export interface BrainConfig {
     quickIngestRetention: number;
     /** Days before removing web crawl data */
     webCrawlRetention: number;
+  };
+
+  /** Entity extraction configuration (GLiNER service) */
+  entityExtraction?: {
+    /** Enable entity extraction during ingestion */
+    enabled: boolean;
+    /** GLiNER service URL (default: http://localhost:6971) */
+    serviceUrl?: string;
+    /** Auto-detect document domain for better entity types */
+    autoDetectDomain?: boolean;
+    /** Minimum confidence threshold (default: 0.5) */
+    confidenceThreshold?: number;
+    /** Request timeout in ms (default: 60000) */
+    timeoutMs?: number;
   };
 
   /** Agent settings (persisted) - NEW multi-persona format */
@@ -394,6 +429,13 @@ const DEFAULT_BRAIN_CONFIG: BrainConfig = {
     quickIngestRetention: 30,
     webCrawlRetention: 7,
   },
+  entityExtraction: {
+    enabled: true,
+    serviceUrl: 'http://localhost:6971',
+    autoDetectDomain: true,
+    confidenceThreshold: 0.5,
+    timeoutMs: 60000,
+  },
 };
 
 // ============================================
@@ -421,6 +463,12 @@ export class BrainManager {
   private activeWatchers: Map<string, FileWatcher> = new Map();
   private _orchestrator: IngestionOrchestrator | null = null;
   private _stateMachine: NodeStateMachine | null = null;
+  private entityExtractionClient: EntityExtractionClient | null = null;
+
+  // Unified ingestion pipeline (new)
+  private _fileStateMachine: FileStateMachine | null = null;
+  private _unifiedProcessors: Map<string, UnifiedProcessor> = new Map();
+  private _processingLoops: Map<string, ProcessingLoop> = new Map();
 
   private constructor(config: BrainConfig) {
     this.config = config;
@@ -448,6 +496,7 @@ export class BrainManager {
         apiKeys: { ...DEFAULT_BRAIN_CONFIG.apiKeys, ...config?.apiKeys },
         embeddings: { ...DEFAULT_BRAIN_CONFIG.embeddings, ...config?.embeddings },
         cleanup: { ...DEFAULT_BRAIN_CONFIG.cleanup, ...config?.cleanup },
+        entityExtraction: config?.entityExtraction ? { ...DEFAULT_BRAIN_CONFIG.entityExtraction, ...config.entityExtraction } : DEFAULT_BRAIN_CONFIG.entityExtraction,
       };
       BrainManager.instance = new BrainManager(mergedConfig);
     }
@@ -488,6 +537,17 @@ export class BrainManager {
     // 2. Load or create config (ports, embeddings config, cleanup config)
     await this.loadOrCreateConfig();
 
+    // 2b. Initialize entity extraction client if enabled
+    if (this.config.entityExtraction?.enabled) {
+      this.entityExtractionClient = new EntityExtractionClient({
+        serviceUrl: this.config.entityExtraction.serviceUrl || 'http://localhost:6971',
+        autoDetectDomain: this.config.entityExtraction.autoDetectDomain ?? true,
+        confidenceThreshold: this.config.entityExtraction.confidenceThreshold ?? 0.5,
+        timeoutMs: this.config.entityExtraction.timeoutMs ?? 60000,
+      });
+      console.log(`[Brain] Entity extraction enabled: ${this.config.entityExtraction.serviceUrl || 'http://localhost:6971'}`);
+    }
+
     // 3. Load or create .env (credentials - generated once, reused)
     await this.ensureBrainEnv();
 
@@ -511,6 +571,12 @@ export class BrainManager {
 
     // 10. Initialize ingestion orchestrator
     await this.initializeOrchestrator();
+
+    // 11. Initialize FileStateMachine for the unified pipeline
+    if (this.neo4jClient) {
+      this._fileStateMachine = new FileStateMachine(this.neo4jClient);
+      console.log('[Brain] FileStateMachine initialized');
+    }
 
     this.initialized = true;
     console.log('[Brain] Initialized successfully');
@@ -596,6 +662,54 @@ export class BrainManager {
         });
         return result.totalEmbedded;
       },
+
+      // Entity extraction transform (if enabled)
+      transformGraph: this.entityExtractionClient ? async (graph) => {
+        const isAvailable = await this.entityExtractionClient!.isAvailable();
+        if (!isAvailable) {
+          console.warn('[Brain] Entity extraction service not available, skipping');
+          return graph;
+        }
+
+        const embedFunction = async (texts: string[]) => {
+          const service = this.getEmbeddingService();
+          if (!service) return texts.map(() => []);
+          return service.embedBatch(texts);
+        };
+
+        console.log('[Brain] Running entity extraction transform...');
+        const entityTransform = createEntityExtractionTransform({
+          ...this.entityExtractionClient!.getConfig(),
+          projectId: graph.nodes[0]?.properties?.projectId as string || 'unknown',
+          verbose: true,
+          deduplication: {
+            strategy: 'hybrid',
+            fuzzyThreshold: 0.85,
+            embeddingThreshold: 0.9,
+          },
+          embedFunction,
+        });
+
+        // Adapt graph to ParsedGraph format expected by entity transform
+        const parsedGraph = {
+          nodes: graph.nodes,
+          relationships: graph.relationships,
+          metadata: {
+            ...graph.metadata,
+            relationshipsGenerated: graph.relationships.length,
+            parseTimeMs: 0,
+          },
+        };
+
+        const result = await entityTransform(parsedGraph);
+
+        // Return in the format expected by transformGraph hook
+        return {
+          nodes: result.nodes,
+          relationships: result.relationships,
+          metadata: graph.metadata,
+        };
+      } : undefined,
     };
 
     this._orchestrator = new IngestionOrchestrator(deps, {
@@ -608,6 +722,77 @@ export class BrainManager {
 
     await this._orchestrator.initialize();
     console.log('[Brain] Ingestion orchestrator initialized');
+  }
+
+  /**
+   * Get or create a UnifiedProcessor for a specific project
+   * Each project has its own processor instance.
+   */
+  getOrCreateUnifiedProcessor(projectId: string, projectRoot?: string): UnifiedProcessor | null {
+    // Check if already exists
+    const existing = this._unifiedProcessors.get(projectId);
+    if (existing) {
+      return existing;
+    }
+
+    // Validate dependencies
+    if (!this.neo4jClient) {
+      console.warn('[Brain] Cannot create unified processor: Neo4j client not connected');
+      return null;
+    }
+
+    const driver = this.neo4jClient.getDriver();
+    if (!driver) {
+      console.warn('[Brain] Cannot create unified processor: Neo4j driver not available');
+      return null;
+    }
+
+    // Create processor for this project
+    const processor = createUnifiedProcessor(driver, this.neo4jClient, projectId, {
+      projectRoot,
+      glinerServiceUrl: this.entityExtractionClient
+        ? this.config.entityExtraction?.serviceUrl
+        : undefined,
+      verbose: false,
+    });
+
+    this._unifiedProcessors.set(projectId, processor);
+    console.log(`[Brain] UnifiedProcessor created for project: ${projectId}`);
+
+    return processor;
+  }
+
+  /**
+   * Get or create a ProcessingLoop for a specific project
+   */
+  getOrCreateProcessingLoop(projectId: string, projectRoot?: string): ProcessingLoop | null {
+    // Check if already exists
+    const existing = this._processingLoops.get(projectId);
+    if (existing) {
+      return existing;
+    }
+
+    // Get or create processor first
+    const processor = this.getOrCreateUnifiedProcessor(projectId, projectRoot);
+    if (!processor) {
+      console.warn(`[Brain] Cannot create processing loop: processor not available for ${projectId}`);
+      return null;
+    }
+
+    // Create loop for this project
+    const loop = createProcessingLoop(processor, {
+      idleIntervalMs: 1000,
+      busyIntervalMs: 100,
+      maxIdleIntervalMs: 10000,
+      batchSize: 10,
+      verbose: false,
+      recoverOnStart: true,
+    });
+
+    this._processingLoops.set(projectId, loop);
+    console.log(`[Brain] ProcessingLoop created for project: ${projectId}`);
+
+    return loop;
   }
 
   /**
@@ -627,6 +812,168 @@ export class BrainManager {
   }
 
   /**
+   * Get the file state machine
+   * Returns null if not initialized
+   */
+  get fileStateMachine(): FileStateMachine | null {
+    return this._fileStateMachine;
+  }
+
+  /**
+   * Get or create FileStateMachine (singleton, shared across all projects)
+   * The FileStateMachine uses projectId in queries, so one instance works for all projects.
+   */
+  getOrCreateFileStateMachine(_projectId?: string): FileStateMachine {
+    if (!this._fileStateMachine) {
+      if (!this.neo4jClient) {
+        throw new Error('Brain not initialized. Call initialize() first.');
+      }
+      this._fileStateMachine = new FileStateMachine(this.neo4jClient);
+    }
+    return this._fileStateMachine;
+  }
+
+  /**
+   * Get project ID for a given path
+   * Uses ProjectRegistry to generate a consistent ID from the path.
+   */
+  getProjectIdForPath(projectPath: string): string {
+    const absolutePath = path.resolve(projectPath);
+    return ProjectRegistry.generateId(absolutePath);
+  }
+
+  /**
+   * Get unified processor for a project
+   */
+  getUnifiedProcessor(projectId: string): UnifiedProcessor | null {
+    return this._unifiedProcessors.get(projectId) || null;
+  }
+
+  /**
+   * Get processing loop for a project
+   */
+  getProcessingLoop(projectId: string): ProcessingLoop | null {
+    return this._processingLoops.get(projectId) || null;
+  }
+
+  /**
+   * Get all active unified processors
+   */
+  getAllUnifiedProcessors(): Map<string, UnifiedProcessor> {
+    return new Map(this._unifiedProcessors);
+  }
+
+  /**
+   * Get all active processing loops
+   */
+  getAllProcessingLoops(): Map<string, ProcessingLoop> {
+    return new Map(this._processingLoops);
+  }
+
+  /**
+   * Start the processing loop for a specific project
+   */
+  async startProcessingLoop(projectId: string, projectRoot?: string): Promise<void> {
+    const loop = this.getOrCreateProcessingLoop(projectId, projectRoot);
+    if (!loop) {
+      console.warn(`[Brain] Cannot start processing loop: not available for ${projectId}`);
+      return;
+    }
+    if (loop.isActive()) {
+      console.log(`[Brain] ProcessingLoop already running for ${projectId}`);
+      return;
+    }
+    await loop.start();
+    console.log(`[Brain] ProcessingLoop started for ${projectId}`);
+  }
+
+  /**
+   * Stop the processing loop for a specific project
+   */
+  async stopProcessingLoop(projectId: string): Promise<void> {
+    const loop = this._processingLoops.get(projectId);
+    if (!loop) {
+      return;
+    }
+    await loop.stop();
+    console.log(`[Brain] ProcessingLoop stopped for ${projectId}`);
+  }
+
+  /**
+   * Stop all processing loops
+   */
+  async stopAllProcessingLoops(): Promise<void> {
+    const promises: Promise<void>[] = [];
+    for (const [projectId, loop] of this._processingLoops) {
+      if (loop.isActive()) {
+        promises.push(loop.stop().then(() => {
+          console.log(`[Brain] ProcessingLoop stopped for ${projectId}`);
+        }));
+      }
+    }
+    await Promise.all(promises);
+  }
+
+  /**
+   * Get processing loop statistics for a project
+   */
+  getProcessingLoopStats(projectId: string): LoopStats | null {
+    const loop = this._processingLoops.get(projectId);
+    if (!loop) return null;
+    return loop.getStats();
+  }
+
+  /**
+   * Get unified processor progress for a project
+   */
+  async getProcessingProgress(projectId: string): Promise<{ processed: number; total: number; percentage: number } | null> {
+    const processor = this._unifiedProcessors.get(projectId);
+    if (!processor) return null;
+    return processor.getProgress();
+  }
+
+  /**
+   * Check if all files are fully processed for a project
+   */
+  async isProcessingComplete(projectId: string): Promise<boolean> {
+    const processor = this._unifiedProcessors.get(projectId);
+    if (!processor) return true;
+    return processor.isComplete();
+  }
+
+  /**
+   * Wait for processing to complete for a project
+   *
+   * @param projectId - Project ID to wait for
+   * @param maxWaitMs - Maximum time to wait in milliseconds (default: 300000 = 5 minutes)
+   * @param pollIntervalMs - Interval between checks (default: 200ms)
+   * @returns true if processing completed, false if timed out
+   */
+  async waitForProcessingComplete(
+    projectId: string,
+    maxWaitMs: number = 300000,
+    pollIntervalMs: number = 200
+  ): Promise<boolean> {
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWaitMs) {
+      // Check if ProcessingLoop is done
+      const isComplete = await this.isProcessingComplete(projectId);
+      if (isComplete) {
+        // Also check if ingestion lock is released
+        if (!this.ingestionLock.isLocked()) {
+          return true;
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+
+    console.warn(`[Brain] Timeout waiting for processing to complete for ${projectId} after ${maxWaitMs}ms`);
+    return false;
+  }
+
+  /**
    * Get node state counts for a project (or all projects)
    * Useful for dashboards and monitoring
    */
@@ -638,212 +985,26 @@ export class BrainManager {
   /**
    * Ensure Neo4j indexes exist for fast node lookups
    * Critical for relationship creation performance
+   *
+   * Uses centralized index management from ensure-indexes.ts
    */
   private async ensureIndexes(): Promise<void> {
     if (!this.neo4jClient) return;
 
     console.log('[Brain] Ensuring indexes...');
 
-    // Index on uuid for fast relationship MATCH queries
-    // This dramatically speeds up MATCH (from {uuid: ...}) queries
-    const indexQueries = [
-      'CREATE INDEX node_uuid IF NOT EXISTS FOR (n:Scope) ON (n.uuid)',
-      'CREATE INDEX file_uuid IF NOT EXISTS FOR (n:File) ON (n.uuid)',
-      'CREATE INDEX directory_uuid IF NOT EXISTS FOR (n:Directory) ON (n.uuid)',
-      'CREATE INDEX project_uuid IF NOT EXISTS FOR (n:Project) ON (n.uuid)',
-      'CREATE INDEX package_uuid IF NOT EXISTS FOR (n:PackageJson) ON (n.uuid)',
-      'CREATE INDEX markdown_uuid IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.uuid)',
-      'CREATE INDEX codeblock_uuid IF NOT EXISTS FOR (n:CodeBlock) ON (n.uuid)',
-      'CREATE INDEX section_uuid IF NOT EXISTS FOR (n:MarkdownSection) ON (n.uuid)',
-      'CREATE INDEX datafile_uuid IF NOT EXISTS FOR (n:DataFile) ON (n.uuid)',
-      'CREATE INDEX datasection_uuid IF NOT EXISTS FOR (n:DataSection) ON (n.uuid)',
-      'CREATE INDEX mediafile_uuid IF NOT EXISTS FOR (n:MediaFile) ON (n.uuid)',
-      'CREATE INDEX imagefile_uuid IF NOT EXISTS FOR (n:ImageFile) ON (n.uuid)',
-      'CREATE INDEX webpage_uuid IF NOT EXISTS FOR (n:WebPage) ON (n.uuid)',
-      // Entity extraction indexes (GLiNER)
-      'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
-      'CREATE INDEX entity_projectid IF NOT EXISTS FOR (n:Entity) ON (n.projectId)',
-      'CREATE INDEX entity_type IF NOT EXISTS FOR (n:Entity) ON (n.entityType)',
-      'CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n._name)',
-      // Index on projectId for fast project-scoped queries
-      'CREATE INDEX scope_projectid IF NOT EXISTS FOR (n:Scope) ON (n.projectId)',
-      'CREATE INDEX file_projectid IF NOT EXISTS FOR (n:File) ON (n.projectId)',
-      // Index for touched-files (orphan files outside projects)
-      'CREATE INDEX directory_path IF NOT EXISTS FOR (n:Directory) ON (n.path)',
-      'CREATE INDEX file_absolutepath IF NOT EXISTS FOR (n:File) ON (n.absolutePath)',
-      'CREATE INDEX file_state IF NOT EXISTS FOR (n:File) ON (n.state)',
-      // Index on absolutePath for fast file lookups across all node types
-      'CREATE INDEX scope_absolutepath IF NOT EXISTS FOR (n:Scope) ON (n.absolutePath)',
-      'CREATE INDEX markdown_absolutepath IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.absolutePath)',
-      'CREATE INDEX section_absolutepath IF NOT EXISTS FOR (n:MarkdownSection) ON (n.absolutePath)',
-      'CREATE INDEX datafile_absolutepath IF NOT EXISTS FOR (n:DataFile) ON (n.absolutePath)',
-      'CREATE INDEX mediafile_absolutepath IF NOT EXISTS FOR (n:MediaFile) ON (n.absolutePath)',
-      'CREATE INDEX imagefile_absolutepath IF NOT EXISTS FOR (n:ImageFile) ON (n.absolutePath)',
-      'CREATE INDEX stylesheet_absolutepath IF NOT EXISTS FOR (n:Stylesheet) ON (n.absolutePath)',
-      'CREATE INDEX webpage_absolutepath IF NOT EXISTS FOR (n:WebPage) ON (n.absolutePath)',
-    ];
+    // Base indexes (UUID, projectId, absolutePath, state)
+    await ensureBaseIndexes(this.neo4jClient, { verbose: false });
 
-    for (const query of indexQueries) {
-      try {
-        await this.neo4jClient.run(query);
-      } catch (err: any) {
-        // Ignore errors (index might already exist with different name)
-        if (!err.message?.includes('already exists')) {
-          console.warn(`[Brain] Index creation warning: ${err.message}`);
-        }
-      }
+    // Fulltext index for BM25 search
+    await ensureFulltextIndexes(this.neo4jClient, { verbose: false });
+
+    // Vector indexes for semantic search (if embeddings are enabled)
+    if (this.embeddingService?.canGenerateEmbeddings()) {
+      await ensureVectorIndexesCentralized(this.neo4jClient, { dimension: 3072, verbose: false });
     }
 
     console.log('[Brain] Indexes ensured');
-
-    // Ensure full-text indexes for BM25 search
-    await this.ensureFullTextIndexes();
-
-    // Ensure vector indexes for semantic search (if embeddings are enabled)
-    if (this.embeddingService?.canGenerateEmbeddings()) {
-      await this.ensureVectorIndexes();
-    }
-  }
-
-  /**
-   * Ensure full-text indexes exist for BM25 keyword search
-   * Creates composite indexes covering textContent/source fields across node types
-   */
-  private async ensureFullTextIndexes(): Promise<void> {
-    if (!this.neo4jClient) return;
-
-    console.log('[Brain] Ensuring unified full-text index...');
-
-    // Single unified fulltext index on _name, _content, _description
-    // These unified fields are extracted by GraphMerger.extractUnifiedFields()
-    // from the original type-specific fields (source, code, textContent, etc.)
-    const allContentLabels = [
-      'Scope', 'File', 'DataFile', 'DocumentFile', 'PDFDocument', 'WordDocument',
-      'SpreadsheetDocument', 'MarkdownDocument', 'MarkdownSection', 'MediaFile',
-      'ImageFile', 'ThreeDFile', 'WebPage', 'CodeBlock', 'VueSFC', 'SvelteComponent',
-      'Stylesheet', 'GenericFile', 'PackageJson', 'DataSection', 'WebDocument',
-      'Entity', // Entity extraction nodes (GLiNER)
-    ];
-
-    try {
-      const labelsPart = allContentLabels.join('|');
-      const query = `CREATE FULLTEXT INDEX unified_fulltext IF NOT EXISTS FOR (n:${labelsPart}) ON EACH [n._name, n._content, n._description]`;
-
-      await this.neo4jClient.run(query);
-      console.log('[Brain] Unified full-text index ensured');
-    } catch (err: any) {
-      if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
-        console.log('[Brain] Unified full-text index already exists');
-      } else {
-        console.warn(`[Brain] Full-text index creation warning: ${err.message}`);
-      }
-    }
-  }
-
-  /**
-   * Ensure vector indexes exist for fast semantic search
-   * Creates indexes based on MULTI_EMBED_CONFIGS (only for labels/types that actually have embeddings)
-   */
-  private async ensureVectorIndexes(): Promise<void> {
-    if (!this.neo4jClient || !this.embeddingService) return;
-
-    console.log('[Brain] Ensuring vector indexes...');
-
-    // Dimension for Gemini embeddings
-    const dimension = 3072;
-
-    let createdCount = 0;
-    let skippedCount = 0;
-    let errorCount = 0;
-
-    // Create indexes based on actual embedding configurations
-    for (const config of MULTI_EMBED_CONFIGS) {
-      const label = config.label;
-
-      for (const embeddingConfig of config.embeddings) {
-        const embeddingProp = embeddingConfig.propertyName;
-        // Index name format: {label}_{embeddingProp}_vector
-        // e.g., scope_embedding_name_vector, file_embedding_content_vector
-        const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
-
-        try {
-          // Check if index already exists
-          const checkResult = await this.neo4jClient.run(
-            `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
-            { indexName }
-          );
-
-          const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
-
-          if (!exists) {
-            // Create vector index
-            const createQuery = `
-              CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
-              FOR (n:\`${label}\`)
-              ON n.\`${embeddingProp}\`
-              OPTIONS {
-                indexConfig: {
-                  \`vector.dimensions\`: ${dimension},
-                  \`vector.similarity_function\`: 'cosine'
-                }
-              }
-            `;
-
-            await this.neo4jClient.run(createQuery);
-            createdCount++;
-            console.log(`[Brain] Created vector index: ${indexName}`);
-          } else {
-            skippedCount++;
-          }
-        } catch (err: any) {
-          errorCount++;
-          // Ignore errors (index might already exist or Neo4j version doesn't support vector indexes)
-          if (!err.message?.includes('already exists') && !err.message?.includes('does not exist')) {
-            console.warn(`[Brain] Vector index creation warning for ${indexName}: ${err.message}`);
-          }
-        }
-      }
-    }
-
-    // Also create index for legacy 'embedding' property on common labels
-    const legacyLabels = ['Scope', 'File', 'MarkdownSection', 'CodeBlock', 'MarkdownDocument'];
-    for (const label of legacyLabels) {
-      const indexName = `${label.toLowerCase()}_embedding_vector`;
-      try {
-        const checkResult = await this.neo4jClient.run(
-          `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
-          { indexName }
-        );
-        const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
-        if (!exists) {
-          const createQuery = `
-            CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
-            FOR (n:\`${label}\`)
-            ON n.\`embedding\`
-            OPTIONS {
-              indexConfig: {
-                \`vector.dimensions\`: ${dimension},
-                \`vector.similarity_function\`: 'cosine'
-              }
-            }
-          `;
-          await this.neo4jClient.run(createQuery);
-          createdCount++;
-          console.log(`[Brain] Created legacy vector index: ${indexName}`);
-        } else {
-          skippedCount++;
-        }
-      } catch (err: any) {
-        errorCount++;
-        if (!err.message?.includes('already exists') && !err.message?.includes('does not exist')) {
-          console.debug(`[Brain] Legacy vector index creation skipped for ${indexName}: ${err.message}`);
-        }
-      }
-    }
-
-    if (createdCount > 0 || skippedCount > 0) {
-      console.log(`[Brain] Vector indexes ensured (${createdCount} created, ${skippedCount} already existed${errorCount > 0 ? `, ${errorCount} errors` : ''})`);
-    }
   }
 
   /**
@@ -1499,6 +1660,7 @@ volumes:
     // Initialize ingestion manager (with change tracking)
     this.ingestionManager = new IncrementalIngestionManager(this.neo4jClient);
     console.log('[Brain] IncrementalIngestionManager initialized');
+    // Note: Entity extraction is now handled post-ingestion via processEntityExtraction()
 
     // Initialize embedding service with configured provider
     const embeddingConfig = this.buildEmbeddingProviderConfig();
@@ -2634,32 +2796,8 @@ volumes:
       skipInitialSync: false, // Do the initial ingestion
     });
 
-    // Wait for initial sync to complete (queue must be processed)
-    const watcher = this.getWatcher(absolutePath);
-    if (watcher) {
-      const queue = watcher.getQueue();
-      const maxWaitMs = 300000; // 5 minutes max
-      const startWait = Date.now();
-
-      // Wait for queue to be empty (files processed)
-      while (queue.getPendingCount() > 0 || queue.getQueuedCount() > 0) {
-        if (Date.now() - startWait > maxWaitMs) {
-          console.warn(`[QuickIngest] Timeout waiting for queue to empty after ${maxWaitMs}ms`);
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-
-      // Also wait for ingestion lock to be released
-      const ingestionLock = this.getIngestionLock();
-      while (ingestionLock.isLocked()) {
-        if (Date.now() - startWait > maxWaitMs) {
-          console.warn(`[QuickIngest] Timeout waiting for ingestion lock after ${maxWaitMs}ms`);
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
+    // Wait for initial sync to complete (ProcessingLoop must finish)
+    await this.waitForProcessingComplete(finalProjectId, 300000); // 5 minutes max
 
     // Get stats after ingestion
     const nodeCount = await this.countProjectNodes(finalProjectId);
@@ -4254,6 +4392,108 @@ volumes:
   }
 
   /**
+   * Process entity extraction on dirty document nodes (post-ingestion).
+   * This is called after ingestion to extract entities only from nodes with changed content.
+   *
+   * @param projectId - Project to process
+   * @param verbose - Enable verbose logging
+   * @returns Stats about entities processed
+   */
+  async processEntityExtraction(projectId: string, verbose = false): Promise<{
+    nodesProcessed: number;
+    entitiesCreated: number;
+    relationsCreated: number;
+  }> {
+    if (!this.entityExtractionClient || !this.ingestionManager) {
+      return { nodesProcessed: 0, entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // Check service availability
+    const isAvailable = await this.entityExtractionClient.isAvailable();
+    if (!isAvailable) {
+      if (verbose) console.warn('[Brain] Entity extraction service not available, skipping');
+      return { nodesProcessed: 0, entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // Get dirty entity nodes
+    const dirtyNodes = await this.ingestionManager.getDirtyEntityNodes(projectId);
+    if (dirtyNodes.length === 0) {
+      return { nodesProcessed: 0, entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    if (verbose) {
+      console.log(`[Brain] Processing entity extraction for ${dirtyNodes.length} dirty nodes...`);
+    }
+
+    // Build a graph from the dirty nodes
+    const nodes = dirtyNodes.map(n => ({
+      id: n.uuid,
+      labels: n.labels,
+      properties: {
+        uuid: n.uuid,
+        projectId,
+        _content: n.content,
+        file: n.file,
+      },
+    }));
+
+    const embedFunction = async (texts: string[]) => {
+      const service = this.getEmbeddingService();
+      if (!service) return texts.map(() => []);
+      return service.embedBatch(texts);
+    };
+
+    // Create and run the entity transform
+    const entityTransform = createEntityExtractionTransform({
+      ...this.entityExtractionClient.getConfig(),
+      projectId,
+      verbose,
+      deduplication: {
+        strategy: 'hybrid',
+        fuzzyThreshold: 0.85,
+        embeddingThreshold: 0.9,
+      },
+      embedFunction,
+    });
+
+    const result = await entityTransform({
+      nodes,
+      relationships: [],
+      metadata: { filesProcessed: 0, nodesGenerated: nodes.length, relationshipsGenerated: 0, parseTimeMs: 0 },
+    });
+
+    // Extract only Entity nodes and their relationships
+    const entityNodes = result.nodes.filter(n => n.labels.includes('Entity'));
+    const entityRelationships = result.relationships;
+
+    if (entityNodes.length > 0) {
+      if (verbose) {
+        console.log(`[Brain] Ingesting ${entityNodes.length} entities, ${entityRelationships.length} relationships...`);
+      }
+
+      // Ingest the Entity nodes
+      await this.ingestionManager.ingestGraph(
+        { nodes: entityNodes, relationships: entityRelationships },
+        { projectId, markDirty: true }
+      );
+    }
+
+    // Mark source nodes as clean
+    const processedUuids = dirtyNodes.map(n => n.uuid);
+    await this.ingestionManager.markEntitiesClean(processedUuids);
+
+    if (verbose) {
+      console.log(`[Brain] Entity extraction complete: ${entityNodes.length} entities from ${dirtyNodes.length} nodes`);
+    }
+
+    return {
+      nodesProcessed: dirtyNodes.length,
+      entitiesCreated: entityNodes.length,
+      relationsCreated: entityRelationships.length,
+    };
+  }
+
+  /**
    * Build the embedding provider configuration based on brain config
    */
   private buildEmbeddingProviderConfig(): EmbeddingProviderConfig | undefined {
@@ -4474,9 +4714,6 @@ volumes:
       throw new Error('Brain not initialized. Call initialize() first.');
     }
 
-    // Create IncrementalIngestionManager for the watcher
-    const ingestionManager = new IncrementalIngestionManager(this.neo4jClient);
-
     // Default patterns from shared constants
     const includePatterns = options.includePatterns || DEFAULT_INCLUDE_PATTERNS;
     const excludePatterns = options.excludePatterns || DEFAULT_EXCLUDE_PATTERNS;
@@ -4490,98 +4727,39 @@ volumes:
       exclude: excludePatterns,
     };
 
-    // Create FileWatcher with afterIngestion callback for embeddings
-    const watcher = new FileWatcher(ingestionManager, sourceConfig, {
-      projectId, // Required for hash-based incremental detection
-      verbose: options.verbose ?? false,
-      ingestionLock: this.ingestionLock,
-      embeddingLock: this.embeddingLock, // Separate lock for embeddings
-      batchInterval: 1000, // 1 second batching
+    // Get or create FileStateMachine
+    const fileStateMachine = this.getOrCreateFileStateMachine(projectId);
 
-      // Hook afterIngestion to regenerate embeddings
-      afterIngestion: async (stats) => {
-        if (stats.created + stats.updated > 0 && this.embeddingService?.canGenerateEmbeddings()) {
-          console.log(`[Brain] Regenerating embeddings for ${stats.created + stats.updated} changed nodes...`);
-          try {
-            const result = await this.embeddingService.generateMultiEmbeddings({
-              projectId,
-              incrementalOnly: true,
-              verbose: options.verbose ?? false,
-            });
-            console.log(`[Brain] Embeddings: ${result.totalEmbedded} generated, ${result.skippedCount} cached`);
-          } catch (err: any) {
-            console.warn(`[Brain] Embedding generation failed: ${err.message}`);
+    // Create FileWatcher (detector mode - only marks files as 'discovered')
+    const watcher = new FileWatcher(
+      {
+        fileStateMachine,
+        neo4jClient: this.neo4jClient,
+      },
+      sourceConfig,
+      {
+        projectId,
+        verbose: options.verbose ?? false,
+        batchIntervalMs: 500, // 500ms batching
+        onBatchComplete: (stats) => {
+          if (stats.created + stats.reset + stats.deleted > 0) {
+            console.log(`[Brain] Files detected: +${stats.created} new, ~${stats.reset} changed, -${stats.deleted} deleted`);
           }
-        }
-      },
+          // Trigger ProcessingLoop to process the discovered files
+          const loop = this._processingLoops.get(projectId);
+          if (loop) {
+            loop.triggerProcessing();
+          }
+        },
+      }
+    );
 
-      onBatchComplete: (stats) => {
-        console.log(`[Brain] Ingestion complete: +${stats.created} created, ~${stats.updated} updated, -${stats.deleted} deleted`);
-      },
-
-      // Process dirty embeddings after each batch (regardless of file changes)
-      // This catches nodes marked dirty manually or from schema changes
-      afterBatch: async (_stats) => {
-        if (!this.neo4jClient || !this.embeddingService?.canGenerateEmbeddings()) {
-          return;
-        }
-
-        // Count dirty embeddings for this project
-        let dirtyCount = 0;
-        try {
-          const result = await this.neo4jClient.run(
-            `MATCH (n)
-             WHERE n.projectId = $projectId AND n.embeddingsDirty = true
-             RETURN count(n) as count`,
-            { projectId }
-          );
-          dirtyCount = result.records[0]?.get('count')?.toNumber() ?? 0;
-        } catch (err) {
-          return; // Can't check, skip
-        }
-
-        if (dirtyCount === 0) {
-          return; // Nothing to process
-        }
-
-        // Acquire embedding lock to block semantic queries during generation
-        // Dynamic timeout: 2 minutes per batch of 500 nodes, minimum 20 minutes
-        // This accounts for rate limiting which can add 60-70 seconds per batch
-        const batchCount = Math.ceil(dirtyCount / 500);
-        const dynamicTimeout = Math.max(1200000, batchCount * 120000); // min 20 min, 2 min per batch
-        const embeddingOpKey = this.embeddingLock.acquire('watcher-batch', `dirty:${dirtyCount}`, {
-          description: `Processing ${dirtyCount} dirty embeddings for ${projectId}`,
-          timeoutMs: dynamicTimeout,
-        });
-        console.log(`[Brain] Embedding lock timeout: ${Math.round(dynamicTimeout / 60000)} minutes for ${batchCount} batches`);
-
-        console.log(`[Brain] Processing ${dirtyCount} dirty embeddings for project ${projectId}...`);
-        try {
-          const result = await this.embeddingService.generateMultiEmbeddings({
-            projectId,
-            incrementalOnly: true, // Only process nodes with embeddingsDirty = true
-            verbose: true, // Force verbose for debugging
-          });
-          console.log(`[Brain] Dirty embeddings processed: ${result.totalEmbedded} generated, ${result.skippedCount} skipped`);
-        } catch (err: any) {
-          console.error(`[Brain] Failed to process dirty embeddings: ${err.message}`);
-          // Don't rethrow - afterBatch errors shouldn't fail the batch
-        } finally {
-          // Release embedding lock
-          this.embeddingLock.release(embeddingOpKey);
-        }
-      },
-    });
-
-    // Initial sync: catch up with any changes since last ingestion
+    // Initial sync: mark existing files as discovered for processing
     // Skip if:
     // - explicitly requested (skipInitialSync: true)
     // - project already has nodes in database AND skipInitialSync not explicitly false
-    // NOTE: We check the DATABASE directly, not the YAML config (which can be stale)
-    // NOTE: skipInitialSync: false forces sync even after orphan migration
     const nodeCountInDb = await this.countProjectNodes(projectId);
     const projectHasNodes = nodeCountInDb > 0;
-    // Use nullish coalescing: explicit false = force sync, undefined = check projectHasNodes
     const shouldSkipInitialSync = options.skipInitialSync ?? projectHasNodes;
 
     if (shouldSkipInitialSync) {
@@ -4593,45 +4771,13 @@ volumes:
     } else {
       console.log(`[Brain] Initial sync for project: ${projectId}...`);
 
-      // Acquire lock for initial sync (no timeout - can take minutes for large projects)
-      const opKey = this.ingestionLock.acquire('initial-ingest', absolutePath, {
-        description: `Initial sync: ${projectId}`,
-        timeoutMs: 0,
-      });
-
-      try {
-        const syncResult = await ingestionManager.ingestFromPaths(
-          sourceConfig,
-          { projectId, verbose: options.verbose ?? false, incremental: true }
-        );
-
-        if (syncResult.created + syncResult.updated + syncResult.deleted > 0) {
-          console.log(`[Brain] Initial sync: +${syncResult.created} created, ~${syncResult.updated} updated, -${syncResult.deleted} deleted`);
-
-          // Generate embeddings for synced files if needed
-          if (this.embeddingService?.canGenerateEmbeddings()) {
-            console.log(`[Brain] Generating embeddings for synced files...`);
-            try {
-              const embedResult = await this.embeddingService.generateMultiEmbeddings({
-                projectId,
-                incrementalOnly: true,
-                verbose: options.verbose ?? false,
-              });
-              console.log(`[Brain] Embeddings: ${embedResult.totalEmbedded} generated, ${embedResult.skippedCount} cached`);
-            } catch (err: any) {
-              console.warn(`[Brain] Embedding generation failed: ${err.message}`);
-            }
-          }
-        } else {
-          console.log(`[Brain] Initial sync: no changes detected`);
-        }
-      } catch (err: any) {
-        console.warn(`[Brain] Initial sync failed: ${err.message}`);
-        // Continue with watcher anyway
-      } finally {
-        this.ingestionLock.release(opKey);
-      }
+      // Mark all existing files as discovered using watcher's queueDirectory
+      // This will be processed by ProcessingLoop
+      await watcher.queueDirectory(absolutePath);
     }
+
+    // Start ProcessingLoop for this project
+    await this.startProcessingLoop(projectId, absolutePath);
 
     // Start watching for future changes
     console.log(`[Brain] Starting watcher for project: ${projectId}...`);
@@ -4644,9 +4790,6 @@ volumes:
       console.log(`[Brain] Started watching project: ${projectId}`);
     } catch (err: any) {
       console.error(`[Brain] Failed to start watcher: ${err.message}`);
-      // Don't add to activeWatchers if start failed
-      // Don't re-throw - allow the process to continue without this watcher
-      // The project can still be searched, just without auto-ingestion on file changes
       console.warn(`[Brain] Project ${projectId} will not be watched for changes. Search will still work.`);
     }
   }

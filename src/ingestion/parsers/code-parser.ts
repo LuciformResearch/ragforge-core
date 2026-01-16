@@ -85,16 +85,17 @@ const scopeFieldExtractors: FieldExtractors = {
  */
 const fileFieldExtractors: FieldExtractors = {
   name: (node) => {
-    // Use full path for better search
-    return (node.path as string) || (node.name as string) || '';
+    // Use filename only (absolutePath has full path)
+    const filePath = (node.path as string) || (node.name as string) || '';
+    return path.basename(filePath);
   },
 
-  content: (node) => {
-    // File source code
-    return (node.source as string) || null;
+  content: () => {
+    // File node is a container - Scopes have content
+    return null;
   },
 
-  description: () => null, // Would duplicate name
+  description: () => null,
 
   displayPath: (node) => (node.path as string) || '',
 

@@ -399,6 +399,10 @@ export class DataParser implements ContentParser {
         contentHash: hashContent(packageName),
         name: packageName,
         registry: 'npm',
+        // Normalized properties for search
+        _name: packageName,
+        _content: null,
+        _description: 'npm package',
       },
       position: { type: 'whole' },
     };

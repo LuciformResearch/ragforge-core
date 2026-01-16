@@ -44,16 +44,14 @@ const imageFieldExtractors: FieldExtractors = {
     return path.basename(file);
   },
 
-  content: (node) => {
-    // Images don't have textual content by default
-    // Description is populated on-demand via analysis
-    return node.description as string | null ?? null;
+  content: () => {
+    // Images don't have textual content - use _description for vision analysis
+    return null;
   },
 
   description: (node) => {
-    // Return analysis description if available
-    const analysis = node.analysis as { description?: string } | undefined;
-    return analysis?.description ?? null;
+    // Vision analysis description
+    return (node.description as string) || null;
   },
 
   displayPath: (node) => {
@@ -79,26 +77,15 @@ const threeDFieldExtractors: FieldExtractors = {
     return path.basename(file);
   },
 
-  content: (node) => {
-    // 3D files don't have textual content
-    // Could return GLTF metadata as content
-    const gltf = node.gltfInfo as {
-      meshCount?: number;
-      materialCount?: number;
-      textureCount?: number;
-      animationCount?: number;
-    } | undefined;
-
-    if (gltf) {
-      return `Meshes: ${gltf.meshCount ?? 0}, Materials: ${gltf.materialCount ?? 0}, Textures: ${gltf.textureCount ?? 0}, Animations: ${gltf.animationCount ?? 0}`;
-    }
+  content: () => {
+    // 3D files don't have textual content by default
+    // GLTF metadata can be included via includeGltfMetadata option (future)
     return null;
   },
 
   description: (node) => {
-    // Return analysis description if available
-    const analysis = node.analysis as { description?: string } | undefined;
-    return analysis?.description ?? null;
+    // Vision analysis description
+    return (node.description as string) || null;
   },
 
   displayPath: (node) => {

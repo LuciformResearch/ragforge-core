@@ -152,3 +152,17 @@ export {
   type PostProcessOptions,
   type PostProcessResult,
 } from './search-post-processor.js';
+
+// Centralized Index Management
+export {
+  ensureBaseIndexes,
+  ensureFulltextIndexes,
+  ensureVectorIndexes as ensureVectorIndexesCentralized,
+  ensureConversationIndexes,
+  ensureAllIndexes,
+  UUID_INDEXED_LABELS,
+  FULLTEXT_LABELS,
+  ABSOLUTE_PATH_LABELS,
+  type EnsureIndexesOptions,
+  type IndexStats,
+} from './ensure-indexes.js';

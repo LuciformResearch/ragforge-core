@@ -5,11 +5,23 @@
  * that extracts entities from document content using GLiNER.
  */
 
+import { createHash } from 'crypto';
 import type { ParsedGraph, ParsedNode, ParsedRelationship } from '../../runtime/adapters/types.js';
 import type { EntityExtractionConfig, ExtractedEntity, ExtractionResult } from './types.js';
 import { DEFAULT_ENTITY_EXTRACTION_CONFIG } from './types.js';
 import { EntityExtractionClient } from './client.js';
 import { deduplicateEntities, type DeduplicationConfig } from './deduplication.js';
+
+/**
+ * Generate a hash for an Entity node.
+ * Used for change detection in incremental ingestion.
+ */
+function generateEntityHash(name: string, entityType: string, confidence: number): string {
+  return createHash('sha256')
+    .update(`${name}|${entityType}|${confidence}`)
+    .digest('hex')
+    .slice(0, 16);
+}
 
 /**
  * Node labels to process for entity extraction.
@@ -425,6 +437,8 @@ function buildEntityGraph(
             projectId: projectId,
             _state: 'linked', // Use _state for state machine compatibility
             embeddingsDirty: true,
+            // Hash for incremental ingestion change detection
+            hash: generateEntityHash(canonicalName, entity.type, entity.confidence ?? 0),
             // Use unified field names (canonical name)
             _name: canonicalName,
             _content: canonicalName, // For embedding generation

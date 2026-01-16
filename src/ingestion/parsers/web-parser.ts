@@ -43,10 +43,10 @@ const webPageChunkingConfig: ChunkingConfig = {
  */
 const webPageFieldExtractors: FieldExtractors = {
   name: (node) => {
-    // Include URL for better search
+    // Title only (URL is in separate property and _description if no metaDescription)
     const title = node.title as string;
     const url = node.url as string;
-    return `${title || ''} ${url || ''}`.trim();
+    return title || url || '';
   },
 
   content: (node) => {
@@ -54,7 +54,8 @@ const webPageFieldExtractors: FieldExtractors = {
   },
 
   description: (node) => {
-    return (node.metaDescription as string) || (node.description as string) || null;
+    // Meta description from page (no fallback - URL already indexed separately)
+    return (node.metaDescription as string) || null;
   },
 
   displayPath: (node) => {

@@ -77,7 +77,7 @@ export interface CopyResult {
 // ============================================
 
 // Default patterns to exclude
-const DEFAULT_EXCLUDES = ['node_modules', '.git', 'dist', '__pycache__', 'build', '.next', '.nuxt', 'coverage', '.ragforge', 'target'];
+const DEFAULT_EXCLUDES = ['node_modules', '.git', 'dist', '__pycache__', 'build', '.next', '.nuxt', 'coverage', '.ragforge', 'target', 'venv', '.venv', 'env', 'bundle'];
 
 /**
  * List contents of a directory

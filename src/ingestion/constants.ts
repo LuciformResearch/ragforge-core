@@ -26,6 +26,9 @@ export const DEFAULT_EXCLUDE_PATTERNS = [
   '**/coverage/**',
   '**/.next/**',
   '**/.nuxt/**',
+  '**/venv/**',
+  '**/.venv/**',
+  '**/env/**',
   '**/*.test.ts',
   '**/*.spec.ts',
 ];

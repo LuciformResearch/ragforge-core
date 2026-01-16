@@ -9,7 +9,8 @@
  * - parsing: Currently being parsed
  * - parsed: Nodes created, awaiting relations
  * - relations: Relations being created
- * - linked: Relations created, awaiting embeddings
+ * - linked: Relations created, awaiting entity extraction
+ * - entities: Entity extraction in progress (GLiNER)
  * - embedding: Embeddings being generated
  * - embedded: Fully processed
  * - error: Failed at some stage (with errorType)
@@ -25,7 +26,8 @@ import type { Record as Neo4jRecord } from 'neo4j-driver';
  * - parsing: Currently being parsed
  * - parsed: Parsing complete
  * - relations: Building relationships
- * - linked: Relationships built, ready for embedding
+ * - linked: Relationships built, ready for entity extraction
+ * - entities: Entity extraction in progress (GLiNER)
  * - embedding: Currently generating embeddings
  * - embedded: Fully processed with embeddings
  * - error: Processing failed
@@ -37,11 +39,12 @@ export type FileState =
   | 'parsed'
   | 'relations'
   | 'linked'
+  | 'entities'
   | 'embedding'
   | 'embedded'
   | 'error';
 
-export type ErrorType = 'parse' | 'relations' | 'embed';
+export type ErrorType = 'parse' | 'relations' | 'entities' | 'embed';
 
 export interface StateTransition {
   from: FileState | FileState[];
@@ -76,19 +79,24 @@ const VALID_TRANSITIONS: StateTransition[] = [
   { from: 'parsed', to: 'relations', action: 'startRelations' },
   { from: 'relations', to: 'linked', action: 'finishRelations' },
   { from: 'relations', to: 'error', action: 'failRelations' },
-  { from: 'linked', to: 'embedding', action: 'startEmbedding' },
+  { from: 'linked', to: 'entities', action: 'startEntities' },
+  { from: 'entities', to: 'embedding', action: 'finishEntities' },
+  { from: 'entities', to: 'error', action: 'failEntities' },
   { from: 'embedding', to: 'embedded', action: 'finishEmbedding' },
   { from: 'embedding', to: 'error', action: 'failEmbedding' },
   // Reset on file change
   {
-    from: ['parsed', 'relations', 'linked', 'embedding', 'embedded', 'error'],
+    from: ['parsed', 'relations', 'linked', 'entities', 'embedding', 'embedded', 'error'],
     to: 'discovered',
     action: 'fileChanged',
   },
   // Skip relations (for files without references)
   { from: 'parsed', to: 'linked', action: 'skipRelations' },
+  // Skip entities (for files without document content)
+  { from: 'linked', to: 'embedding', action: 'skipEntities' },
   // Skip embedding (batch mode)
-  { from: 'linked', to: 'embedded', action: 'skipEmbedding' },
+  { from: 'entities', to: 'embedded', action: 'skipEmbedding' },
+  { from: 'linked', to: 'embedded', action: 'skipEntitiesAndEmbedding' },
 ];
 
 /**
@@ -105,7 +113,7 @@ export function isValidTransition(from: FileState, to: FileState): boolean {
  * Get the next expected state in the normal flow
  */
 export function getNextState(current: FileState): FileState | null {
-  const flow: FileState[] = ['discovered', 'parsing', 'parsed', 'relations', 'linked', 'embedding', 'embedded'];
+  const flow: FileState[] = ['discovered', 'parsing', 'parsed', 'relations', 'linked', 'entities', 'embedding', 'embedded'];
   const idx = flow.indexOf(current);
   if (idx === -1 || idx === flow.length - 1) return null;
   return flow[idx + 1];
@@ -261,6 +269,7 @@ export class FileStateMachine {
       parsed: 0,
       relations: 0,
       linked: 0,
+      entities: 0,
       embedding: 0,
       embedded: 0,
       error: 0,
@@ -290,6 +299,7 @@ export class FileStateMachine {
     const stats: Record<string, number> = {
       parse: 0,
       relations: 0,
+      entities: 0,
       embed: 0,
     };
 
@@ -343,7 +353,7 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IN ['parsing', 'relations', 'embedding']
+      WHERE f.state IN ['parsing', 'relations', 'entities', 'embedding']
         AND f.stateUpdatedAt < datetime() - duration({milliseconds: $threshold})
       SET f.state = 'discovered',
           f.stateUpdatedAt = datetime(),
@@ -361,6 +371,164 @@ export class FileStateMachine {
    */
   async markFileChanged(fileUuid: string): Promise<boolean> {
     return this.transition(fileUuid, 'discovered');
+  }
+
+  /**
+   * Mark a file as discovered by its absolute path.
+   * Creates the File node if it doesn't exist.
+   * If the file exists and is in 'embedded' state, resets to 'discovered'.
+   * If the file is already being processed (other states), leaves it alone.
+   *
+   * @param absolutePath - Absolute path to the file
+   * @param projectId - Project ID
+   * @param relativePath - Optional relative path (for display)
+   * @returns Object with created (new file) and reset (existing file reset) flags
+   */
+  async markDiscovered(
+    absolutePath: string,
+    projectId: string,
+    relativePath?: string
+  ): Promise<{ created: boolean; reset: boolean; uuid: string }> {
+    const uuid = `file:${projectId}:${absolutePath}`;
+    const now = new Date().toISOString();
+
+    // MERGE: create if not exists, then conditionally update state
+    const result = await this.neo4jClient.run(
+      `
+      MERGE (f:File {uuid: $uuid})
+      ON CREATE SET
+        f.file = $relativePath,
+        f.absolutePath = $absolutePath,
+        f.projectId = $projectId,
+        f.state = 'discovered',
+        f.stateUpdatedAt = datetime(),
+        f.createdAt = $now,
+        f.retryCount = 0,
+        f._wasCreated = true
+      ON MATCH SET
+        f._wasCreated = false,
+        f._previousState = f.state,
+        f.state = CASE
+          WHEN f.state = 'embedded' THEN 'discovered'
+          WHEN f.state = 'error' THEN 'discovered'
+          ELSE f.state
+        END,
+        f.stateUpdatedAt = CASE
+          WHEN f.state IN ['embedded', 'error'] THEN datetime()
+          ELSE f.stateUpdatedAt
+        END,
+        f.retryCount = CASE
+          WHEN f.state IN ['embedded', 'error'] THEN 0
+          ELSE f.retryCount
+        END
+      RETURN f._wasCreated as wasCreated,
+             f._previousState as previousState,
+             f.state as currentState,
+             f.uuid as uuid
+    `,
+      {
+        uuid,
+        absolutePath,
+        projectId,
+        relativePath: relativePath || absolutePath,
+        now,
+      }
+    );
+
+    if (result.records.length === 0) {
+      return { created: false, reset: false, uuid };
+    }
+
+    const record = result.records[0];
+    const wasCreated = record.get('wasCreated');
+    const previousState = record.get('previousState');
+    const currentState = record.get('currentState');
+
+    // Clean up temporary properties
+    await this.neo4jClient.run(
+      `
+      MATCH (f:File {uuid: $uuid})
+      REMOVE f._wasCreated, f._previousState
+    `,
+      { uuid }
+    );
+
+    return {
+      created: wasCreated === true,
+      reset: !wasCreated && previousState !== currentState,
+      uuid,
+    };
+  }
+
+  /**
+   * Mark multiple files as discovered (batch version)
+   */
+  async markDiscoveredBatch(
+    files: Array<{ absolutePath: string; relativePath?: string }>,
+    projectId: string
+  ): Promise<{ created: number; reset: number; skipped: number }> {
+    if (files.length === 0) {
+      return { created: 0, reset: 0, skipped: 0 };
+    }
+
+    const now = new Date().toISOString();
+    const fileData = files.map((f) => ({
+      uuid: `file:${projectId}:${f.absolutePath}`,
+      absolutePath: f.absolutePath,
+      relativePath: f.relativePath || f.absolutePath,
+    }));
+
+    const result = await this.neo4jClient.run(
+      `
+      UNWIND $files as fileData
+      MERGE (f:File {uuid: fileData.uuid})
+      ON CREATE SET
+        f.file = fileData.relativePath,
+        f.absolutePath = fileData.absolutePath,
+        f.projectId = $projectId,
+        f.state = 'discovered',
+        f.stateUpdatedAt = datetime(),
+        f.createdAt = $now,
+        f.retryCount = 0,
+        f._action = 'created'
+      ON MATCH SET
+        f._action = CASE
+          WHEN f.state IN ['embedded', 'error'] THEN 'reset'
+          ELSE 'skipped'
+        END,
+        f.state = CASE
+          WHEN f.state IN ['embedded', 'error'] THEN 'discovered'
+          ELSE f.state
+        END,
+        f.stateUpdatedAt = CASE
+          WHEN f.state IN ['embedded', 'error'] THEN datetime()
+          ELSE f.stateUpdatedAt
+        END,
+        f.retryCount = CASE
+          WHEN f.state IN ['embedded', 'error'] THEN 0
+          ELSE f.retryCount
+        END
+      WITH f, f._action as action
+      REMOVE f._action
+      RETURN action, count(*) as cnt
+    `,
+      { files: fileData, projectId, now }
+    );
+
+    let created = 0;
+    let reset = 0;
+    let skipped = 0;
+
+    for (const record of result.records) {
+      const action = record.get('action');
+      const count = record.get('cnt')?.toNumber?.() || record.get('cnt') || 0;
+
+      if (action === 'created') created = count;
+      else if (action === 'reset') reset = count;
+      else if (action === 'skipped') skipped = count;
+    }
+
+    return { created, reset, skipped };
   }
 
   /**
@@ -386,7 +554,7 @@ export class FileStateMachine {
    * Get incomplete files (not in 'embedded' state)
    */
   async getIncompleteFiles(projectId: string): Promise<FileStateInfo[]> {
-    return this.getFilesInState(projectId, ['discovered', 'parsing', 'parsed', 'relations', 'linked', 'embedding']);
+    return this.getFilesInState(projectId, ['discovered', 'parsing', 'parsed', 'relations', 'linked', 'entities', 'embedding']);
   }
 
   /**
@@ -394,7 +562,7 @@ export class FileStateMachine {
    */
   async isProjectFullyProcessed(projectId: string): Promise<boolean> {
     const stats = await this.getStateStats(projectId);
-    const incomplete = stats.discovered + stats.parsing + stats.parsed + stats.relations + stats.linked + stats.embedding + stats.error;
+    const incomplete = stats.discovered + stats.parsing + stats.parsed + stats.relations + stats.linked + stats.entities + stats.embedding + stats.error;
     return incomplete === 0;
   }
 

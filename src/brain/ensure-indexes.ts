@@ -1,0 +1,514 @@
+/**
+ * Centralized Index Management for RagForge
+ *
+ * This module provides functions to ensure all required Neo4j indexes exist.
+ * Indexes are organized by category:
+ *
+ * 1. Base Indexes - UUID, projectId, absolutePath, state
+ * 2. Fulltext Indexes - unified_fulltext for _name, _content, _description
+ * 3. Vector Indexes - based on MULTI_EMBED_CONFIGS for semantic search
+ * 4. Conversation Indexes - for conversation memory (optional)
+ *
+ * Usage:
+ *   import { ensureAllIndexes } from './ensure-indexes.js';
+ *   await ensureAllIndexes(neo4jClient, { dimension: 3072 });
+ *
+ * For community-docs or other apps with custom indexes:
+ *   await ensureBaseIndexes(neo4jClient);
+ *   await ensureFulltextIndexes(neo4jClient);
+ *   await ensureVectorIndexes(neo4jClient, { dimension: 3072 });
+ *   // Then add your own custom indexes
+ *
+ * @since 2026-01-16
+ */
+
+import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
+import { MULTI_EMBED_CONFIGS } from './embedding-service.js';
+
+// ============================================
+// Types
+// ============================================
+
+export interface EnsureIndexesOptions {
+  /** Vector embedding dimension (default: 3072 for Gemini) */
+  dimension?: number;
+  /** Verbose logging */
+  verbose?: boolean;
+  /** Skip vector indexes (useful if no embedding service) */
+  skipVectorIndexes?: boolean;
+  /** Skip conversation indexes */
+  skipConversationIndexes?: boolean;
+}
+
+export interface IndexStats {
+  created: number;
+  skipped: number;
+  errors: number;
+}
+
+// ============================================
+// Node Labels
+// ============================================
+
+/**
+ * All node labels that should have UUID indexes
+ */
+export const UUID_INDEXED_LABELS = [
+  'Scope',
+  'File',
+  'Directory',
+  'Project',
+  'PackageJson',
+  'MarkdownDocument',
+  'MarkdownSection',
+  'CodeBlock',
+  'DataFile',
+  'DataSection',
+  'MediaFile',
+  'ImageFile',
+  'ThreeDFile',
+  'WebPage',
+  'DocumentFile',
+  'PDFDocument',
+  'WordDocument',
+  'SpreadsheetDocument',
+  'VueSFC',
+  'SvelteComponent',
+  'Stylesheet',
+  'GenericFile',
+  'WebDocument',
+  'EmbeddingChunk',
+  'ExternalLibrary',
+  'Entity',
+] as const;
+
+/**
+ * All node labels that can have content for fulltext search
+ */
+export const FULLTEXT_LABELS = [
+  'Scope',
+  'File',
+  'DataFile',
+  'DocumentFile',
+  'PDFDocument',
+  'WordDocument',
+  'SpreadsheetDocument',
+  'MarkdownDocument',
+  'MarkdownSection',
+  'MediaFile',
+  'ImageFile',
+  'ThreeDFile',
+  'WebPage',
+  'CodeBlock',
+  'VueSFC',
+  'SvelteComponent',
+  'Stylesheet',
+  'GenericFile',
+  'PackageJson',
+  'DataSection',
+  'WebDocument',
+  'Entity',
+] as const;
+
+/**
+ * Labels that should have absolutePath indexes
+ */
+export const ABSOLUTE_PATH_LABELS = [
+  'Scope',
+  'File',
+  'MarkdownDocument',
+  'MarkdownSection',
+  'DataFile',
+  'MediaFile',
+  'ImageFile',
+  'Stylesheet',
+  'WebPage',
+] as const;
+
+// ============================================
+// Base Indexes
+// ============================================
+
+/**
+ * Ensure base property indexes exist (UUID, projectId, absolutePath, state)
+ * These are essential for all RagForge operations.
+ */
+export async function ensureBaseIndexes(
+  neo4jClient: Neo4jClient,
+  options: { verbose?: boolean } = {}
+): Promise<IndexStats> {
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const { verbose = false } = options;
+
+  if (verbose) {
+    console.log('[Indexes] Ensuring base indexes...');
+  }
+
+  const indexQueries: string[] = [];
+
+  // UUID indexes for all node types
+  for (const label of UUID_INDEXED_LABELS) {
+    indexQueries.push(
+      `CREATE INDEX ${label.toLowerCase()}_uuid IF NOT EXISTS FOR (n:${label}) ON (n.uuid)`
+    );
+  }
+
+  // ProjectId indexes
+  indexQueries.push(
+    'CREATE INDEX scope_projectid IF NOT EXISTS FOR (n:Scope) ON (n.projectId)',
+    'CREATE INDEX file_projectid IF NOT EXISTS FOR (n:File) ON (n.projectId)',
+    'CREATE INDEX entity_projectid IF NOT EXISTS FOR (n:Entity) ON (n.projectId)'
+  );
+
+  // Entity-specific indexes
+  indexQueries.push(
+    'CREATE INDEX entity_type IF NOT EXISTS FOR (n:Entity) ON (n.entityType)',
+    'CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n._name)'
+  );
+
+  // File state index (for state machine)
+  indexQueries.push(
+    'CREATE INDEX file_state IF NOT EXISTS FOR (n:File) ON (n.state)'
+  );
+
+  // AbsolutePath indexes for fast file lookups
+  for (const label of ABSOLUTE_PATH_LABELS) {
+    indexQueries.push(
+      `CREATE INDEX ${label.toLowerCase()}_absolutepath IF NOT EXISTS FOR (n:${label}) ON (n.absolutePath)`
+    );
+  }
+
+  // Directory path index
+  indexQueries.push(
+    'CREATE INDEX directory_path IF NOT EXISTS FOR (n:Directory) ON (n.path)'
+  );
+
+  // Execute all index queries
+  for (const query of indexQueries) {
+    try {
+      await neo4jClient.run(query);
+      stats.created++;
+    } catch (err: any) {
+      if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
+        stats.skipped++;
+      } else {
+        stats.errors++;
+        if (verbose) {
+          console.warn(`[Indexes] Warning: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  if (verbose) {
+    console.log(`[Indexes] Base indexes: ${stats.created} created, ${stats.skipped} skipped, ${stats.errors} errors`);
+  }
+
+  return stats;
+}
+
+// ============================================
+// Fulltext Indexes
+// ============================================
+
+/**
+ * Ensure fulltext index exists for unified search across all content types.
+ * Uses the normalized _name, _content, _description properties.
+ */
+export async function ensureFulltextIndexes(
+  neo4jClient: Neo4jClient,
+  options: { verbose?: boolean } = {}
+): Promise<IndexStats> {
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const { verbose = false } = options;
+
+  if (verbose) {
+    console.log('[Indexes] Ensuring fulltext indexes...');
+  }
+
+  try {
+    const labelsPart = FULLTEXT_LABELS.join('|');
+    const query = `CREATE FULLTEXT INDEX unified_fulltext IF NOT EXISTS FOR (n:${labelsPart}) ON EACH [n._name, n._content, n._description]`;
+
+    await neo4jClient.run(query);
+    stats.created++;
+
+    if (verbose) {
+      console.log('[Indexes] Unified fulltext index ensured');
+    }
+  } catch (err: any) {
+    if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
+      stats.skipped++;
+      if (verbose) {
+        console.log('[Indexes] Unified fulltext index already exists');
+      }
+    } else {
+      stats.errors++;
+      console.warn(`[Indexes] Fulltext index warning: ${err.message}`);
+    }
+  }
+
+  return stats;
+}
+
+// ============================================
+// Vector Indexes
+// ============================================
+
+/**
+ * Ensure vector indexes exist for semantic search.
+ * Creates indexes based on MULTI_EMBED_CONFIGS.
+ */
+export async function ensureVectorIndexes(
+  neo4jClient: Neo4jClient,
+  options: { dimension?: number; verbose?: boolean } = {}
+): Promise<IndexStats> {
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const { dimension = 3072, verbose = false } = options;
+
+  if (verbose) {
+    console.log(`[Indexes] Ensuring vector indexes (dimension: ${dimension})...`);
+  }
+
+  // Create indexes based on MULTI_EMBED_CONFIGS
+  for (const config of MULTI_EMBED_CONFIGS) {
+    const label = config.label;
+
+    for (const embeddingConfig of config.embeddings) {
+      const embeddingProp = embeddingConfig.propertyName;
+      const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
+
+      try {
+        // Check if index already exists
+        const checkResult = await neo4jClient.run(
+          `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+          { indexName }
+        );
+
+        const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+
+        if (!exists) {
+          const createQuery = `
+            CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
+            FOR (n:\`${label}\`)
+            ON n.\`${embeddingProp}\`
+            OPTIONS {
+              indexConfig: {
+                \`vector.dimensions\`: ${dimension},
+                \`vector.similarity_function\`: 'cosine'
+              }
+            }
+          `;
+
+          await neo4jClient.run(createQuery);
+          stats.created++;
+
+          if (verbose) {
+            console.log(`[Indexes] Created vector index: ${indexName}`);
+          }
+        } else {
+          stats.skipped++;
+        }
+      } catch (err: any) {
+        stats.errors++;
+        if (!err.message?.includes('already exists')) {
+          if (verbose) {
+            console.warn(`[Indexes] Vector index warning for ${indexName}: ${err.message}`);
+          }
+        }
+      }
+    }
+  }
+
+  // EmbeddingChunk vector index
+  const chunkIndexName = 'embeddingchunk_embedding_content_vector';
+  try {
+    const checkResult = await neo4jClient.run(
+      `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+      { indexName: chunkIndexName }
+    );
+    const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+
+    if (!exists) {
+      await neo4jClient.run(`
+        CREATE VECTOR INDEX ${chunkIndexName} IF NOT EXISTS
+        FOR (n:EmbeddingChunk)
+        ON n.embedding_content
+        OPTIONS {
+          indexConfig: {
+            \`vector.dimensions\`: ${dimension},
+            \`vector.similarity_function\`: 'cosine'
+          }
+        }
+      `);
+      stats.created++;
+      if (verbose) {
+        console.log(`[Indexes] Created vector index: ${chunkIndexName}`);
+      }
+    } else {
+      stats.skipped++;
+    }
+  } catch (err: any) {
+    stats.errors++;
+  }
+
+  if (verbose) {
+    console.log(`[Indexes] Vector indexes: ${stats.created} created, ${stats.skipped} skipped, ${stats.errors} errors`);
+  }
+
+  return stats;
+}
+
+// ============================================
+// Conversation Indexes
+// ============================================
+
+/**
+ * Ensure conversation-related indexes exist.
+ * For conversation memory feature.
+ */
+export async function ensureConversationIndexes(
+  neo4jClient: Neo4jClient,
+  options: { dimension?: number; verbose?: boolean } = {}
+): Promise<IndexStats> {
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const { dimension = 3072, verbose = false } = options;
+
+  if (verbose) {
+    console.log('[Indexes] Ensuring conversation indexes...');
+  }
+
+  // Constraints
+  const constraints = [
+    'CREATE CONSTRAINT conversation_uuid_unique IF NOT EXISTS FOR (c:Conversation) REQUIRE c.uuid IS UNIQUE',
+    'CREATE CONSTRAINT message_uuid_unique IF NOT EXISTS FOR (m:Message) REQUIRE m.uuid IS UNIQUE',
+    'CREATE CONSTRAINT summary_uuid_unique IF NOT EXISTS FOR (s:Summary) REQUIRE s.uuid IS UNIQUE',
+    'CREATE CONSTRAINT tool_call_uuid_unique IF NOT EXISTS FOR (tc:ToolCall) REQUIRE tc.uuid IS UNIQUE',
+    'CREATE CONSTRAINT tool_result_uuid_unique IF NOT EXISTS FOR (tr:ToolResult) REQUIRE tr.uuid IS UNIQUE',
+  ];
+
+  // Indexes
+  const indexes = [
+    'CREATE INDEX conversation_created_at IF NOT EXISTS FOR (c:Conversation) ON (c.created_at)',
+    'CREATE INDEX conversation_updated_at IF NOT EXISTS FOR (c:Conversation) ON (c.updated_at)',
+    'CREATE INDEX conversation_status IF NOT EXISTS FOR (c:Conversation) ON (c.status)',
+    'CREATE INDEX message_timestamp IF NOT EXISTS FOR (m:Message) ON (m.timestamp)',
+    'CREATE INDEX summary_level IF NOT EXISTS FOR (s:Summary) ON (s.level)',
+    'CREATE INDEX summary_created_at IF NOT EXISTS FOR (s:Summary) ON (s.created_at)',
+  ];
+
+  // Execute constraints and indexes
+  for (const query of [...constraints, ...indexes]) {
+    try {
+      await neo4jClient.run(query);
+      stats.created++;
+    } catch (err: any) {
+      if (err.message?.includes('already exists') || err.message?.includes('equivalent')) {
+        stats.skipped++;
+      } else {
+        stats.errors++;
+        if (verbose) {
+          console.warn(`[Indexes] Conversation index warning: ${err.message}`);
+        }
+      }
+    }
+  }
+
+  // Vector indexes for conversation embeddings
+  const vectorIndexes = [
+    { name: 'message_embedding_index', label: 'Message', prop: 'embedding' },
+    { name: 'summary_embedding_index', label: 'Summary', prop: 'embedding' },
+  ];
+
+  for (const idx of vectorIndexes) {
+    try {
+      const checkResult = await neo4jClient.run(
+        `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
+        { indexName: idx.name }
+      );
+      const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+
+      if (!exists) {
+        await neo4jClient.run(`
+          CREATE VECTOR INDEX ${idx.name} IF NOT EXISTS
+          FOR (n:${idx.label}) ON (n.${idx.prop})
+          OPTIONS {indexConfig: {
+            \`vector.dimensions\`: ${dimension},
+            \`vector.similarity_function\`: 'cosine'
+          }}
+        `);
+        stats.created++;
+      } else {
+        stats.skipped++;
+      }
+    } catch (err: any) {
+      stats.errors++;
+    }
+  }
+
+  if (verbose) {
+    console.log(`[Indexes] Conversation indexes: ${stats.created} created, ${stats.skipped} skipped, ${stats.errors} errors`);
+  }
+
+  return stats;
+}
+
+// ============================================
+// All-in-One
+// ============================================
+
+/**
+ * Ensure all RagForge indexes exist.
+ * Convenience function that calls all ensure* functions.
+ */
+export async function ensureAllIndexes(
+  neo4jClient: Neo4jClient,
+  options: EnsureIndexesOptions = {}
+): Promise<IndexStats> {
+  const {
+    dimension = 3072,
+    verbose = false,
+    skipVectorIndexes = false,
+    skipConversationIndexes = false,
+  } = options;
+
+  const totalStats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+
+  if (verbose) {
+    console.log('[Indexes] Ensuring all indexes...');
+  }
+
+  // Base indexes
+  const baseStats = await ensureBaseIndexes(neo4jClient, { verbose });
+  totalStats.created += baseStats.created;
+  totalStats.skipped += baseStats.skipped;
+  totalStats.errors += baseStats.errors;
+
+  // Fulltext indexes
+  const fulltextStats = await ensureFulltextIndexes(neo4jClient, { verbose });
+  totalStats.created += fulltextStats.created;
+  totalStats.skipped += fulltextStats.skipped;
+  totalStats.errors += fulltextStats.errors;
+
+  // Vector indexes
+  if (!skipVectorIndexes) {
+    const vectorStats = await ensureVectorIndexes(neo4jClient, { dimension, verbose });
+    totalStats.created += vectorStats.created;
+    totalStats.skipped += vectorStats.skipped;
+    totalStats.errors += vectorStats.errors;
+  }
+
+  // Conversation indexes
+  if (!skipConversationIndexes) {
+    const convStats = await ensureConversationIndexes(neo4jClient, { dimension, verbose });
+    totalStats.created += convStats.created;
+    totalStats.skipped += convStats.skipped;
+    totalStats.errors += convStats.errors;
+  }
+
+  if (verbose) {
+    console.log(`[Indexes] Total: ${totalStats.created} created, ${totalStats.skipped} skipped, ${totalStats.errors} errors`);
+  }
+
+  return totalStats;
+}

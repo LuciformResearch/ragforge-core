@@ -93,6 +93,7 @@ export class IncrementalIngestionManager {
   private _stateMachine?: FileStateMachine;
   private _stateMigration?: FileStateMigration;
   private _fileProcessors: Map<string, FileProcessor> = new Map();
+  private _transformGraph?: (graph: { nodes: any[]; relationships: any[]; metadata: any }) => Promise<{ nodes: any[]; relationships: any[]; metadata: any }>;
 
   constructor(private client: Neo4jClient) {
     this.changeTracker = new ChangeTracker(client);
@@ -123,6 +124,14 @@ export class IncrementalIngestionManager {
       this._stateMigration = new FileStateMigration(this.client);
     }
     return this._stateMigration;
+  }
+
+  /**
+   * Set a transform function to apply to parsed graphs before ingestion.
+   * This is used for entity extraction and other graph transformations.
+   */
+  setTransformGraph(transform: (graph: { nodes: any[]; relationships: any[]; metadata: any }) => Promise<{ nodes: any[]; relationships: any[]; metadata: any }>): void {
+    this._transformGraph = transform;
   }
 
   /**
@@ -663,8 +672,22 @@ export class IncrementalIngestionManager {
       }
 
       // Build state machine SET clause for content nodes
+      // Also mark entitiesDirty for document nodes that need entity extraction
+      // For EmbeddingChunk, we check parentLabel at query time (can be Scope or MarkdownSection)
+      const isDirectDocumentNode = labelsArray.includes('MarkdownSection') || labelsArray.includes('MarkdownDocument')
+        || labelsArray.includes('WebPage') || labelsArray.includes('WebDocument');
+      const isEmbeddingChunk = labelsArray.includes('EmbeddingChunk');
+
+      let entitiesDirtyClause = '';
+      if (markForEmbedding && isDirectDocumentNode) {
+        entitiesDirtyClause = ', n.entitiesDirty = true';
+      } else if (markForEmbedding && isEmbeddingChunk) {
+        // For EmbeddingChunk, only set entitiesDirty if parentLabel is a document type
+        entitiesDirtyClause = `, n.entitiesDirty = CASE WHEN n.parentLabel IN ['MarkdownSection', 'MarkdownDocument', 'WebPage', 'WebDocument'] THEN true ELSE n.entitiesDirty END`;
+      }
+
       const stateClause = (markForEmbedding && isContentNode)
-        ? `, n.${P.state} = 'linked', n.${P.stateChangedAt} = datetime()`
+        ? `, n.${P.state} = 'linked', n.${P.stateChangedAt} = datetime()` + entitiesDirtyClause
         : '';
 
       // MERGE with += preserves existing embeddings (they're not in props)
@@ -1279,6 +1302,10 @@ export class IncrementalIngestionManager {
       console.log(`\n✅ Parsed ${countStr} from source`);
     }
 
+    // NOTE: Entity extraction is now handled POST-INGESTION via entitiesDirty flag
+    // This allows incremental extraction only on nodes with changed content
+    // See BrainManager.processEntityExtraction() which runs after ingestion
+
     // NOTE: rawContentHash is updated AFTER ingestion completes to ensure atomicity
     // If daemon is killed mid-ingestion, the hash won't be updated, so next sync
     // will correctly detect the file as changed and re-ingest all nodes
@@ -1449,6 +1476,71 @@ export class IncrementalIngestionManager {
     );
 
     return result.records[0]?.get('dirty') === true;
+  }
+
+  // ============================================
+  // Entity Extraction Dirty Tracking
+  // ============================================
+
+  /**
+   * Get document nodes that need entity extraction.
+   * Returns nodes with entitiesDirty = true (MarkdownSection, EmbeddingChunk with doc parent, etc.)
+   */
+  async getDirtyEntityNodes(projectId?: string): Promise<Array<{
+    uuid: string;
+    labels: string[];
+    content: string;
+    file?: string;
+  }>> {
+    const projectFilter = projectId ? 'AND n.projectId = $projectId' : '';
+    const result = await this.client.run(
+      `
+      MATCH (n)
+      WHERE n.entitiesDirty = true ${projectFilter}
+      RETURN n.uuid AS uuid, labels(n) AS labels, n._content AS content, n.file AS file
+      `,
+      { projectId }
+    );
+
+    return result.records.map(record => ({
+      uuid: record.get('uuid'),
+      labels: record.get('labels'),
+      content: record.get('content'),
+      file: record.get('file'),
+    }));
+  }
+
+  /**
+   * Count nodes with dirty entities
+   */
+  async countDirtyEntityNodes(projectId?: string): Promise<number> {
+    const projectFilter = projectId ? 'AND n.projectId = $projectId' : '';
+    const result = await this.client.run(
+      `
+      MATCH (n)
+      WHERE n.entitiesDirty = true ${projectFilter}
+      RETURN count(n) AS count
+      `,
+      { projectId }
+    );
+
+    return result.records[0]?.get('count')?.toNumber() || 0;
+  }
+
+  /**
+   * Mark entity extraction as complete for specified nodes
+   */
+  async markEntitiesClean(uuids: string[]): Promise<void> {
+    if (uuids.length === 0) return;
+
+    await this.client.run(
+      `
+      MATCH (n)
+      WHERE n.uuid IN $uuids
+      SET n.entitiesDirty = false
+      `,
+      { uuids }
+    );
   }
 
   /**

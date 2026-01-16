@@ -13,7 +13,8 @@ export type NodeState =
   | 'parsing'    // Currently being parsed
   | 'parsed'     // Parsing complete, waiting for linking
   | 'linking'    // Creating relationships (CONSUMES, etc.)
-  | 'linked'     // Relationships created, ready for embedding
+  | 'linked'     // Relationships created, ready for entities
+  | 'entities'   // Extracting entities (GLiNER)
   | 'embedding'  // Generating embeddings
   | 'ready'      // Fully processed
   | 'skip'       // No embedding needed (binary files, etc.)
@@ -22,7 +23,7 @@ export type NodeState =
 /**
  * Error types for the error state
  */
-export type StateErrorType = 'parse' | 'link' | 'embed';
+export type StateErrorType = 'parse' | 'link' | 'entities' | 'embed';
 
 /**
  * Valid state transitions
@@ -32,7 +33,8 @@ export const VALID_TRANSITIONS: Record<NodeState, NodeState[]> = {
   parsing:   ['parsed', 'error'],
   parsed:    ['linking'],
   linking:   ['linked', 'error'],
-  linked:    ['embedding', 'skip'],
+  linked:    ['entities', 'skip'],  // entities extraction after linking
+  entities:  ['embedding', 'error'],  // embedding after entities
   embedding: ['ready', 'error'],
   ready:     ['pending'],  // Reset if content changed
   skip:      ['pending'],  // Reset if content changed
@@ -51,7 +53,7 @@ export function isValidTransition(from: NodeState, to: NodeState): boolean {
  */
 export function getNextState(current: NodeState): NodeState | null {
   const normalFlow: NodeState[] = [
-    'pending', 'parsing', 'parsed', 'linking', 'linked', 'embedding', 'ready'
+    'pending', 'parsing', 'parsed', 'linking', 'linked', 'entities', 'embedding', 'ready'
   ];
   const idx = normalFlow.indexOf(current);
   if (idx === -1 || idx === normalFlow.length - 1) return null;
@@ -67,10 +69,11 @@ export const STATE_PRIORITY: Record<NodeState, number> = {
   parsed:    3,
   linking:   4,
   linked:    5,
-  embedding: 6,
-  ready:     7,
-  skip:      8,
-  error:     9,
+  entities:  6,
+  embedding: 7,
+  ready:     8,
+  skip:      9,
+  error:     10,
 };
 
 /**
@@ -91,7 +94,7 @@ export function isErrorState(state: NodeState): boolean {
  * Check if a state is in-progress (actively being processed)
  */
 export function isInProgressState(state: NodeState): boolean {
-  return state === 'parsing' || state === 'linking' || state === 'embedding';
+  return state === 'parsing' || state === 'linking' || state === 'entities' || state === 'embedding';
 }
 
 /**
@@ -148,6 +151,9 @@ export interface NodeStateInfo {
   /** When linking completed */
   linkedAt?: Date;
 
+  /** When entity extraction completed */
+  entitiesAt?: Date;
+
   /** When embedding completed */
   embeddedAt?: Date;
 
@@ -196,6 +202,7 @@ export interface StateCounts {
   parsed: number;
   linking: number;
   linked: number;
+  entities: number;
   embedding: number;
   ready: number;
   skip: number;
@@ -285,6 +292,7 @@ export const STATE_PROPERTIES = {
   detectedAt: '_detectedAt',
   parsedAt: '_parsedAt',
   linkedAt: '_linkedAt',
+  entitiesAt: '_entitiesAt',
   embeddedAt: '_embeddedAt',
   contentHash: '_contentHash',
   embeddingProvider: '_embeddingProvider',
