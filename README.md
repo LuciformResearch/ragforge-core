@@ -144,11 +144,66 @@ After configuration, restart Claude Code to load the MCP server. You should see 
 
 ---
 
-## MCP Tools Available
+## Usage with Claude Code
 
-Once configured, Claude has access to these tools:
+### First Time: Ingest Your Project
 
-### Code & File Operations
+When you open Claude Code in a project for the first time, ask Claude to ingest it:
+
+```
+"Ingest this project into your brain"
+```
+
+Claude will call `ingest_directory` which:
+1. **Parses all code files** (TypeScript, Python, Rust, Go, C, C++, C#, etc.)
+2. **Extracts scopes** (functions, classes, methods, interfaces)
+3. **Resolves relationships** (imports, inheritance, function calls)
+4. **Extracts entities** (GLiNER - people, organizations, dates) if enabled
+5. **Generates embeddings** for semantic search
+
+**Duration**: 1-10 minutes depending on project size:
+- Small project (100 files): ~1 minute
+- Medium project (500 files): ~3-5 minutes
+- Large project (1000+ files): ~5-10 minutes
+
+### Search Your Codebase
+
+After ingestion, Claude can search semantically:
+
+```
+"Find code that handles user authentication"
+"Where is the payment processing logic?"
+"Show me all API endpoints"
+```
+
+This uses `brain_search` with vector embeddings - finds code by meaning, not just keywords.
+
+### Cleanup and Re-ingest
+
+If you need to reset the knowledge graph:
+
+```
+"Clean up the brain for this project and re-ingest"
+```
+
+Or manually:
+```
+cleanup_brain({ mode: "project", project_id: "your-project-id", confirm: true })
+```
+
+### MCP Tools Reference
+
+#### Core Operations
+
+| Tool | Description | Example |
+|------|-------------|---------|
+| `ingest_directory` | Index a codebase | `{ path: "/path/to/project" }` |
+| `brain_search` | Semantic search | `{ query: "auth logic", semantic: true }` |
+| `cleanup_brain` | Delete project data | `{ mode: "project", project_id: "...", confirm: true }` |
+| `list_brain_projects` | List all indexed projects | `{}` |
+
+#### File Operations
+
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read file with line numbers, images, PDFs |
@@ -156,31 +211,41 @@ Once configured, Claude has access to these tools:
 | `edit_file` | Search/replace or line-based editing |
 | `grep_files` | Regex search in files |
 | `glob_files` | Find files by pattern |
-| `analyze_files` | Extract code structure (functions, classes) |
+| `analyze_files` | Extract code structure on-the-fly |
 
-### Knowledge Graph
+#### Graph Navigation
+
 | Tool | Description |
 |------|-------------|
-| `brain_search` | Semantic search across all ingested content |
-| `ingest_directory` | Index a codebase into the knowledge graph |
-| `ingest_web_page` | Crawl and index web pages |
-| `explore_node` | Navigate relationships in the graph |
+| `explore_node` | Navigate relationships from a node |
 | `extract_dependency_hierarchy` | Get dependency trees |
+| `run_cypher` | Execute raw Cypher queries |
 
-### Web & Research
+#### Web & Research
+
 | Tool | Description |
 |------|-------------|
 | `search_web` | Google search with AI synthesis |
 | `fetch_web_page` | Render and extract web page content |
+| `ingest_web_page` | Index web pages into the brain |
 | `call_research_agent` | Autonomous research agent |
 
-### Images & 3D
+#### Images & 3D
+
 | Tool | Description |
 |------|-------------|
 | `read_image` | OCR text extraction |
 | `describe_image` | AI image description |
 | `generate_image` | Create images from text |
 | `generate_3d_from_text` | Create 3D models from description |
+
+#### Configuration
+
+| Tool | Description |
+|------|-------------|
+| `switch_embedding_provider` | Change embedding provider (gemini/tei/ollama) |
+| `get_brain_status` | Check Neo4j connection and config |
+| `set_api_key` | Configure API keys |
 
 ---
 
@@ -254,7 +319,51 @@ docker compose up -d gliner
 
 - **Port**: 6971
 - **GPU Memory**: ~2-3 GB VRAM
-- **Model**: `urchade/gliner_multi_pii-v1`
+- **Model**: `fastino/gliner2-large-v1` (default) or `urchade/gliner_multi_pii-v1`
+
+#### GLiNER Domain Configuration
+
+Entity extraction is configured per-domain in `services/gliner_service/entity-extraction.yaml`:
+
+```yaml
+# Domains with enabled=false skip entity extraction entirely
+domains:
+  # CODE - disabled (TypeScript parser already extracts functions/classes as Scope nodes)
+  code:
+    enabled: false
+    description: "Text about programming, software, functions, APIs"
+
+  # ECOMMERCE - enabled: extract products, brands, ingredients
+  ecommerce:
+    enabled: true
+    description: "Text about products, shopping, prices, brands, beauty"
+    entity_types:
+      product: "A specific commercial product with a name"
+      brand: "A company brand name"
+      ingredient: "A specific ingredient in a product"
+      price: "A monetary amount with currency"
+    relation_types:
+      made_by: "product is made by brand"
+      contains: "product contains ingredient"
+
+  # LEGAL - enabled: extract parties, contracts, dates
+  legal:
+    enabled: true
+    description: "Legal documents, contracts, terms, obligations"
+    entity_types:
+      person: "A human individual mentioned by their full name"
+      organization: "A company, institution, or legal entity"
+      contract: "A named legal agreement or contract"
+      date: "A specific date or deadline"
+```
+
+**Why `enabled: false` instead of removing the domain?**
+- With `enabled: false`, the domain is still **detected** during classification
+- When a file is classified as "code" or "documentation", entity extraction is **skipped entirely**
+- This is faster than running extraction with empty entity types
+- If you remove the domain, the file would fall back to `defaults` and run unnecessary extraction
+
+**In short:** Keep domains with `enabled: false` to skip extraction for those file types.
 
 ### TEI - Text Embeddings Inference (Optional)
 
