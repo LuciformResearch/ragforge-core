@@ -12,7 +12,7 @@
 
 import process from 'process';
 import * as path from 'path';
-import { BrainManager } from '@luciformresearch/ragforge';
+import { BrainManager } from '../../index.js';
 import { ensureEnvLoaded } from '../utils/env.js';
 
 export interface CleanOptions {
@@ -76,13 +76,13 @@ export async function runClean(options: CleanOptions): Promise<void> {
   const resolvedPath = path.resolve(options.projectPath);
   console.log(`🧹 Cleaning project: ${resolvedPath}`);
 
-  // Find project by path (try cache first)
-  let project = brain.findProjectByPath(resolvedPath);
+  // Find project by path
+  let project = await brain.findProjectByPath(resolvedPath);
   let projectId: string | null = null;
-  
-  // If not found in cache, search directly in Neo4j
+
+  // If not found, search directly in Neo4j
   if (!project) {
-    console.log(`📡 Project not in cache, searching in Neo4j...`);
+    console.log(`📡 Project not found, searching in Neo4j...`);
     const neo4jClient = (brain as any).neo4jClient;
     if (!neo4jClient) {
       console.error(`❌ Neo4j client not initialized. Is the daemon running?`);

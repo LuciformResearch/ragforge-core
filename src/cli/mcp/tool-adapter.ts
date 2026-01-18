@@ -5,7 +5,7 @@
  */
 
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { GeneratedToolDefinition } from '@luciformresearch/ragforge';
+import type { GeneratedToolDefinition } from '../../index.js';
 
 /**
  * Convert a single RagForge tool to MCP format

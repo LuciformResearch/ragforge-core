@@ -2463,7 +2463,7 @@ export class ConversationStorage {
         const availableProjects: Array<{ id: string; path: string; type: string }> = [];
 
         if (isProjectKnown && this.brainManager) {
-          const project = this.brainManager.findProjectByPath(projectRoot);
+          const project = await this.brainManager.findProjectByPath(projectRoot);
           if (project) {
             availableProjects.push({ id: project.id, path: project.path, type: project.type });
           }
@@ -2472,7 +2472,7 @@ export class ConversationStorage {
         // Add projects in cwd (if different from current project)
         if (hasProjectsInCwd && this.brainManager) {
           for (const projectPath of projectsInCwd) {
-            const project = this.brainManager.findProjectByPath(projectPath);
+            const project = await this.brainManager.findProjectByPath(projectPath);
             if (project && !availableProjects.find(p => p.id === project.id)) {
               availableProjects.push({ id: project.id, path: project.path, type: project.type });
             }
@@ -2927,15 +2927,15 @@ export class ConversationStorage {
 
     try {
       const absolutePath = path.resolve(projectRoot);
-      const projects = this.brainManager.listProjects();
-      
+      const projects = await this.brainManager.listProjects();
+
       // Check if projectRoot matches any registered project path
       for (const project of projects) {
         if (project.path === absolutePath || absolutePath.startsWith(project.path + path.sep)) {
           return true;
         }
       }
-      
+
       return false;
     } catch (error) {
       console.debug('[ConversationStorage] Error checking if project is known:', error);
@@ -2954,20 +2954,20 @@ export class ConversationStorage {
 
     try {
       const absoluteCwd = path.resolve(cwd);
-      const projects = this.brainManager.listProjects();
+      const projects = await this.brainManager.listProjects();
       const matchingProjects: string[] = [];
-      
+
       // Check if any registered project is a subdirectory of cwd
       for (const project of projects) {
         const projectPath = path.resolve(project.path);
         const relativePath = path.relative(absoluteCwd, projectPath);
-        
+
         // If project is a subdirectory of cwd (not outside, not same level)
         if (relativePath !== '' && relativePath !== '.' && !relativePath.startsWith('..')) {
           matchingProjects.push(projectPath);
         }
       }
-      
+
       return matchingProjects;
     } catch (error) {
       console.debug('[ConversationStorage] Error checking projects in cwd:', error);

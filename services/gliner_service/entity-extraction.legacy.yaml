@@ -1,0 +1,202 @@
+# Entity Extraction Configuration - LEGACY VERSION
+# ================================================
+# This is the original configuration before optimization.
+# Kept for reference. The active config is entity-extraction.yaml
+#
+# This file configures domain presets for automatic entity extraction.
+# Each domain defines:
+#   - description: Used for multi-label classification
+#   - entity_types: Types of entities to extract in this domain
+#   - relation_types: Relations between entities (key: description)
+#
+# You can add custom domains or modify existing ones without changing code.
+
+# Entity types that should NOT have embeddings generated
+# These are numeric/value types where embedding similarity doesn't make sense:
+# - price, amount, currency: monetary values
+# - date, duration: temporal values
+# - quantity, size: measurements
+#
+# This is the SINGLE SOURCE OF TRUTH for this list.
+# TypeScript code fetches this via /config endpoint.
+skip_embedding_types:
+  - price
+  - date
+  - quantity
+  - amount
+  - currency
+  - size
+  - duration
+
+# Default settings (used when no domain is detected or specified)
+defaults:
+  entity_types:
+    - person
+    - organization
+    - location
+    - technology
+    - product
+    - price
+    - date
+    - quantity
+    # Link/reference types (extracted across all domains)
+    - url
+    - file_path
+    - endpoint
+  relation_types:
+    works_for: "person works for organization"
+    located_in: "entity is located in location"
+    created_by: "product/technology created by person/organization"
+    costs: "product has price"
+    depends_on: "technology depends on another technology"
+    part_of: "entity is part of another entity"
+    references: "entity references url or file_path"
+    links_to: "entity links to url or endpoint"
+
+# Domain-specific presets
+domains:
+  ecommerce:
+    description: "Text about products, shopping, prices, brands, e-commerce"
+    entity_types:
+      - product
+      - brand
+      - price
+      - currency
+      - quantity
+      - category
+      - ingredient
+      - certification
+      - benefit
+      - hair_type
+      - skin_type
+      - size
+      - color
+      - material
+    relation_types:
+      compatible_with: "product is compatible with attribute (e.g. hair type)"
+      contains: "product contains ingredient"
+      certified_by: "product has certification"
+      provides_benefit: "product provides benefit"
+      recommended_with: "product is recommended with another product"
+      complements: "product complements another product"
+      priced_at: "product has price"
+
+  code:
+    description: "Text about programming, software, functions, APIs, code"
+    entity_types:
+      - function
+      - class
+      - method
+      - variable
+      - module
+      - library
+      - api
+      - endpoint
+      - parameter
+      - return_type
+      - error
+      - exception
+      - configuration
+      # Link/reference types specific to code
+      - file_path
+      - url
+      - git_ref
+      - package_name
+    relation_types:
+      calls: "function/method calls another"
+      inherits_from: "class inherits from another class"
+      implements: "class implements interface"
+      imports: "module imports another module"
+      returns: "function returns type"
+      throws: "function throws exception"
+      depends_on: "module depends on library"
+      defined_in: "function/class is defined in file_path"
+      references: "code references another file_path or url"
+      documented_at: "code is documented at url"
+
+  documentation:
+    description: "Technical documentation, specifications, requirements, user stories"
+    entity_types:
+      - concept
+      - feature
+      - requirement
+      - specification
+      - user_story
+      - use_case
+      - actor
+      - system
+      - component
+      - version
+      - release
+      - milestone
+      # Link/reference types specific to documentation
+      - file_path
+      - url
+      - endpoint
+      - section_ref
+    relation_types:
+      describes: "section describes concept"
+      requires: "feature requires another feature"
+      implements: "feature implements requirement"
+      affects: "change affects component"
+      belongs_to: "feature belongs to release"
+      see_also: "documentation references another url or file_path"
+      defined_at: "concept is defined at url or file_path"
+      api_endpoint: "feature exposes endpoint"
+
+  legal:
+    description: "Legal documents, contracts, terms, obligations, agreements"
+    entity_types:
+      - person
+      - organization
+      - contract
+      - clause
+      - obligation
+      - right
+      - party
+      - date
+      - duration
+      - amount
+      - jurisdiction
+    relation_types:
+      party_to: "person/organization is party to contract"
+      obligated_to: "party has obligation"
+      grants_right: "clause grants right to party"
+      effective_date: "contract has effective date"
+      governed_by: "contract governed by jurisdiction"
+
+  # Example custom domain - uncomment and modify as needed
+  # medical:
+  #   description: "Medical and healthcare content, symptoms, treatments"
+  #   entity_types:
+  #     - symptom
+  #     - diagnosis
+  #     - treatment
+  #     - medication
+  #     - dosage
+  #     - condition
+  #     - patient
+  #     - doctor
+  #   relation_types:
+  #     treats: "medication/treatment treats condition"
+  #     causes: "condition causes symptom"
+  #     prescribed_by: "medication prescribed by doctor"
+  #     contraindicated_with: "medication contraindicated with another"
+
+  # scientific:
+  #   description: "Scientific papers, research, experiments, hypotheses"
+  #   entity_types:
+  #     - researcher
+  #     - institution
+  #     - hypothesis
+  #     - experiment
+  #     - result
+  #     - method
+  #     - dataset
+  #     - citation
+  #   relation_types:
+  #     authored_by: "paper authored by researcher"
+  #     affiliated_with: "researcher affiliated with institution"
+  #     cites: "paper cites another paper"
+  #     proves: "experiment proves hypothesis"
+  #     uses_method: "experiment uses method"

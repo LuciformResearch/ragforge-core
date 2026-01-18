@@ -160,13 +160,13 @@ const markdownDocumentNodeType: NodeTypeDefinition = {
 const markdownSectionNodeType: NodeTypeDefinition = {
   label: 'MarkdownSection',
   description: 'Section within a parsed document',
-  supportsLineNavigation: false,
+  supportsLineNavigation: true, // Now supports line navigation
   uuidStrategy: { type: 'signature', fields: ['file', 'index'] },
   fields: markdownSectionFieldExtractors,
   contentHashField: 'content',
   chunking: sectionChunkingConfig,
-  additionalRequiredProps: ['file', 'title', 'content', 'index'],
-  indexedProps: ['file', 'title', 'titleLevel', 'type', 'pageNum'],
+  additionalRequiredProps: ['file', 'title', 'content', 'index', 'startLine', 'endLine'],
+  indexedProps: ['file', 'title', 'titleLevel', 'type', 'pageNum', 'startLine'],
 };
 
 // ============================================================
@@ -353,11 +353,14 @@ export class DocumentParser implements ContentParser {
         // If we have text content, create a single section
         // TODO: Parse text content into sections using the same heuristics
         if (docInfo.textContent) {
+          const lineCount = docInfo.textContent.split('\n').length;
           sections = [{
             index: 1,
             title: '',
             text: docInfo.textContent,
             pageNum: 1,
+            startLine: 1,
+            endLine: lineCount,
           }];
         }
 
@@ -409,11 +412,14 @@ export class DocumentParser implements ContentParser {
     // TODO: Parse DOCX with sections (using mammoth HTML or similar)
     const sections: ParsedSection[] = [];
     if (docInfo.textContent) {
+      const lineCount = docInfo.textContent.split('\n').length;
       sections.push({
         index: 1,
         title: '',
         text: docInfo.textContent,
         pageNum: 1,
+        startLine: 1,
+        endLine: lineCount,
       });
     }
 
@@ -460,11 +466,14 @@ export class DocumentParser implements ContentParser {
 
     // TODO: Convert sheets to markdown tables
     if (docInfo.textContent) {
+      const lineCount = docInfo.textContent.split('\n').length;
       sections.push({
         index: 1,
         title: 'Data',
         text: docInfo.textContent,
         pageNum: 1,
+        startLine: 1,
+        endLine: lineCount,
       });
     }
 
@@ -587,6 +596,18 @@ export class DocumentParser implements ContentParser {
       to: fileId,
     });
 
+    // DEFINED_IN for orphan cleanup
+    relationships.push({
+      type: 'DEFINED_IN',
+      from: docId,
+      to: fileId,
+      targetLabel: 'File',
+      targetProps: {
+        _name: fileName,
+        path: filePath,
+      }
+    });
+
     // 3. Create MarkdownSection nodes
     for (const section of sections) {
       const sectionId = `section:${hashContent(filePath + section.index + projectId)}`;
@@ -607,6 +628,10 @@ export class DocumentParser implements ContentParser {
         // Raw content - will be extracted to _content then removed
         content: section.text,
         index: section.index,
+        // Line positions from parser (for chunking)
+        startLine: section.startLine,
+        endLine: section.endLine,
+        // pageNum is kept as metadata only (original PDF page number)
         pageNum: section.pageNum,
         type: section.type || 'content',
         slug: this.slugify(sectionTitle),
@@ -621,6 +646,18 @@ export class DocumentParser implements ContentParser {
         type: 'IN_DOCUMENT',
         from: sectionId,
         to: docId,
+      });
+
+      // DEFINED_IN for orphan cleanup
+      relationships.push({
+        type: 'DEFINED_IN',
+        from: sectionId,
+        to: fileId,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          path: filePath,
+        }
       });
     }
   }

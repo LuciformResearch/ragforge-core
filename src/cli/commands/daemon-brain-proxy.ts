@@ -18,7 +18,7 @@ import type {
   BrainSearchOptions,
   UnifiedSearchResult,
   IngestionStatus,
-} from '@luciformresearch/ragforge';
+} from '../../index.js';
 
 const DAEMON_URL = 'http://127.0.0.1:6969';
 

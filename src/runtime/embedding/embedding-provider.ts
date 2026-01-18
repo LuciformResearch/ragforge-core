@@ -17,6 +17,8 @@ export interface EmbeddingProviderInterface {
   getModelName(): string;
   embed(texts: string[], overrides?: { model?: string; dimension?: number }): Promise<number[][]>;
   embedSingle(text: string, overrides?: { model?: string; dimension?: number }): Promise<number[]>;
+  /** Get the embedding dimension for this provider (generates a test embedding if needed) */
+  getDimensions(): Promise<number>;
 }
 
 /**
@@ -135,6 +137,19 @@ export class GeminiEmbeddingProvider {
   async embedSingle(text: string, overrides?: { model?: string; dimension?: number }): Promise<number[]> {
     const embeddings = await this.embed([text], overrides);
     return embeddings[0];
+  }
+
+  /**
+   * Get embedding dimensions - returns configured dimension or generates a test embedding
+   */
+  async getDimensions(): Promise<number> {
+    // If dimension is configured, return it directly
+    if (this.dimension) {
+      return this.dimension;
+    }
+    // Otherwise generate a test embedding to determine the dimension
+    const testEmbedding = await this.embedSingle('test');
+    return testEmbedding.length;
   }
 }
 

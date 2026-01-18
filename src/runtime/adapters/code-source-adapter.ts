@@ -16,6 +16,7 @@ import fg from 'fast-glob';
 import { createHash } from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import * as os from 'os';
 import pLimit from 'p-limit';
 import { formatLocalDate } from '../utils/timestamp.js';
 import { getLastSegment, getPathDepth, splitPath, isLocalPath, isAbsolutePath } from '../../utils/path-utils.js';
@@ -40,6 +41,12 @@ import {
   type RelationshipResolutionResult,
   type ResolvedRelationship,
   type ParsedFilesMap,
+  // Parallel parsing with worker threads
+  ProjectParser,
+  isCodeParserSupported,
+  NonCodeProjectParser,
+  isNonCodeParserSupported,
+  detectNonCodeParserType,
   // TODO: Migrate to UniversalScope/FileAnalysis from './base'
   // These internal types (ScopeInfo, ScopeFileAnalysis) are used throughout this file
   // and require a larger refactoring effort to replace with the universal types.
@@ -163,6 +170,8 @@ export class CodeSourceAdapter extends SourceAdapter {
   private svelteParser: SvelteParser | null = null;
   private markdownParser: MarkdownParser | null = null;
   private genericParser: GenericCodeParser | null = null;
+  private projectParser: ProjectParser | null = null;
+  private nonCodeProjectParser: NonCodeProjectParser | null = null;
   private uuidCache: Map<string, Map<string, string>>; // filePath -> (key -> uuid)
 
   constructor(adapterName: 'typescript' | 'python' | 'html' | 'auto') {
@@ -270,6 +279,40 @@ export class CodeSourceAdapter extends SourceAdapter {
       await this.genericParser.initialize();
     }
     return this.genericParser;
+  }
+
+  /**
+   * Get or initialize ProjectParser for parallel code file parsing.
+   * Uses worker threads for true parallelism on CPU-bound parsing tasks.
+   */
+  private getProjectParser(): ProjectParser {
+    if (!this.projectParser) {
+      // Use CPU count - 1 workers, minimum 1
+      const maxWorkers = Math.max(1, (os.cpus().length || 4) - 1);
+      this.projectParser = new ProjectParser({
+        maxWorkers,
+        verbose: false,
+      });
+      console.log(`[CodeSourceAdapter] ProjectParser initialized with ${maxWorkers} workers`);
+    }
+    return this.projectParser;
+  }
+
+  /**
+   * Get or initialize NonCodeProjectParser for parallel non-code file parsing.
+   * Uses worker threads for true parallelism.
+   */
+  private getNonCodeProjectParser(): NonCodeProjectParser {
+    if (!this.nonCodeProjectParser) {
+      // Use CPU count - 1 workers, minimum 1
+      const maxWorkers = Math.max(1, (os.cpus().length || 4) - 1);
+      this.nonCodeProjectParser = new NonCodeProjectParser({
+        maxWorkers,
+        verbose: false,
+      });
+      console.log(`[CodeSourceAdapter] NonCodeProjectParser initialized with ${maxWorkers} workers`);
+    }
+    return this.nonCodeProjectParser;
   }
 
   /**
@@ -651,258 +694,283 @@ export class CodeSourceAdapter extends SourceAdapter {
     const limit = pLimit(10);
     let filesProcessed = 0;
 
-    // Pre-initialize all parsers BEFORE parallel processing to avoid race conditions
-    // Detect which parsers we'll need based on file extensions
-    const needsTs = files.some(f => /\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(f));
-    const needsPy = files.some(f => /\.pyi?$/i.test(f));
-    const needsRust = files.some(f => /\.rs$/i.test(f));
-    const needsGo = files.some(f => /\.go$/i.test(f));
-    const needsC = files.some(f => /\.[ch]$/i.test(f));
-    const needsCpp = files.some(f => /\.(cpp|cc|cxx|hpp|hxx)$/i.test(f));
-    const needsCSharp = files.some(f => /\.cs$/i.test(f));
-    const needsVue = files.some(f => /\.vue$/i.test(f));
-    const needsSvelte = files.some(f => /\.svelte$/i.test(f));
-    const needsHtml = files.some(f => /\.html?$/i.test(f));
-    const needsCss = files.some(f => /\.css$/i.test(f));
-    const needsScss = files.some(f => /\.scss$/i.test(f));
-    const needsMd = files.some(f => /\.mdx?$/i.test(f));
+    // Separate code files (for ProjectParser with true parallelism) from other files
+    const codeFilePaths = files.filter(f => isCodeParserSupported(f));
+    const otherFiles = files.filter(f => !isCodeParserSupported(f));
 
-    // Initialize parsers in parallel
-    console.log(`🔧 Initializing parsers: TS=${needsTs}, Py=${needsPy}, Rust=${needsRust}, Go=${needsGo}, C=${needsC}, C++=${needsCpp}, C#=${needsCSharp}, Vue=${needsVue}, Svelte=${needsSvelte}, HTML=${needsHtml}, CSS=${needsCss}, SCSS=${needsScss}, MD=${needsMd}`);
-    await Promise.all([
-      needsTs && this.registry.initializeParser('typescript').catch(() => {}),
-      needsPy && this.registry.initializeParser('python').catch(() => {}),
-      needsRust && this.registry.initializeParser('rust').catch(() => {}),
-      needsGo && this.registry.initializeParser('go').catch(() => {}),
-      needsC && this.registry.initializeParser('c').catch(() => {}),
-      needsCpp && this.registry.initializeParser('cpp').catch(() => {}),
-      needsCSharp && this.registry.initializeParser('csharp').catch(() => {}),
-      needsVue && this.getVueParser().catch(() => {}),
-      needsSvelte && this.getSvelteParser().catch(() => {}),
-      needsHtml && this.getHtmlParser().catch(() => {}),
-      needsCss && this.getCssParser().catch(() => {}),
-      needsScss && this.getScssParser().catch(() => {}),
-      needsMd && this.getMarkdownParser().catch(() => {}),
-    ].filter(Boolean));
-    console.log(`✅ All parsers initialized`);
+    console.log(`📊 Files breakdown: ${codeFilePaths.length} code files, ${otherFiles.length} other files`);
 
-    // Parse single file and return typed result
-    const parseFile = async (file: string, index: number): Promise<void> => {
-      console.log(`📄 [${index + 1}/${files.length}] ${file}`);
-      try {
-        // Handle document files first (PDF, DOCX, XLSX - binary with full text extraction)
-        if (isDocumentFile(file)) {
+    // ========================================================================
+    // PHASE 1: Parse CODE files with ProjectParser (true parallelism via workers)
+    // ========================================================================
+    if (codeFilePaths.length > 0) {
+      console.log(`🚀 Starting parallel code parsing of ${codeFilePaths.length} files with worker threads...`);
+
+      // First, read all code files and compute metadata (I/O bound, use pLimit)
+      const codeContentMap = new Map<string, string>();
+      await Promise.all(
+        codeFilePaths.map(file => limit(async () => {
           try {
-            const docInfo = await parseDocumentFile(file, { extractText: true });
-            if (docInfo) {
-              documentFiles.set(file, docInfo);
+            let content: string;
+            let mtime: string;
+
+            if (contentMap && contentMap.has(file)) {
+              // Virtual file: read from memory
+              const virtualContent = contentMap.get(file)!;
+              content = typeof virtualContent === 'string'
+                ? virtualContent
+                : virtualContent.toString('utf-8');
+              mtime = formatLocalDate(new Date());
+            } else {
+              // Disk file: read from filesystem
+              const fsModule = await import('fs');
+              const [fileContent, stat] = await Promise.all([
+                fsModule.promises.readFile(file, 'utf-8'),
+                fsModule.promises.stat(file)
+              ]);
+              content = fileContent;
+              mtime = formatLocalDate(stat.mtime);
             }
+
+            // Store content for ProjectParser
+            codeContentMap.set(file, content);
+
+            // Pre-compute file metadata
+            const rawContentHash = createHash('sha256').update(content).digest('hex');
+            fileMetadata.set(file, {
+              rawContentHash,
+              mtime,
+              rawContent: getRawContentProp(content),
+            });
           } catch (err) {
-            console.warn(`Failed to parse document file ${file}:`, err);
+            console.warn(`Failed to read code file ${file}:`, err);
           }
-          return;
-        }
+        }))
+      );
 
-        // Handle media files (images, 3D - binary, metadata only)
-        if (isMediaFile(file)) {
-          try {
-            const mediaInfo = await parseMediaFile(file);
-            if (mediaInfo) {
-              mediaFiles.set(file, mediaInfo);
-            }
-          } catch (err) {
-            console.warn(`Failed to parse media file ${file}:`, err);
-          }
-          return;
-        }
+      // Parse all code files with ProjectParser (CPU-bound, uses worker threads)
+      const projectParser = this.getProjectParser();
+      const parseResult = await projectParser.parseProject({
+        root: config.root || process.cwd(),
+        files: Array.from(codeContentMap.keys()),
+        contentMap: codeContentMap,
+        resolveRelationships: false, // We'll handle relationships separately in buildGraph
+      });
 
-        // Read file content: from contentMap (virtual) or disk
-        let content: string;
-        let mtime: string | undefined;
-
-        if (contentMap && contentMap.has(file)) {
-          // Virtual file: read from memory
-          const virtualContent = contentMap.get(file)!;
-          content = typeof virtualContent === 'string'
-            ? virtualContent
-            : virtualContent.toString('utf-8');
-          console.log(`   📦 Virtual ${file} (${content.length} chars)`);
-          mtime = formatLocalDate(new Date()); // Use current time for virtual files
-        } else {
-          // Disk file: read from filesystem
-          const fsModule = await import('fs');
-          const [fileContent, stat] = await Promise.all([
-            fsModule.promises.readFile(file, 'utf-8'),
-            fsModule.promises.stat(file)
-          ]);
-          content = fileContent;
-          mtime = formatLocalDate(stat.mtime);
-          console.log(`   📖 Read ${file} (${content.length} chars)`);
-        }
-
-        // Pre-compute file metadata (hash + mtime + optional raw content)
-        const rawContentHash = createHash('sha256').update(content).digest('hex');
-        fileMetadata.set(file, {
-          rawContentHash,
-          mtime,
-          rawContent: getRawContentProp(content),
-        });
-
-        // Handle package.json files
-        if (this.isPackageJson(file)) {
-          const pkgInfo = this.parsePackageJson(content, file);
-          if (pkgInfo) {
-            packageJsonFiles.set(file, pkgInfo);
-          }
-          console.log(`   ✅ Done: ${file} (package.json)`);
-          return;
-        }
-
-        // Handle Vue SFC files
-        if (this.isVueFile(file)) {
-          const vueParser = await this.getVueParser();
-          const result = await vueParser.parseFile(file, content);
-          vueFiles.set(file, result);
-          return;
-        }
-
-        // Handle Svelte component files
-        if (this.isSvelteFile(file)) {
-          const svelteParser = await this.getSvelteParser();
-          const result = await svelteParser.parseFile(file, content);
-          svelteFiles.set(file, result);
-          return;
-        }
-
-        // Handle HTML files (not Vue/Svelte)
-        if (this.isHtmlFile(file)) {
-          const htmlParser = await this.getHtmlParser();
-          const result = await htmlParser.parseFile(file, content, { parseScripts: true });
-          htmlFiles.set(file, result);
-          return;
-        }
-
-        // Handle SCSS files
-        if (this.isScssFile(file)) {
-          const scssParser = await this.getScssParser();
-          const result = await scssParser.parseFile(file, content);
-          scssFiles.set(file, result);
-          return;
-        }
-
-        // Handle CSS files
-        if (this.isCssFile(file)) {
-          const cssParser = await this.getCssParser();
-          const result = await cssParser.parseFile(file, content);
-          cssFiles.set(file, result);
-          return;
-        }
-
-        // Handle Markdown files
-        if (this.isMarkdownFile(file)) {
-          console.log(`   🔹 MD: getting parser for ${file}`);
-          const mdParser = await this.getMarkdownParser();
-          console.log(`   🔹 MD: parser obtained, parsing ${file}`);
-          const result = await mdParser.parseFile(file, content, { parseCodeBlocks: false }); // Disabled for now - causes parallel deadlock
-          console.log(`   🔹 MD: done ${file}`);
-          markdownFiles.set(file, result);
-          return;
-        }
-
-        // Handle data files (JSON, YAML, XML, TOML, ENV) - but not package.json which is handled separately
-        if (isDataFile(file) && !this.isPackageJson(file)) {
-          try {
-            const dataInfo = parseDataFile(file, content);
-            dataFiles.set(file, dataInfo);
-            console.log(`   ✅ Done: ${file} (data file)`);
-          } catch (err) {
-            console.warn(`Failed to parse data file ${file}:`, err);
-            console.log(`   ⚠️ Done with error: ${file} (data file)`);
-          }
-          return;
-        }
-
-        // Handle TypeScript/Python files with ParserRegistry (parsers pre-initialized above)
-        const parser = this.registry.getParserForFile(file);
-        if (parser) {
-          const universalAnalysis = await parser.parseFile(file, content);
-
-          // LEGACY CONVERSION: Convert UniversalScope/FileAnalysis → ScopeInfo/ScopeFileAnalysis
-          // This conversion exists because the rest of this file uses the internal types.
-          // TODO: Refactor this file to use UniversalScope/FileAnalysis directly and remove this conversion.
-          const analysis: ScopeFileAnalysis = {
-            filePath: file,
-            totalScopes: universalAnalysis.scopes.length,
-            imports: universalAnalysis.imports.map(imp => imp.source),
-            dependencies: [],
-            scopes: universalAnalysis.scopes.map(uScope => ({
-              name: uScope.name,
-              type: uScope.type as any,
-              filePath: uScope.filePath,
-              startLine: uScope.startLine,
-              endLine: uScope.endLine,
-              content: uScope.source || '',
-              contentDedented: uScope.source || '',
-              signature: uScope.signature || '',
-              returnType: uScope.returnType,
-              parameters: uScope.parameters || [],
-              parent: uScope.parentName,
-              depth: uScope.depth || 0,
-              linesOfCode: uScope.endLine - uScope.startLine + 1,
-              identifierReferences: uScope.references || [],
-              importReferences: uScope.imports || [],
-              modifiers: [],
-              complexity: 0,
-              children: [],
-              imports: [],
-              exports: [],
-              dependencies: [],
-              astValid: true,
-              astIssues: [],
-              astNotes: [],
-              decorators: (uScope as any).decorators,
-              docstring: (uScope as any).docstring,
-              value: uScope.value,
-              // Phase 3: Include languageSpecific metadata (heritage, generics, decorators, enums)
-              languageSpecific: uScope.languageSpecific
-            } as ScopeInfo)),
-            exports: universalAnalysis.exports.map(e => e.exported),
-            importReferences: universalAnalysis.imports.map(imp => ({
-              source: imp.source,
-              imported: imp.imported,
-              alias: imp.alias,
-              kind: imp.kind as any,
-              isLocal: isLocalPath(imp.source)
-            })),
-            totalLines: universalAnalysis.linesOfCode,
-            astValid: true,
-            astIssues: universalAnalysis.errors?.map(e => e.message) || []
-          };
-
-          codeFiles.set(file, analysis);
-          return;
-        }
-
-        // Fallback: Use GenericCodeParser for unknown code files
-        // This handles any code file that doesn't have a dedicated parser
-        const genericParser = await this.getGenericParser();
-        const genericResult = await genericParser.parseFile(file, content);
-        genericFiles.set(file, genericResult);
-
-      } catch (error) {
-        console.error(`Error parsing file ${file}:`, error);
-      } finally {
+      // Store results - ProjectParser returns ScopeFileAnalysis directly
+      for (const [filePath, analysis] of parseResult.files) {
+        codeFiles.set(filePath, analysis);
         filesProcessed++;
-        onProgress(file);
+        onProgress(filePath);
       }
-    };
 
-    // Process all files in parallel with concurrency limit
-    console.log(`🚀 Starting parallel parsing of ${files.length} files (concurrency: 10)...`);
-    await Promise.all(
-      files.map((file, index) => limit(() => parseFile(file, index)))
-    );
-    console.log(`✅ Parallel parsing complete. Files processed: ${filesProcessed}/${files.length}`);
+      // Log any errors
+      if (parseResult.errors.length > 0) {
+        console.warn(`⚠️ ${parseResult.errors.length} code files failed to parse:`);
+        parseResult.errors.slice(0, 5).forEach(e => console.warn(`  - ${e.file}: ${e.error}`));
+      }
+
+      console.log(`✅ Code parsing complete: ${parseResult.stats.successfulFiles}/${parseResult.stats.totalFiles} files, ${parseResult.stats.totalScopes} scopes in ${parseResult.stats.parseTimeMs}ms`);
+    }
+
+    // ========================================================================
+    // PHASE 2: Parse OTHER files with NonCodeProjectParser (true parallelism)
+    // ========================================================================
+    if (otherFiles.length > 0) {
+      console.log(`🚀 Starting parallel parsing of ${otherFiles.length} non-code files with worker threads...`);
+
+      // Separate files by type: binary (documents, media), text-parsable (md, css, html, vue, svelte), other (data, pkg.json)
+      const binaryFiles: string[] = [];
+      const nonCodeParsableFiles: string[] = [];
+      const otherTextFiles: string[] = [];
+
+      for (const file of otherFiles) {
+        if (isDocumentFile(file) || isMediaFile(file)) {
+          binaryFiles.push(file);
+        } else if (isNonCodeParserSupported(file)) {
+          nonCodeParsableFiles.push(file);
+        } else {
+          otherTextFiles.push(file);
+        }
+      }
+
+      console.log(`   📊 Non-code breakdown: ${binaryFiles.length} binary, ${nonCodeParsableFiles.length} parsable, ${otherTextFiles.length} other`);
+
+      // PHASE 2a: Process binary files (documents, media) with pLimit
+      if (binaryFiles.length > 0) {
+        await Promise.all(
+          binaryFiles.map(file => limit(async () => {
+            try {
+              if (isDocumentFile(file)) {
+                const docInfo = await parseDocumentFile(file, { extractText: true });
+                if (docInfo) documentFiles.set(file, docInfo);
+              } else if (isMediaFile(file)) {
+                const mediaInfo = await parseMediaFile(file);
+                if (mediaInfo) mediaFiles.set(file, mediaInfo);
+              }
+              filesProcessed++;
+              onProgress(file);
+            } catch (err) {
+              console.warn(`Failed to parse binary file ${file}:`, err);
+            }
+          }))
+        );
+      }
+
+      // PHASE 2b: Read and parse non-code parsable files with NonCodeProjectParser
+      if (nonCodeParsableFiles.length > 0) {
+        // Read all non-code parsable files and compute metadata
+        const nonCodeContentMap = new Map<string, string>();
+        await Promise.all(
+          nonCodeParsableFiles.map(file => limit(async () => {
+            try {
+              let content: string;
+              let mtime: string;
+
+              if (contentMap && contentMap.has(file)) {
+                const virtualContent = contentMap.get(file)!;
+                content = typeof virtualContent === 'string'
+                  ? virtualContent
+                  : virtualContent.toString('utf-8');
+                mtime = formatLocalDate(new Date());
+              } else {
+                const fsModule = await import('fs');
+                const [fileContent, stat] = await Promise.all([
+                  fsModule.promises.readFile(file, 'utf-8'),
+                  fsModule.promises.stat(file)
+                ]);
+                content = fileContent;
+                mtime = formatLocalDate(stat.mtime);
+              }
+
+              nonCodeContentMap.set(file, content);
+
+              const rawContentHash = createHash('sha256').update(content).digest('hex');
+              fileMetadata.set(file, {
+                rawContentHash,
+                mtime,
+                rawContent: getRawContentProp(content),
+              });
+            } catch (err) {
+              console.warn(`Failed to read non-code file ${file}:`, err);
+            }
+          }))
+        );
+
+        // Parse all non-code files with NonCodeProjectParser (uses worker threads)
+        const nonCodeParser = this.getNonCodeProjectParser();
+        const parseInputs = Array.from(nonCodeContentMap.entries()).map(([filePath, content]) => ({
+          path: filePath,
+          content,
+          options: this.isMarkdownFile(filePath) ? { parseCodeBlocks: false } : {},
+        }));
+
+        const nonCodeResult = await nonCodeParser.parseFiles({ files: parseInputs });
+
+        // Store results
+        for (const [filePath, result] of nonCodeResult.markdownFiles) {
+          markdownFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+        for (const [filePath, result] of nonCodeResult.cssFiles) {
+          cssFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+        for (const [filePath, result] of nonCodeResult.scssFiles) {
+          scssFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+        for (const [filePath, result] of nonCodeResult.htmlFiles) {
+          htmlFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+        for (const [filePath, result] of nonCodeResult.vueFiles) {
+          vueFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+        for (const [filePath, result] of nonCodeResult.svelteFiles) {
+          svelteFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+        for (const [filePath, result] of nonCodeResult.genericFiles) {
+          genericFiles.set(filePath, result);
+          filesProcessed++;
+          onProgress(filePath);
+        }
+
+        if (nonCodeResult.errors.length > 0) {
+          console.warn(`⚠️ ${nonCodeResult.errors.length} non-code files failed to parse:`);
+          nonCodeResult.errors.slice(0, 5).forEach(e => console.warn(`  - ${e.file}: ${e.error}`));
+        }
+
+        console.log(`✅ Non-code parsing complete: ${nonCodeResult.stats.successfulFiles}/${nonCodeResult.stats.totalFiles} files in ${nonCodeResult.stats.parseTimeMs}ms`);
+      }
+
+      // PHASE 2c: Process other text files (package.json, data files) with pLimit
+      if (otherTextFiles.length > 0) {
+        await Promise.all(
+          otherTextFiles.map(file => limit(async () => {
+            try {
+              let content: string;
+              let mtime: string;
+
+              if (contentMap && contentMap.has(file)) {
+                const virtualContent = contentMap.get(file)!;
+                content = typeof virtualContent === 'string'
+                  ? virtualContent
+                  : virtualContent.toString('utf-8');
+                mtime = formatLocalDate(new Date());
+              } else {
+                const fsModule = await import('fs');
+                const [fileContent, stat] = await Promise.all([
+                  fsModule.promises.readFile(file, 'utf-8'),
+                  fsModule.promises.stat(file)
+                ]);
+                content = fileContent;
+                mtime = formatLocalDate(stat.mtime);
+              }
+
+              const rawContentHash = createHash('sha256').update(content).digest('hex');
+              fileMetadata.set(file, {
+                rawContentHash,
+                mtime,
+                rawContent: getRawContentProp(content),
+              });
+
+              // Handle package.json
+              if (this.isPackageJson(file)) {
+                const pkgInfo = this.parsePackageJson(content, file);
+                if (pkgInfo) packageJsonFiles.set(file, pkgInfo);
+              }
+              // Handle data files (JSON, YAML, XML, TOML, ENV)
+              else if (isDataFile(file)) {
+                const dataInfo = parseDataFile(file, content);
+                dataFiles.set(file, dataInfo);
+              }
+              // Fallback: GenericCodeParser
+              else {
+                const genericParser = await this.getGenericParser();
+                const genericResult = await genericParser.parseFile(file, content);
+                genericFiles.set(file, genericResult);
+              }
+
+              filesProcessed++;
+              onProgress(file);
+            } catch (err) {
+              console.warn(`Failed to process file ${file}:`, err);
+            }
+          }))
+        );
+      }
+
+      console.log(`✅ All non-code files processed. Total: ${filesProcessed}/${files.length}`);
+    }
 
     return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles, fileMetadata };
   }
@@ -1077,7 +1145,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: pkgId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
     }
 
@@ -1210,6 +1284,10 @@ export class CodeSourceAdapter extends SourceAdapter {
         });
       }
 
+      // Enrich class/interface nodes with their members summary
+      // This helps search find classes when searching for method names
+      this.enrichClassNodesWithMembers(nodes, analysis.scopes, filePath);
+
       // Create File node with full metadata (using relative paths)
       const fileName = getLastSegment(relPath);
       const directory = relPath.includes('/') ? relPath.substring(0, relPath.lastIndexOf('/')) : '.';
@@ -1247,12 +1325,19 @@ export class CodeSourceAdapter extends SourceAdapter {
       });
 
       // Create DEFINED_IN relationships
+      const fileUuidForScope = UniqueIDHelper.GenerateFileUUID(filePath);
       for (const scope of analysis.scopes) {
         const uuid = this.generateUUID(scope, filePath);
         relationships.push({
           type: 'DEFINED_IN',
           from: uuid,
-          to: UniqueIDHelper.GenerateFileUUID(filePath)
+          to: fileUuidForScope,
+          targetLabel: 'File',
+          targetProps: {
+            _name: path.basename(filePath),
+            absolutePath: filePath,
+            path: relPath,
+          }
         });
       }
 
@@ -1280,10 +1365,17 @@ export class CodeSourceAdapter extends SourceAdapter {
         // Create IN_DIRECTORY relationship (File -> Directory)
         if (currentPath === relPath) {
           const absDirPath = path.join(projectRoot, dir);
+          const dirName = dir.includes('/') ? dir.substring(dir.lastIndexOf('/') + 1) : dir;
           relationships.push({
             type: 'IN_DIRECTORY',
             from: UniqueIDHelper.GenerateFileUUID(filePath),
-            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
+            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath),
+            targetLabel: 'Directory',
+            targetProps: {
+              _name: dirName,
+              absolutePath: absDirPath,
+              path: dir,
+            }
           });
         }
 
@@ -1314,10 +1406,17 @@ export class CodeSourceAdapter extends SourceAdapter {
       if (parentDir && parentDir !== '.' && parentDir !== '' && directories.has(parentDir)) {
         const absParentPath = path.join(projectRoot, parentDir);
         const absDirPath = path.join(projectRoot, dir);
+        const dirName = dir.includes('/') ? dir.substring(dir.lastIndexOf('/') + 1) : dir;
         relationships.push({
           type: 'PARENT_OF',
           from: UniqueIDHelper.GenerateDirectoryUUID(absParentPath),
-          to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
+          to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath),
+          targetLabel: 'Directory',
+          targetProps: {
+            _name: dirName,
+            absolutePath: absDirPath,
+            path: dir,
+          }
         });
       }
     }
@@ -1356,6 +1455,11 @@ export class CodeSourceAdapter extends SourceAdapter {
               to: UniqueIDHelper.GenerateExternalLibraryUUID(imp.source),
               properties: {
                 symbol: imp.imported
+              },
+              targetLabel: 'ExternalLibrary',
+              targetProps: {
+                _name: imp.source,
+                name: imp.source,
               }
             });
           }
@@ -1451,7 +1555,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: docId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       // Create Image nodes and relationships
@@ -1502,10 +1612,17 @@ export class CodeSourceAdapter extends SourceAdapter {
         // Create IN_DIRECTORY relationship (File -> Directory)
         if (currentPath === relPath) {
           const absDirPath = path.join(projectRoot, dir);
+          const dirName = dir.includes('/') ? dir.substring(dir.lastIndexOf('/') + 1) : dir;
           relationships.push({
             type: 'IN_DIRECTORY',
             from: UniqueIDHelper.GenerateFileUUID(filePath),
-            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
+            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath),
+            targetLabel: 'Directory',
+            targetProps: {
+              _name: dirName,
+              absolutePath: absDirPath,
+              path: dir,
+            }
           });
         }
 
@@ -1553,7 +1670,13 @@ export class CodeSourceAdapter extends SourceAdapter {
           relationships.push({
             type: 'DEFINED_IN',
             from: scopeUuid,
-            to: fileUuid
+            to: fileUuid,
+            targetLabel: 'File',
+            targetProps: {
+              _name: fileName,
+              absolutePath: filePath,
+              path: relPath,
+            }
           });
 
           // Create SCRIPT_OF relationship (Scope -> WebDocument)
@@ -1636,16 +1759,49 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: stylesheetId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       // Create IMPORTS relationships for @import
       for (const importUrl of stylesheet.imports) {
+        // Determine import type: HTTP URL, local file path, or npm package
+        const isHttpUrl = importUrl.startsWith('http://') || importUrl.startsWith('https://');
+        const isLocal = isLocalPath(importUrl); // handles ./relative, ../parent, /absolute, C:\windows
+
+        let importUuid: string;
+        let targetLabel: string;
+        let targetProps: { _name: string; [key: string]: unknown };
+
+        if (isHttpUrl) {
+          // External URL (CDN, etc.)
+          importUuid = UniqueIDHelper.GenerateExternalURLUUID(importUrl);
+          targetLabel = 'ExternalURL';
+          targetProps = { _name: importUrl, url: importUrl };
+        } else if (isLocal) {
+          // Local file (relative or absolute path)
+          importUuid = UniqueIDHelper.GenerateFileUUID(path.resolve(path.dirname(filePath), importUrl));
+          targetLabel = 'File';
+          targetProps = { _name: path.basename(importUrl), path: importUrl };
+        } else {
+          // npm package (e.g., "tailwindcss", "@tailwind/forms")
+          importUuid = UniqueIDHelper.GenerateExternalLibraryUUID(importUrl);
+          targetLabel = 'ExternalLibrary';
+          targetProps = { _name: importUrl, library: importUrl };
+        }
+
         relationships.push({
           type: 'IMPORTS',
           from: stylesheetId,
-          to: importUrl, // Will be resolved to file if it exists
-          properties: {}
+          to: importUuid,
+          properties: { originalUrl: importUrl },
+          targetLabel,
+          targetProps,
         });
       }
 
@@ -1668,7 +1824,12 @@ export class CodeSourceAdapter extends SourceAdapter {
         relationships.push({
           type: 'DEFINES_VARIABLE',
           from: stylesheetId,
-          to: varId
+          to: varId,
+          targetLabel: 'CSSVariable',
+          targetProps: {
+            _name: variable.name,
+            value: variable.value,
+          }
         });
       }
 
@@ -1697,10 +1858,17 @@ export class CodeSourceAdapter extends SourceAdapter {
 
         if (currentPath === relPath) {
           const absDirPath = path.join(projectRoot, dir);
+          const dirName = dir.includes('/') ? dir.substring(dir.lastIndexOf('/') + 1) : dir;
           relationships.push({
             type: 'IN_DIRECTORY',
             from: fileUuid,
-            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
+            to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath),
+            targetLabel: 'Directory',
+            targetProps: {
+              _name: dirName,
+              absolutePath: absDirPath,
+              path: dir,
+            }
           });
         }
 
@@ -1776,7 +1944,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: stylesheetId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       // Add directory handling
@@ -1851,7 +2025,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: vueId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       // Add directory handling
@@ -1925,7 +2105,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: svelteId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
@@ -2003,7 +2189,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: mdId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
@@ -2036,13 +2228,46 @@ export class CodeSourceAdapter extends SourceAdapter {
             from: mdId,
             to: blockId
           });
+
+          // DEFINED_IN for orphan cleanup
+          relationships.push({
+            type: 'DEFINED_IN',
+            from: blockId,
+            to: fileUuid,
+            targetLabel: 'File',
+            targetProps: {
+              _name: fileName,
+              absolutePath: filePath,
+              path: relPath,
+            }
+          });
         }
       }
 
       // Create MarkdownSection nodes for each section (searchable content)
       if (doc.sections && doc.sections.length > 0) {
+        // Build stable section names with duplicate handling
+        // Map from section (by startLine for lookup) to its stable name
+        const sectionStableNames = new Map<number, string>();
+        const nameCounters = new Map<string, number>();
+
         for (const section of doc.sections) {
-          const sectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, section.startLine);
+          // Build base name: title:level (or fallback for untitled sections)
+          const baseName = section.title
+            ? `${section.title}:${section.level}`
+            : `untitled:${section.level}`;
+
+          // Track duplicates and append index if needed
+          const count = nameCounters.get(baseName) || 0;
+          const stableName = count === 0 ? baseName : `${baseName}:${count}`;
+          nameCounters.set(baseName, count + 1);
+
+          sectionStableNames.set(section.startLine, stableName);
+        }
+
+        for (const section of doc.sections) {
+          const stableName = sectionStableNames.get(section.startLine)!;
+          const sectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, stableName);
           // Compute hash from content for incremental ingestion
           const sectionHash = createHash('sha256').update(section.content || '').digest('hex').slice(0, 16);
 
@@ -2069,14 +2294,35 @@ export class CodeSourceAdapter extends SourceAdapter {
           relationships.push({
             type: 'HAS_SECTION',
             from: mdId,
-            to: sectionId
+            to: sectionId,
+            targetLabel: 'MarkdownSection',
+            targetProps: {
+              _name: section.title || `Section ${section.startLine}`,
+              absolutePath: filePath,
+              file: relPath,
+              startLine: section.startLine,
+            }
+          });
+
+          // DEFINED_IN for orphan cleanup
+          relationships.push({
+            type: 'DEFINED_IN',
+            from: sectionId,
+            to: fileUuid,
+            targetLabel: 'File',
+            targetProps: {
+              _name: fileName,
+              absolutePath: filePath,
+              path: relPath,
+            }
           });
 
           // Link to parent section if exists
           if (section.parentTitle) {
             const parentSection = doc.sections.find(s => s.title === section.parentTitle);
             if (parentSection) {
-              const parentSectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, parentSection.startLine);
+              const parentStableName = sectionStableNames.get(parentSection.startLine)!;
+              const parentSectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, parentStableName);
               relationships.push({
                 type: 'CHILD_OF',
                 from: sectionId,
@@ -2149,7 +2395,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: genericId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
@@ -2232,7 +2484,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: dataFileId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
@@ -2271,11 +2529,24 @@ export class CodeSourceAdapter extends SourceAdapter {
             });
           }
 
+          // Extract domain for targetProps
+          let urlDomain = '';
+          try {
+            urlDomain = new URL(ref.value).hostname;
+          } catch {
+            urlDomain = ref.value.split('/')[2] || '';
+          }
           relationships.push({
             type: 'LINKS_TO',
             from: dataFileId,
             to: urlUuid,
-            properties: { path: ref.path, line: ref.line }
+            properties: { path: ref.path, line: ref.line },
+            targetLabel: 'ExternalURL',
+            targetProps: {
+              _name: urlDomain || ref.value,
+              url: ref.value,
+              domain: urlDomain,
+            }
           });
         } else if (ref.type === 'code' || ref.type === 'config' || ref.type === 'file') {
           // Reference to a file - resolve relative path
@@ -2306,11 +2577,18 @@ export class CodeSourceAdapter extends SourceAdapter {
           const refPath = this.resolveReferencePath(ref.value, relPath, projectRoot);
           if (refPath && directories.has(refPath)) {
             const absRefPath = path.join(projectRoot, refPath);
+            const dirName = refPath.includes('/') ? refPath.substring(refPath.lastIndexOf('/') + 1) : refPath;
             relationships.push({
               type: 'REFERENCES',
               from: dataFileId,
               to: UniqueIDHelper.GenerateDirectoryUUID(absRefPath),
-              properties: { path: ref.path, refType: 'directory' }
+              properties: { path: ref.path, refType: 'directory' },
+              targetLabel: 'Directory',
+              targetProps: {
+                _name: dirName,
+                absolutePath: absRefPath,
+                path: refPath,
+              }
             });
           }
         } else if (ref.type === 'package') {
@@ -2333,7 +2611,12 @@ export class CodeSourceAdapter extends SourceAdapter {
             type: 'USES_PACKAGE',
             from: dataFileId,
             to: pkgUuid,
-            properties: { path: ref.path, line: ref.line }
+            properties: { path: ref.path, line: ref.line },
+            targetLabel: 'ExternalLibrary',
+            targetProps: {
+              _name: ref.value,
+              name: ref.value,
+            }
           });
         }
       }
@@ -2435,7 +2718,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: mediaId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
@@ -2534,7 +2823,13 @@ export class CodeSourceAdapter extends SourceAdapter {
       relationships.push({
         type: 'DEFINED_IN',
         from: docId,
-        to: fileUuid
+        to: fileUuid,
+        targetLabel: 'File',
+        targetProps: {
+          _name: fileName,
+          absolutePath: filePath,
+          path: relPath,
+        }
       });
 
       this.ensureDirectoryNodes(relPath, directories, nodes, relationships, fileUuid, projectRoot);
@@ -2600,10 +2895,17 @@ export class CodeSourceAdapter extends SourceAdapter {
 
       if (currentPath === relPath) {
         const absDirPath = path.join(projectRoot, dir);
+        const dirName = dir.includes('/') ? dir.substring(dir.lastIndexOf('/') + 1) : dir;
         relationships.push({
           type: 'IN_DIRECTORY',
           from: fileUuid,
-          to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath)
+          to: UniqueIDHelper.GenerateDirectoryUUID(absDirPath),
+          targetLabel: 'Directory',
+          targetProps: {
+            _name: dirName,
+            absolutePath: absDirPath,
+            path: dir,
+          }
         });
       }
 
@@ -2643,7 +2945,13 @@ export class CodeSourceAdapter extends SourceAdapter {
     relationships.push({
       type: isRoot ? 'HAS_SECTION' : 'HAS_CHILD',
       from: parentId,
-      to: sectionId
+      to: sectionId,
+      targetLabel: 'DataSection',
+      targetProps: {
+        _name: section.key || section.path,
+        path: section.path,
+        depth: section.depth,
+      }
     });
 
     // Recursively create child sections (limit depth to avoid explosion)
@@ -2711,9 +3019,10 @@ export class CodeSourceAdapter extends SourceAdapter {
     // e.g., "MyClass.myMethod" vs "OtherClass.myMethod"
     const parentPrefix = scope.parent ? `${scope.parent}.` : '';
 
-    // Use signature if available, otherwise build from name:type:content
-    const baseInput = scope.signature ||
-      `${scope.name}:${scope.type}:${scope.contentDedented || scope.content}`;
+    // Use signature if available, otherwise just name:type
+    // NEVER include content - it changes frequently and breaks UUID stability
+    // The signature from codeparsers should always be non-empty
+    const baseInput = scope.signature || `${scope.name}:${scope.type}`;
 
     let hashInput = `${parentPrefix}${baseInput}`;
 
@@ -3242,5 +3551,77 @@ export class CodeSourceAdapter extends SourceAdapter {
   ): Promise<void> {
     // TODO: Implement XML export using fast-xml-parser
     console.log('XML export requested but not yet implemented');
+  }
+
+  /**
+   * Enrich class/interface nodes with their members summary.
+   * This helps search find classes when searching for method names.
+   *
+   * Adds a "Members:" section to _content with signatures and line numbers.
+   */
+  private enrichClassNodesWithMembers(
+    nodes: ParsedNode[],
+    scopes: ScopeInfo[],
+    filePath: string
+  ): void {
+    // Build a map of UUID -> scope for quick lookup
+    const scopeByUuid = new Map<string, ScopeInfo>();
+    for (const scope of scopes) {
+      const uuid = this.generateUUID(scope, filePath);
+      scopeByUuid.set(uuid, scope);
+    }
+
+    // Find class/interface nodes
+    const containerTypes = ['class', 'interface', 'enum', 'namespace', 'module'];
+
+    for (const node of nodes) {
+      if (node.labels[0] !== 'Scope') continue;
+
+      const scopeType = node.properties.type as string;
+      if (!containerTypes.includes(scopeType)) continue;
+
+      const parentUuid = node.properties.uuid as string;
+
+      // Find all children (nodes with this as parentUUID)
+      const children = nodes.filter(n =>
+        n.labels[0] === 'Scope' &&
+        n.properties.parentUUID === parentUuid
+      );
+
+      if (children.length === 0) continue;
+
+      // Build members summary
+      const memberLines: string[] = [];
+      for (const child of children) {
+        const childScope = scopeByUuid.get(child.properties.uuid as string);
+        if (!childScope) continue;
+
+        // Get signature (from _name which is the normalized signature)
+        const signature = (child.properties._name as string) || childScope.name;
+        const startLine = childScope.startLine;
+        const endLine = childScope.endLine;
+
+        // Extract body preview (content without signature)
+        let bodyPreview = '';
+        const content = child.properties._content as string || childScope.content || '';
+        const sigLength = signature.length;
+        if (content.length > sigLength) {
+          bodyPreview = content
+            .substring(sigLength)
+            .trim()
+            .substring(0, 150)
+            .replace(/\s+/g, ' '); // collapse whitespace
+          if (bodyPreview.length >= 150) bodyPreview += '...';
+        }
+
+        memberLines.push(`  - ${signature} (L${startLine}-${endLine})${bodyPreview ? '\n    ' + bodyPreview : ''}`);
+      }
+
+      // Append to _content
+      if (memberLines.length > 0) {
+        const existingContent = (node.properties._content as string) || '';
+        node.properties._content = `${existingContent}\n\nMembers:\n${memberLines.join('\n')}`;
+      }
+    }
   }
 }

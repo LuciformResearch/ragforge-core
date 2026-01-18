@@ -25,6 +25,10 @@ import { NODE_SCHEMAS, CONTENT_NODE_LABELS, type NodeTypeSchema } from '../utils
 import { isDocumentFile, parseDocumentFile, type DocumentFileInfo } from '../runtime/adapters/document-file-parser.js';
 import { extractReferences, resolveAllReferences, type ResolvedReference } from '../brain/reference-extractor.js';
 import * as path from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 // Image file extensions
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
@@ -283,7 +287,9 @@ export function generateIngestDirectoryTool(): GeneratedToolDefinition {
     name: 'ingest_directory',
     description: `Ingest any directory into the agent's persistent brain.
 
-This tool allows quick ingestion of code, documents, or any files into the knowledge base.
+**Fire-and-forget**: Returns immediately with file counts and estimated time.
+Processing (parsing, entity extraction, embeddings) happens in the background.
+
 Files are automatically detected and parsed based on their extension:
 - Code: TypeScript, JavaScript, Python, Vue, Svelte, HTML, CSS
 - Documents: PDF, DOCX, XLSX, CSV
@@ -291,12 +297,14 @@ Files are automatically detected and parsed based on their extension:
 - Media: Images (with OCR/description), 3D models
 - Markdown files
 
-After ingestion, you can search across all ingested content using brain_search.
+Returns:
+- File counts by extension
+- Estimated nodes and processing time
+- Log path for monitoring progress
 
-Example usage:
-- ingest_directory({ path: "/path/to/project" })
-- ingest_directory({ path: "./docs", project_name: "my-docs" })
-- ingest_directory({ path: "./images", analyze_images: true })`,
+After ingestion completes, search content using brain_search.
+
+Example: ingest_directory({ path: "/path/to/project" })`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -318,18 +326,6 @@ Example usage:
           items: { type: 'string' },
           description: 'Glob patterns to exclude (default: node_modules, .git, dist, etc.)',
         },
-        analyze_images: {
-          type: 'boolean',
-          description: 'Analyze images with Gemini Vision to generate descriptions (default: false). Enables semantic search on images.',
-        },
-        analyze_3d: {
-          type: 'boolean',
-          description: 'Analyze 3D models (.glb, .gltf) by rendering and describing them (default: false). Slower but enables semantic search on 3D assets.',
-        },
-        ocr_documents: {
-          type: 'boolean',
-          description: 'Run OCR on scanned PDF documents (default: false). Useful for PDFs that are scanned images.',
-        },
       },
       required: ['path'],
     },
@@ -337,7 +333,7 @@ Example usage:
 }
 
 /**
- * Generate handler for ingest_directory
+ * Generate handler for ingest_directory (fire-and-forget)
  */
 export function generateIngestDirectoryHandler(ctx: BrainToolsContext) {
   return async (params: {
@@ -345,20 +341,14 @@ export function generateIngestDirectoryHandler(ctx: BrainToolsContext) {
     project_name?: string;
     include?: string[];
     exclude?: string[];
-    analyze_images?: boolean;
-    analyze_3d?: boolean;
-    ocr_documents?: boolean;
-  }): Promise<QuickIngestResult> => {
-    const options: QuickIngestOptions = {
+  }) => {
+    const options = {
       projectName: params.project_name,
       include: params.include,
       exclude: params.exclude,
-      analyzeImages: params.analyze_images,
-      analyze3d: params.analyze_3d,
-      ocrDocuments: params.ocr_documents,
     };
 
-    return ctx.brain.quickIngest(params.path, options);
+    return ctx.brain.quickIngestAsync(params.path, options);
   };
 }
 
@@ -409,7 +399,12 @@ Example usage:
         types: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Limit to specific node types (lowercase): "function", "method", "class", "interface", "variable", "file" (default: all)',
+          description: 'Limit to specific node types (lowercase): "function", "method", "class", "interface", "variable", "file". Default: code types only (Scope). Use include_all_types=true to search everything.',
+        },
+        include_all_types: {
+          type: 'boolean',
+          optional: true,
+          description: 'Set to true to search ALL node types including markdown, entities, etc. Default: false (only searches code/Scope nodes).',
         },
         semantic: {
           type: 'boolean',
@@ -482,7 +477,7 @@ When enabled, each result will include a 'relationships' object showing what the
 - And any other relationships discovered automatically
 
 This helps understand how search results connect to other parts of the codebase.
-Default: 0 (disabled). Use 1 for direct relationships, 2-3 for deeper exploration.`,
+Default: 1 (direct relationships). Use 0 to disable, 2-3 for deeper exploration.`,
         },
         summarize: {
           type: 'boolean',
@@ -516,13 +511,13 @@ Only applies when semantic=false (BM25 mode).
           enum: ['json', 'markdown', 'compact'],
           optional: true,
           description: `Output format for results:
-- "json": Full JSON output with all fields (default)
-- "markdown": Human-readable markdown with ASCII dependency tree
+- "markdown": Human-readable markdown with code snippets (default)
+- "json": Full JSON output with all fields
 - "compact": Minimal JSON with only essential fields
 
 Markdown format is ~90% smaller than full JSON and includes:
 - Results with title, location, score
-- ASCII tree visualization of dependency graph
+- Code snippets for top results
 - Summary table of node types`,
         },
         include_source: {
@@ -545,6 +540,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     query: string;
     projects?: string[];
     types?: string[];
+    include_all_types?: boolean;
     semantic?: boolean;
     embedding_type?: 'name' | 'content' | 'description' | 'all';
     glob?: string;
@@ -610,11 +606,11 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
     try {
       // Determine target projects (filter by params.projects if specified)
       log.debug('Step 1: Listing projects');
-      const allProjects = ctx.brain.listProjects();
+      const allProjects = await ctx.brain.listProjects();
       log.debug(`Found ${allProjects.length} total projects`);
 
       const targetProjects = params.projects
-        ? allProjects.filter(p => params.projects!.includes(p.id))
+        ? allProjects.filter((p: any) => params.projects!.includes(p.id))
         : allProjects;
 
       // Include touched-files (orphan files) in search when user doesn't specify projects
@@ -740,9 +736,19 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         ? Math.max(originalLimit, 100)
         : originalLimit;
       
+      // Default: only search Scope (code) nodes
+      // Use include_all_types=true to search everything (markdown, entities, etc.)
+      const DEFAULT_LABELS = ['Scope'];
+      const effectiveLabels = params.include_all_types ? undefined : DEFAULT_LABELS;
+
+      // Apply defaults for format and explore_depth
+      const effectiveFormat = params.format ?? 'markdown';
+      const effectiveExploreDepth = params.explore_depth ?? 1;
+
       const options: BrainSearchOptions = {
         projects: params.projects,
         nodeTypes: params.types,
+        labels: effectiveLabels,
         semantic: params.semantic,
         // Automatically enable hybrid search (semantic + BM25 with RRF fusion) when semantic is true
         hybrid: params.semantic === true,
@@ -1150,10 +1156,10 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         }>;
       } | undefined = undefined;
 
-      if (params.explore_depth && params.explore_depth > 0 && result.results.length > 0) {
-        log.info('Exploring relationships for results', { explore_depth: params.explore_depth, resultCount: result.results.length });
+      if (effectiveExploreDepth > 0 && result.results.length > 0) {
+        log.info('Exploring relationships for results', { explore_depth: effectiveExploreDepth, resultCount: result.results.length });
         const exploreStart = Date.now();
-        const clampedDepth = Math.min(Math.max(params.explore_depth, 1), 3);
+        const clampedDepth = Math.min(Math.max(effectiveExploreDepth, 1), 3);
 
         const neo4j = ctx.brain.getNeo4jClient();
         if (neo4j) {
@@ -1398,9 +1404,9 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
         graph,
       };
 
-      // Apply formatting if requested
+      // Apply formatting (default: markdown)
       let formatted_output: string | object | undefined;
-      if (params.format && params.format !== 'json') {
+      if (effectiveFormat !== 'json') {
         const formatterInput: BrainSearchOutput = {
           results: result.results,
           totalCount: result.totalCount,
@@ -1409,7 +1415,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
           summary,
         };
 
-        if (params.format === 'markdown') {
+        if (effectiveFormat === 'markdown') {
           formatted_output = formatAsMarkdown(formatterInput, params.query, {
             includeSource: params.include_source,
             includeGraph: !!graph,
@@ -1425,12 +1431,12 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
               min_score: params.min_score,
               boost_keywords: params.boost_keywords,
               boost_weight: params.boost_weight,
-              explore_depth: params.explore_depth,
+              explore_depth: effectiveExploreDepth,
               use_reranking: params.use_reranking,
               fuzzy_distance: params.fuzzy_distance,
             },
           });
-        } else if (params.format === 'compact') {
+        } else if (effectiveFormat === 'compact') {
           formatted_output = formatAsCompact(formatterInput, params.query);
         }
       }
@@ -1455,7 +1461,7 @@ export function generateBrainSearchHandler(ctx: BrainToolsContext) {
       }
 
       // When format is markdown or compact, return only formatted output (not raw results) to save context
-      if (params.format === 'markdown' || params.format === 'compact') {
+      if (effectiveFormat === 'markdown' || effectiveFormat === 'compact') {
         return {
           results: [], // Empty to save context - use formatted_output instead
           totalCount: result.totalCount,
@@ -2452,10 +2458,10 @@ export function generateListWatchersHandler(ctx: BrainToolsContext) {
     count: number;
   }> => {
     const watchedIds = ctx.brain.getWatchedProjects();
-    const projects = ctx.brain.listProjects();
+    const projects = await ctx.brain.listProjects();
 
     const watchers = watchedIds.map((projectId: string) => {
-      const project = projects.find(p => p.id === projectId);
+      const project = projects.find((p: any) => p.id === projectId);
       return {
         projectId,
         projectPath: project?.path || 'unknown',
@@ -2526,8 +2532,8 @@ export function generateStartWatcherHandler(ctx: BrainToolsContext) {
     try {
       // Force initial sync to catch any changes since last session
       await ctx.brain.startWatching(absolutePath, { skipInitialSync: false, verbose });
-      const projects = ctx.brain.listProjects();
-      const project = projects.find(p => p.path === absolutePath);
+      const projects = await ctx.brain.listProjects();
+      const project = projects.find((p: any) => p.path === absolutePath);
 
       return {
         success: true,
@@ -2670,6 +2676,7 @@ export function generateMarkFileDirtyHandler(ctx: BrainToolsContext) {
     file_path: string;
     relative_path?: string;
     project_id?: string;
+    file_reset?: boolean;
     queued?: boolean;
     message?: string;
   }> => {
@@ -2711,23 +2718,54 @@ export function generateMarkFileDirtyHandler(ctx: BrainToolsContext) {
     }
 
     try {
-      // Mark all nodes associated with this file as dirty
-      // Use both file (relative) and absolutePath for matching to handle path format variations
+      // Get FileStateMachine to properly reset File state
+      const fileStateMachine = ctx.brain.fileStateMachine;
+
+      // 1. Reset File node to 'discovered' state via FileStateMachine
+      // Also clear parsedContentHash to force re-parsing even if content unchanged
+      let fileReset = false;
+      if (fileStateMachine) {
+        const UniqueIDHelper = (await import('../runtime/utils/UniqueIDHelper.js')).UniqueIDHelper;
+        const fileUuid = UniqueIDHelper.GenerateFileUUID(absolutePath);
+        fileReset = await fileStateMachine.markFileChanged(fileUuid);
+
+        // Clear parsedContentHash to force re-parsing
+        await neo4jClient.run(
+          `MATCH (f:File {uuid: $uuid})
+           SET f.parsedContentHash = null
+           RETURN f.uuid`,
+          { uuid: fileUuid }
+        );
+      }
+
+      // 2. Mark all content nodes (Scope, MarkdownSection, etc.) as dirty for schema updates
+      // Clear embedding hashes to force re-embedding
+      // These will be re-processed when the file is re-parsed
       const result = await neo4jClient.run(
         `MATCH (n)
-         WHERE (n.file = $relativePath OR n.absolutePath = $absolutePath) AND n.projectId = $projectId
-         SET n.schemaDirty = true, n._state = 'linked'
+         WHERE (n.file = $relativePath OR n.absolutePath = $absolutePath)
+           AND n.projectId = $projectId
+           AND NOT n:File
+         SET n.schemaDirty = true,
+             n._state = 'linked',
+             n.embedding_name_hash = null,
+             n.embedding_content_hash = null,
+             n.embedding_description_hash = null
          RETURN count(n) AS count`,
         { relativePath, absolutePath, projectId: project.id }
       );
 
       const nodesMarked = result.records.length > 0 ? (result.records[0]?.get('count')?.toNumber() || 0) : 0;
 
-      let queued = false;
-      if (queue_for_ingestion && nodesMarked > 0) {
-        // Queue file for immediate re-ingestion
-        ctx.brain.queueFileChange(absolutePath, 'updated');
-        queued = true;
+      // 3. Trigger ProcessingLoop if immediate processing requested
+      // Use the new unified flow instead of the old queueFileChange
+      let triggered = false;
+      if (queue_for_ingestion) {
+        const loop = ctx.brain.getProcessingLoop(project.id);
+        if (loop) {
+          loop.triggerProcessing();
+          triggered = true;
+        }
       }
 
       return {
@@ -2736,10 +2774,11 @@ export function generateMarkFileDirtyHandler(ctx: BrainToolsContext) {
         file_path: absolutePath,
         relative_path: relativePath,
         project_id: project.id,
-        queued,
-        message: queued
-          ? `Marked ${nodesMarked} node(s) as dirty and queued for re-ingestion`
-          : `Marked ${nodesMarked} node(s) as dirty (will be re-ingested on next cycle)`,
+        file_reset: fileReset,
+        queued: triggered,
+        message: fileReset
+          ? `Reset file to 'discovered' state, marked ${nodesMarked} content node(s) as dirty${triggered ? ', triggered re-ingestion' : ''}`
+          : `Marked ${nodesMarked} content node(s) as dirty${triggered ? ', triggered re-ingestion' : ' (file state unchanged)'}`,
       };
     } catch (err: any) {
       return {
@@ -3916,7 +3955,7 @@ async function findProjectRoot(
  * Helper: Find which project a file belongs to
  */
 async function findProjectForFile(brain: BrainManager, absolutePath: string): Promise<{ id: string; path: string } | null> {
-  const projects = brain.listProjects();
+  const projects = await brain.listProjects();
   const pathModule = await import('path');
 
   for (const project of projects) {
@@ -4660,9 +4699,9 @@ export function generateBrainReadFileHandler(ctx: BrainToolsContext) {
       if (codeExtensions.includes(ext)) {
         try {
           // Check if file is in an ingested project
-          const registeredProjects = ctx.brain.listProjects();
+          const registeredProjects = await ctx.brain.listProjects();
           const projectForFile = registeredProjects.find(
-            p => absolutePath.startsWith(p.path + pathModule.sep)
+            (p: any) => absolutePath.startsWith(p.path + pathModule.sep)
           );
 
           if (projectForFile) {
@@ -5791,24 +5830,29 @@ export function generateSetApiKeyHandler(ctx: BrainToolsContext) {
 
 /**
  * Generate switch_embedding_provider tool definition
- * Allows switching between Gemini (cloud) and Ollama (local) embedding providers
+ * Allows switching between Gemini (cloud), Ollama (local), and TEI (local GPU) embedding providers
  */
 export function generateSwitchEmbeddingProviderTool(): GeneratedToolDefinition {
   return {
     name: 'switch_embedding_provider',
-    description: `Switch the embedding provider between Gemini (cloud) and Ollama (local).
+    description: `Switch the embedding provider between Gemini (cloud), Ollama (local), and TEI (local GPU).
 
 Use this when:
-- You want to use free, local embeddings with Ollama
+- You want to use free, local embeddings with Ollama or TEI
 - You've hit Gemini API quota limits
 - You need private/offline embedding generation
+- You want fast GPU-accelerated embeddings with TEI
 
 Providers:
 - gemini: Cloud-based, requires API key, best quality (3072 dimensions)
 - ollama: Local, free, private (768-1024 dimensions depending on model)
+- tei: Local, GPU-accelerated, fast (768 dimensions with bge-base-en-v1.5)
 
 For Ollama, make sure it's running locally (default: http://localhost:11434)
 and you have an embedding model pulled (e.g., \`ollama pull nomic-embed-text\`).
+
+For TEI, start the Docker container with:
+  docker compose up -d tei
 
 Recommended Ollama models:
 - nomic-embed-text (768 dims, good quality, default)
@@ -5818,13 +5862,15 @@ Recommended Ollama models:
 Example:
   switch_embedding_provider({ provider: "ollama" })
   switch_embedding_provider({ provider: "ollama", model: "mxbai-embed-large" })
-  switch_embedding_provider({ provider: "gemini" })`,
+  switch_embedding_provider({ provider: "gemini" })
+  switch_embedding_provider({ provider: "tei" })
+  switch_embedding_provider({ provider: "tei", base_url: "http://localhost:8081" })`,
     inputSchema: {
       type: 'object',
       properties: {
         provider: {
           type: 'string',
-          enum: ['gemini', 'ollama'],
+          enum: ['gemini', 'ollama', 'tei'],
           description: 'Embedding provider to switch to',
         },
         model: {
@@ -5833,7 +5879,7 @@ Example:
         },
         base_url: {
           type: 'string',
-          description: 'Base URL for Ollama API (default: http://localhost:11434)',
+          description: 'Base URL for Ollama API (default: http://localhost:11434) or TEI API (default: http://localhost:8081)',
         },
       },
       required: ['provider'],
@@ -5846,7 +5892,7 @@ Example:
  */
 export function generateSwitchEmbeddingProviderHandler(ctx: BrainToolsContext) {
   return async (params: {
-    provider: 'gemini' | 'ollama';
+    provider: 'gemini' | 'ollama' | 'tei';
     model?: string;
     base_url?: string;
   }): Promise<{ success: boolean; message: string; provider_info?: { name: string; model: string } }> => {
@@ -5928,9 +5974,34 @@ export function generateGetBrainStatusHandler(ctx: BrainToolsContext) {
         provider: providerInfo?.name,
         model: providerInfo?.model,
       },
-      projects: ctx.brain.listProjects().length,
+      projects: (await ctx.brain.listProjects()).length,
     };
   };
+}
+
+/**
+ * Restart GPU Docker containers to free VRAM after cleanup.
+ * Restarts ragforge-gliner and ragforge-tei if they exist.
+ */
+async function restartGpuContainers(): Promise<{ restarted: string[]; errors: string[] }> {
+  const containers = ['ragforge-gliner', 'ragforge-tei'];
+  const restarted: string[] = [];
+  const errors: string[] = [];
+
+  for (const container of containers) {
+    try {
+      // Check if container exists and is running
+      const { stdout } = await execAsync(`docker ps -q -f name=${container}`);
+      if (stdout.trim()) {
+        await execAsync(`docker restart ${container}`);
+        restarted.push(container);
+      }
+    } catch (err: any) {
+      errors.push(`${container}: ${err.message}`);
+    }
+  }
+
+  return { restarted, errors };
 }
 
 /**
@@ -5939,28 +6010,24 @@ export function generateGetBrainStatusHandler(ctx: BrainToolsContext) {
 export function generateCleanupBrainTool(): GeneratedToolDefinition {
   return {
     name: 'cleanup_brain',
-    description: `Clean up the brain's data and optionally reset everything.
+    description: `Clean up the brain's data.
 
 ⚠️ THIS TOOL IS DESTRUCTIVE - USE WITH CAUTION.
 
 Options:
-- data_only: Clear all Neo4j data (keeps config and credentials)
-- project: Delete a specific project only (requires project_id)
-- full: Remove everything including Docker container, volumes, and ~/.ragforge
-
-After cleanup with 'full', you'll need to restart the MCP server to reinitialize.
+- project: Delete a specific project only (requires project_id). Stops watcher and ProcessingLoop, then batch-deletes all nodes.
+- full: Delete ALL projects. Loops through every project and cleans them up one by one.
 
 Example:
-  cleanup_brain({ mode: "data_only", confirm: true })  // Clear all data
   cleanup_brain({ mode: "project", project_id: "my-project", confirm: true })  // Delete one project
-  cleanup_brain({ mode: "full", confirm: true })  // Complete reset`,
+  cleanup_brain({ mode: "full", confirm: true })  // Delete all projects`,
     inputSchema: {
       type: 'object',
       properties: {
         mode: {
           type: 'string',
-          enum: ['data_only', 'project', 'full'],
-          description: 'Cleanup mode: data_only (clear all), project (delete specific project), full (remove everything)',
+          enum: ['project', 'full'],
+          description: 'Cleanup mode: project (delete specific project), full (remove everything)',
         },
         project_id: {
           type: 'string',
@@ -5981,7 +6048,7 @@ Example:
  */
 export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
   return async (params: {
-    mode: 'data_only' | 'project' | 'full';
+    mode: 'project' | 'full';
     project_id?: string;
     confirm: boolean;
   }): Promise<{ success: boolean; message: string; details?: string[] }> => {
@@ -5995,13 +6062,6 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
     }
 
     const details: string[] = [];
-    const { exec } = await import('child_process');
-    const { promisify } = await import('util');
-    const execAsync = promisify(exec);
-    const fs = await import('fs/promises');
-    const path = await import('path');
-
-    const brainPath = ctx.brain.getBrainPath();
 
     // Mode: Delete a specific project
     if (mode === 'project') {
@@ -6012,47 +6072,19 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
         };
       }
 
-      const neo4jClient = ctx.brain.getNeo4jClient();
-      if (!neo4jClient) {
-        return {
-          success: false,
-          message: 'Neo4j client not available',
-        };
-      }
-
       try {
-        // Delete all nodes with this projectId
-        const result = await neo4jClient.run(
-          'MATCH (n {projectId: $projectId}) DETACH DELETE n RETURN count(n) as deleted',
-          { projectId: project_id }
-        );
-        const deletedCount = result.records[0]?.get('deleted')?.toNumber() || 0;
-        details.push(`Deleted ${deletedCount} nodes with projectId: ${project_id}`);
+        // Use centralized cleanup method
+        const result = await ctx.brain.cleanupProject(project_id);
 
-        // Also delete the Project node itself
-        await neo4jClient.run(
-          'MATCH (p:Project {projectId: $projectId}) DETACH DELETE p',
-          { projectId: project_id }
-        );
-
-        // Stop watcher if active (so it can be restarted fresh on next ingest)
-        const projects = await ctx.brain.listProjects();
-        const project = projects.find(p => p.id === project_id);
-        if (project?.path) {
-          try {
-            await ctx.brain.stopWatching(project.path);
-            details.push(`Stopped watcher for: ${project.path}`);
-          } catch (err: any) {
-            // Watcher might not be active, ignore
-          }
+        if (result.watcherStopped) {
+          details.push(`Stopped watcher for: ${project_id}`);
         }
-
-        // Remove from registry
-        try {
-          await ctx.brain.unregisterProject(project_id);
-          details.push(`Removed project from registry: ${project_id}`);
-        } catch (err: any) {
-          details.push(`Warning: Could not remove from registry: ${err.message}`);
+        if (result.processingLoopStopped) {
+          details.push(`Stopped ProcessingLoop for: ${project_id}`);
+        }
+        details.push(`Deleted ${result.nodesDeleted} nodes with projectId: ${project_id}`);
+        if (result.projectNodeDeleted) {
+          details.push(`Project node deleted`);
         }
 
         return {
@@ -6068,119 +6100,121 @@ export function generateCleanupBrainHandler(ctx: BrainToolsContext) {
       }
     }
 
-    if (mode === 'data_only') {
-      // 1. Stop all active watchers first (they have cached state that needs to be cleared)
-      const watchedProjects = ctx.brain.getWatchedProjects();
-      for (const projectId of watchedProjects) {
-        try {
-          // Get the watcher to access its root path
-          const projects = await ctx.brain.listProjects();
-          const project = projects.find(p => p.id === projectId);
-          if (project?.path) {
-            await ctx.brain.stopWatching(project.path);
-            details.push(`Stopped watcher: ${projectId}`);
-          }
-        } catch (err: any) {
-          details.push(`Warning: Could not stop watcher ${projectId}: ${err.message}`);
-        }
-      }
+    // Full cleanup - delete ALL projects
+    if (mode === 'full') {
+      try {
+        const projects = await ctx.brain.listProjects();
 
-      // 2. Clear Neo4j data
-      const neo4jClient = ctx.brain.getNeo4jClient();
-      if (neo4jClient) {
-        try {
-          await neo4jClient.run('MATCH (n) DETACH DELETE n');
-          details.push('Cleared all Neo4j nodes and relationships');
-        } catch (err: any) {
+        if (projects.length === 0) {
           return {
-            success: false,
-            message: `Failed to clear Neo4j data: ${err.message}`,
+            success: true,
+            message: 'No projects to delete.',
+            details: ['Brain is already empty'],
           };
         }
-      }
 
-      // 3. Clear projects registry (both file and in-memory)
-      try {
-        await ctx.brain.clearProjectsRegistry();
-        details.push('Cleared projects registry');
-      } catch (err: any) {
-        details.push(`Warning: Could not clear projects registry: ${err.message}`);
-      }
-
-      return {
-        success: true,
-        message: 'Brain data cleared successfully. Config and credentials preserved. All watchers stopped - re-ingest to restart.',
-        details,
-      };
-    }
-
-    // Full cleanup
-    if (mode === 'full') {
-      // Stop and remove Docker container
-      try {
-        await execAsync('docker compose down -v', { cwd: brainPath });
-        details.push('Stopped Docker container and removed volumes');
-      } catch {
-        // Container might not be running
-        try {
-          await execAsync('docker rm -f ragforge-brain-neo4j');
-          details.push('Removed Docker container');
-        } catch {
-          // Container might not exist
+        let totalNodesDeleted = 0;
+        for (const project of projects) {
+          const result = await ctx.brain.cleanupProject(project.id);
+          totalNodesDeleted += result.nodesDeleted;
+          details.push(`Deleted project "${project.id}": ${result.nodesDeleted} nodes`);
         }
-      }
 
-      // Remove Docker volumes
-      try {
-        await execAsync('docker volume rm ragforge_brain_data ragforge_brain_logs 2>/dev/null || true');
-        details.push('Removed Docker volumes');
-      } catch {
-        // Volumes might not exist
-      }
+        // Restart GPU containers to free VRAM
+        const gpuRestart = await restartGpuContainers();
+        if (gpuRestart.restarted.length > 0) {
+          details.push(`Restarted GPU containers: ${gpuRestart.restarted.join(', ')}`);
+        }
+        if (gpuRestart.errors.length > 0) {
+          details.push(`GPU container errors: ${gpuRestart.errors.join(', ')}`);
+        }
 
-      // Remove ~/.ragforge directory
-      try {
-        await fs.rm(brainPath, { recursive: true, force: true });
-        details.push(`Removed ${brainPath}`);
+        return {
+          success: true,
+          message: `Deleted ${projects.length} project(s), ${totalNodesDeleted} total nodes.`,
+          details,
+        };
       } catch (err: any) {
         return {
           success: false,
-          message: `Failed to remove brain directory: ${err.message}`,
+          message: `Failed to delete all projects: ${err.message}`,
           details,
         };
       }
-
-      // Reset the singleton and reinitialize fresh
-      BrainManager.resetInstance();
-      details.push('Reset BrainManager singleton');
-
-      // Get a fresh instance and reinitialize
-      try {
-        const newBrain = await BrainManager.getInstance();
-        await newBrain.initialize();
-        // Update the context so all handlers use the new instance
-        ctx.brain = newBrain;
-        details.push('Reinitialized fresh BrainManager');
-      } catch (err: any) {
-        details.push(`Failed to reinitialize: ${err.message}`);
-        return {
-          success: true,
-          message: 'Full cleanup complete but failed to reinitialize. Restart MCP server to fix.',
-          details,
-        };
-      }
-
-      return {
-        success: true,
-        message: 'Full cleanup complete. Brain has been reinitialized fresh.',
-        details,
-      };
     }
 
     return {
       success: false,
       message: `Unknown mode: ${mode}`,
     };
+  };
+}
+
+// ============================================
+// Restart Daemon Tool
+// ============================================
+
+/**
+ * Generate restart_daemon tool definition
+ */
+export function generateRestartDaemonTool(): GeneratedToolDefinition {
+  return {
+    name: 'restart_daemon',
+    description: `Restart the RagForge daemon process.
+
+Use this when:
+- The daemon is not responding correctly
+- You want to apply configuration changes
+- You need to reset watchers
+
+Parameters:
+- with_watchers: Whether to auto-start watchers after restart (default: true)
+
+Example:
+  restart_daemon()  // Restart with watchers (default)
+  restart_daemon({ with_watchers: false })  // Restart without watchers`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        with_watchers: {
+          type: 'boolean',
+          description: 'Whether to auto-start watchers for cwd-related projects after restart (default: true)',
+        },
+      },
+      required: [],
+    },
+  };
+}
+
+/**
+ * Generate handler for restart_daemon
+ */
+export function generateRestartDaemonHandler(_ctx: BrainToolsContext) {
+  return async (params: {
+    with_watchers?: boolean;
+  }): Promise<{ success: boolean; message: string; was_running?: boolean; watchers_started?: boolean }> => {
+    const { with_watchers = true } = params;
+
+    try {
+      const { restartDaemon } = await import('../daemon/daemon-client.js');
+
+      const result = await restartDaemon({
+        withWatchers: with_watchers,
+        verbose: false,
+      });
+
+      return {
+        success: result.success,
+        message: result.message,
+        was_running: result.wasRunning,
+        watchers_started: result.watchersStarted,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Failed to restart daemon: ${err.message}`,
+      };
+    }
   };
 }
 
@@ -6556,7 +6590,7 @@ export function generateExtractDependencyHierarchyHandler(ctx: BrainToolsContext
     // Ensure projects are synced before extraction (like brain_search does)
     // This starts watchers if not active and waits for ingestion to complete
     // Note: ensureProjectSynced may initialize the Neo4j connection, so call it first
-    const projects = ctx.brain.listProjects();
+    const projects = await ctx.brain.listProjects();
     for (const project of projects) {
       try {
         await ensureProjectSynced(ctx.brain, project.path);
@@ -7425,6 +7459,7 @@ export function generateSetupTools(): GeneratedToolDefinition[] {
     generateSwitchEmbeddingProviderTool(),
     generateGetBrainStatusTool(),
     generateCleanupBrainTool(),
+    generateRestartDaemonTool(),
     generateRunCypherTool(),
   ];
 }
@@ -7438,6 +7473,7 @@ export function generateSetupToolHandlers(ctx: BrainToolsContext): Record<string
     switch_embedding_provider: generateSwitchEmbeddingProviderHandler(ctx),
     get_brain_status: generateGetBrainStatusHandler(ctx),
     cleanup_brain: generateCleanupBrainHandler(ctx),
+    restart_daemon: generateRestartDaemonHandler(ctx),
     run_cypher: generateRunCypherHandler(ctx),
   };
 }

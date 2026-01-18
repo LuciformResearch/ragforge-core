@@ -77,9 +77,6 @@ import {
 
 const execAsync = promisify(exec);
 
-// Brain container name (fixed, not per-project)
-const BRAIN_CONTAINER_NAME = 'ragforge-brain-neo4j';
-
 // ============================================
 // Types
 // ============================================
@@ -176,6 +173,8 @@ export interface BrainConfig {
     boltPort?: number;
     /** HTTP port (persisted, used for Docker) */
     httpPort?: number;
+    /** Use external Neo4j instead of managing Docker container (default: false) */
+    external?: boolean;
   };
 
   /** API Keys (loaded from .env) */
@@ -189,7 +188,7 @@ export interface BrainConfig {
   /** Embedding configuration */
   embeddings: {
     /** Default provider */
-    provider: 'gemini' | 'openai' | 'ollama';
+    provider: 'gemini' | 'openai' | 'ollama' | 'tei';
     /** Default model */
     model: string;
     /** Enable embedding cache */
@@ -202,6 +201,17 @@ export interface BrainConfig {
       model?: string;
       /** Batch size for parallel requests (default: 10) */
       batchSize?: number;
+      /** Request timeout in ms (default: 30000) */
+      timeout?: number;
+    };
+    /** TEI-specific configuration */
+    tei?: {
+      /** TEI API base URL (default: http://localhost:8081) */
+      baseUrl?: string;
+      /** Batch size for API calls (default: 32) */
+      batchSize?: number;
+      /** Max concurrent API calls (default: 5) */
+      concurrency?: number;
       /** Request timeout in ms (default: 30000) */
       timeout?: number;
     };
@@ -304,8 +314,10 @@ export interface BrainSearchOptions {
   projects?: string[];
   /** Limit to project types */
   projectTypes?: (ProjectType | 'web-crawl')[];
-  /** Node types to search */
+  /** Node types to search (filters by n.type property) */
   nodeTypes?: string[];
+  /** Neo4j labels to search (e.g., ['Scope']). Default: all labels. */
+  labels?: string[];
   /** Use semantic search */
   semantic?: boolean;
   /**
@@ -420,9 +432,12 @@ const DEFAULT_BRAIN_CONFIG: BrainConfig = {
     replicate: undefined,
   },
   embeddings: {
-    provider: 'gemini',
-    model: 'gemini-embedding-001',
+    provider: 'tei',
+    model: 'BAAI/bge-base-en-v1.5',
     cacheEnabled: true,
+    tei: {
+      baseUrl: 'http://localhost:8081',
+    },
   },
   cleanup: {
     autoGC: true,
@@ -451,7 +466,7 @@ export class BrainManager {
   private config: BrainConfig;
   private neo4jClient: Neo4jClient | null = null;
   private projectRegistry: ProjectRegistry;
-  private registeredProjects: Map<string, RegisteredProject> = new Map();
+  // NOTE: registeredProjects cache removed - all project queries now go directly to DB
   private initialized = false;
   private sourceAdapter: UniversalSourceAdapter;
   private ingestionManager: IncrementalIngestionManager | null = null;
@@ -548,13 +563,10 @@ export class BrainManager {
       console.log(`[Brain] Entity extraction enabled: ${this.config.entityExtraction.serviceUrl || 'http://localhost:6971'}`);
     }
 
-    // 3. Load or create .env (credentials - generated once, reused)
+    // 3. Load or create .env (credentials - loaded from environment)
     await this.ensureBrainEnv();
 
-    // 4. Ensure Docker container is running
-    await this.ensureDockerContainer();
-
-    // 5. Wait for Neo4j to be ready
+    // 4. Wait for Neo4j to be ready (assumes external Neo4j via docker-compose)
     await this.waitForNeo4j();
 
     // 6. Connect to Neo4j
@@ -566,10 +578,7 @@ export class BrainManager {
     // 8. Check for schema updates and mark outdated nodes
     await this.checkSchemaUpdates();
 
-    // 9. Load projects from Neo4j into cache (for sync listProjects())
-    await this.refreshProjectsCache();
-
-    // 10. Initialize ingestion orchestrator
+    // 9. Initialize ingestion orchestrator
     await this.initializeOrchestrator();
 
     // 11. Initialize FileStateMachine for the unified pipeline
@@ -580,6 +589,10 @@ export class BrainManager {
 
     this.initialized = true;
     console.log('[Brain] Initialized successfully');
+
+    // 12. Restore watchers for quick-ingest projects (after initialized = true)
+    // This must be after initialized = true because startWatching checks this.initialized
+    await this.restoreWatchers();
   }
 
   /**
@@ -785,10 +798,12 @@ export class BrainManager {
       idleIntervalMs: 1000,
       busyIntervalMs: 100,
       maxIdleIntervalMs: 10000,
-      batchSize: 10,
       verbose: false,
       recoverOnStart: true,
     });
+
+    // Wire up activity callback - processor signals activity to loop for timeout management
+    processor.setOnActivity(() => loop.recordActivity());
 
     this._processingLoops.set(projectId, loop);
     console.log(`[Brain] ProcessingLoop created for project: ${projectId}`);
@@ -889,15 +904,23 @@ export class BrainManager {
   }
 
   /**
-   * Stop the processing loop for a specific project
+   * Stop and remove the processing loop for a specific project.
+   * Also removes the associated UnifiedProcessor.
+   * This ensures a fresh loop is created on next ingestion.
    */
   async stopProcessingLoop(projectId: string): Promise<void> {
     const loop = this._processingLoops.get(projectId);
-    if (!loop) {
-      return;
+    if (loop) {
+      await loop.stop();
+      this._processingLoops.delete(projectId);
+      console.log(`[Brain] ProcessingLoop stopped and removed for ${projectId}`);
     }
-    await loop.stop();
-    console.log(`[Brain] ProcessingLoop stopped for ${projectId}`);
+
+    // Also remove the UnifiedProcessor
+    if (this._unifiedProcessors.has(projectId)) {
+      this._unifiedProcessors.delete(projectId);
+      console.log(`[Brain] UnifiedProcessor removed for ${projectId}`);
+    }
   }
 
   /**
@@ -925,6 +948,42 @@ export class BrainManager {
   }
 
   /**
+   * Get the last activity timestamp for a project's processing loop
+   * Used for timeout reset during long-running operations
+   */
+  getLastActivityAt(projectId: string): Date | undefined {
+    const loop = this._processingLoops.get(projectId);
+    if (!loop) return undefined;
+    return loop.getLastActivityAt();
+  }
+
+  /**
+   * Check if any processing loop is currently active
+   * Used by daemon to prevent idle shutdown during long-running operations
+   */
+  hasActiveProcessing(): boolean {
+    for (const loop of this._processingLoops.values()) {
+      if (loop.isActive()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Get the number of active processing loops
+   */
+  getActiveProcessingCount(): number {
+    let count = 0;
+    for (const loop of this._processingLoops.values()) {
+      if (loop.isActive()) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
    * Get unified processor progress for a project
    */
   async getProcessingProgress(projectId: string): Promise<{ processed: number; total: number; percentage: number } | null> {
@@ -945,8 +1004,11 @@ export class BrainManager {
   /**
    * Wait for processing to complete for a project
    *
+   * The timeout resets automatically when activity is detected, preventing
+   * timeouts during long-running operations like entity extraction.
+   *
    * @param projectId - Project ID to wait for
-   * @param maxWaitMs - Maximum time to wait in milliseconds (default: 300000 = 5 minutes)
+   * @param maxWaitMs - Maximum time to wait without activity (default: 300000 = 5 minutes)
    * @param pollIntervalMs - Interval between checks (default: 200ms)
    * @returns true if processing completed, false if timed out
    */
@@ -955,9 +1017,12 @@ export class BrainManager {
     maxWaitMs: number = 300000,
     pollIntervalMs: number = 200
   ): Promise<boolean> {
-    const startTime = Date.now();
+    let lastActivityChecked: Date | undefined = undefined;
+    let lastActivityTime = Date.now();
 
-    while (Date.now() - startTime < maxWaitMs) {
+    while (true) {
+      const now = Date.now();
+
       // Check if ProcessingLoop is done
       const isComplete = await this.isProcessingComplete(projectId);
       if (isComplete) {
@@ -967,11 +1032,23 @@ export class BrainManager {
         }
       }
 
+      // Check for activity - if activity was detected, reset the timeout
+      const currentActivity = this.getLastActivityAt(projectId);
+      if (currentActivity && (!lastActivityChecked || currentActivity > lastActivityChecked)) {
+        // New activity detected - reset the timeout
+        lastActivityTime = now;
+        lastActivityChecked = currentActivity;
+      }
+
+      // Check for timeout since last activity
+      const timeSinceActivity = now - lastActivityTime;
+      if (timeSinceActivity >= maxWaitMs) {
+        console.warn(`[Brain] Timeout waiting for processing to complete for ${projectId} - no activity for ${maxWaitMs}ms`);
+        return false;
+      }
+
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     }
-
-    console.warn(`[Brain] Timeout waiting for processing to complete for ${projectId} after ${maxWaitMs}ms`);
-    return false;
   }
 
   /**
@@ -1002,7 +1079,9 @@ export class BrainManager {
 
     // Vector indexes for semantic search (if embeddings are enabled)
     if (this.embeddingService?.canGenerateEmbeddings()) {
-      await ensureVectorIndexesCentralized(this.neo4jClient, { dimension: 3072, verbose: false });
+      // Get actual dimension from the configured provider
+      const dimension = await this.embeddingService.getDimensions() ?? 3072;
+      await ensureVectorIndexesCentralized(this.neo4jClient, { dimension, verbose: true });
     }
 
     console.log('[Brain] Indexes ensured');
@@ -1128,6 +1207,11 @@ export class BrainManager {
         neo4j: { ...this.config.neo4j, ...loadedConfig?.neo4j },
         embeddings: { ...this.config.embeddings, ...loadedConfig?.embeddings },
         cleanup: { ...this.config.cleanup, ...loadedConfig?.cleanup },
+        entityExtraction: {
+          ...this.config.entityExtraction,
+          ...loadedConfig?.entityExtraction,
+          enabled: loadedConfig?.entityExtraction?.enabled ?? this.config.entityExtraction?.enabled ?? true,
+        },
         agentSettings: loadedConfig?.agentSettings,
       };
       console.log('[Brain] Config loaded from', configPath);
@@ -1223,18 +1307,16 @@ export class BrainManager {
   }
 
   /**
-   * Generate new .env file with random password and API keys
+   * Generate new .env file with API keys and Neo4j config
+   * Note: Uses external Neo4j from docker-compose (default ports 7687/7474)
    */
   private async generateBrainEnv(): Promise<void> {
-    // Find available ports if not already set
-    if (!this.config.neo4j.boltPort || !this.config.neo4j.httpPort) {
-      const ports = await this.findAvailablePorts();
-      this.config.neo4j.boltPort = ports.bolt;
-      this.config.neo4j.httpPort = ports.http;
-    }
+    // Use default ports for external Neo4j
+    if (!this.config.neo4j.boltPort) this.config.neo4j.boltPort = 7687;
+    if (!this.config.neo4j.httpPort) this.config.neo4j.httpPort = 7474;
 
-    // Generate random password
-    const password = this.generatePassword();
+    // Use password from env or default 'ragforge' (matching docker-compose.yml)
+    const password = process.env.NEO4J_PASSWORD || 'ragforge';
 
     // Set config
     this.config.neo4j.uri = `bolt://localhost:${this.config.neo4j.boltPort}`;
@@ -1305,198 +1387,13 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
     return password;
   }
 
-  // ============================================
-  // Docker Container Management
-  // ============================================
-
   /**
-   * Ensure the brain's Docker container is running
-   */
-  private async ensureDockerContainer(): Promise<void> {
-    // Check if Docker is available
-    const dockerAvailable = await this.checkDockerAvailable();
-    if (!dockerAvailable) {
-      throw new Error(
-        'Docker is not installed or not running.\n' +
-        'The brain requires Docker to run Neo4j.\n' +
-        'Please install Docker and try again.'
-      );
-    }
-
-    // Check if container exists
-    const containerExists = await this.checkContainerExists();
-    const containerRunning = containerExists ? await this.checkContainerRunning() : false;
-
-    if (containerExists && containerRunning) {
-      console.log(`[Brain] Container ${BRAIN_CONTAINER_NAME} is running`);
-      return;
-    }
-
-    if (containerExists && !containerRunning) {
-      // Start existing container
-      console.log(`[Brain] Starting existing container ${BRAIN_CONTAINER_NAME}...`);
-      try {
-        await execAsync(`docker start ${BRAIN_CONTAINER_NAME}`);
-        console.log('[Brain] Container started');
-        return;
-      } catch (error: any) {
-        console.warn(`[Brain] Failed to start container: ${error.message}`);
-        console.log('[Brain] Removing and recreating container...');
-        await execAsync(`docker rm -f ${BRAIN_CONTAINER_NAME}`);
-      }
-    }
-
-    // Create new container
-    await this.createDockerContainer();
-  }
-
-  /**
-   * Create and start a new Docker container for the brain
-   */
-  private async createDockerContainer(): Promise<void> {
-    console.log('[Brain] Creating Docker container...');
-
-    const boltPort = this.config.neo4j.boltPort!;
-    const httpPort = this.config.neo4j.httpPort!;
-    const password = this.config.neo4j.password!;
-
-    // Generate docker-compose.yml
-    const dockerComposePath = path.join(this.config.path, 'docker-compose.yml');
-    const dockerComposeContent = `version: '3.8'
-
-services:
-  neo4j:
-    image: neo4j:5.23-community
-    container_name: ${BRAIN_CONTAINER_NAME}
-    environment:
-      NEO4J_AUTH: neo4j/${password}
-      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
-      NEO4J_server_memory_heap_initial__size: 512m
-      NEO4J_server_memory_heap_max__size: 2G
-      NEO4J_dbms_security_procedures_unrestricted: apoc.*,gds.*
-    ports:
-      - "${boltPort}:7687"
-      - "${httpPort}:7474"
-    volumes:
-      - ragforge_brain_data:/data
-      - ragforge_brain_logs:/logs
-
-volumes:
-  ragforge_brain_data:
-  ragforge_brain_logs:
-`;
-
-    await fs.writeFile(dockerComposePath, dockerComposeContent, 'utf-8');
-    console.log('[Brain] Generated docker-compose.yml');
-
-    // Start with docker compose
-    try {
-      await execAsync('docker compose up -d', { cwd: this.config.path });
-      console.log(`[Brain] Container ${BRAIN_CONTAINER_NAME} created and started`);
-      console.log(`[Brain] Neo4j Browser: http://localhost:${httpPort}`);
-      console.log(`[Brain] Neo4j Bolt: bolt://localhost:${boltPort}`);
-    } catch (error: any) {
-      throw new Error(`Failed to start Docker container: ${error.message}`);
-    }
-  }
-
-  /**
-   * Check if Docker is available
-   */
-  private async checkDockerAvailable(): Promise<boolean> {
-    try {
-      await execAsync('docker --version');
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Check if the brain container exists
-   */
-  private async checkContainerExists(): Promise<boolean> {
-    try {
-      const { stdout } = await execAsync(
-        `docker ps -a --filter name=^${BRAIN_CONTAINER_NAME}$ --format "{{.Names}}"`
-      );
-      return stdout.trim() === BRAIN_CONTAINER_NAME;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Check if the brain container is running
-   */
-  private async checkContainerRunning(): Promise<boolean> {
-    try {
-      const { stdout } = await execAsync(
-        `docker ps --filter name=^${BRAIN_CONTAINER_NAME}$ --format "{{.Names}}"`
-      );
-      return stdout.trim() === BRAIN_CONTAINER_NAME;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Find available ports for Neo4j
-   */
-  private async findAvailablePorts(): Promise<{ bolt: number; http: number }> {
-    const startBolt = 7687;
-    const startHttp = 7474;
-
-    for (let i = 0; i < 20; i++) {
-      const boltPort = startBolt + i;
-      const httpPort = startHttp + i;
-
-      const boltAvailable = await this.isPortAvailable(boltPort);
-      const httpAvailable = await this.isPortAvailable(httpPort);
-
-      if (boltAvailable && httpAvailable) {
-        return { bolt: boltPort, http: httpPort };
-      }
-    }
-
-    throw new Error(
-      'Could not find available ports for Neo4j.\n' +
-      'Please free up ports 7687-7706 or 7474-7493.'
-    );
-  }
-
-  /**
-   * Check if a port is available
-   */
-  private async isPortAvailable(port: number): Promise<boolean> {
-    try {
-      // Check with ss (more reliable than lsof)
-      const { stdout: ssOut } = await execAsync(`ss -tuln | grep ':${port} ' || echo ""`);
-      if (ssOut.trim().length > 0) {
-        return false;
-      }
-
-      // Check Docker port bindings
-      const { stdout: dockerOut } = await execAsync(
-        `docker ps -a --format "{{.ID}}" | xargs -I {} docker inspect {} --format '{{.HostConfig.PortBindings}}' 2>/dev/null | grep -E " ${port}\\}" || echo ""`
-      );
-      if (dockerOut.trim().length > 0) {
-        return false;
-      }
-
-      return true;
-    } catch {
-      return true; // Assume available if check fails
-    }
-  }
-
-  /**
-   * Wait for Neo4j to be ready
+   * Wait for Neo4j to be ready (external Neo4j via docker-compose)
    */
   private async waitForNeo4j(maxRetries = 30): Promise<void> {
     console.log('[Brain] Waiting for Neo4j to be ready...');
 
-    const port = this.config.neo4j.boltPort!;
+    const port = this.config.neo4j.boltPort || 7687;
 
     for (let i = 0; i < maxRetries; i++) {
       try {
@@ -1513,7 +1410,8 @@ volumes:
 
     throw new Error(
       'Neo4j did not become ready in time.\n' +
-      `Check Docker logs: docker logs ${BRAIN_CONTAINER_NAME}`
+      'Ensure Neo4j is running: docker compose up -d neo4j\n' +
+      'Check logs: docker logs ragforge-neo4j'
     );
   }
 
@@ -1564,42 +1462,11 @@ volumes:
 
     if (setClause.length === 0) return;
 
+    // Use MERGE to create the Project node if it doesn't exist
     await this.neo4jClient.run(
-      `MATCH (p:Project {projectId: $projectId}) SET ${setClause.join(', ')}`,
+      `MERGE (p:Project {projectId: $projectId}) SET ${setClause.join(', ')}`,
       params
     );
-  }
-
-  /**
-   * Get project metadata from Neo4j
-   */
-  private async getProjectFromDb(projectId: string): Promise<RegisteredProject | null> {
-    if (!this.neo4jClient) return null;
-
-    const result = await this.neo4jClient.run(
-      `MATCH (p:Project {projectId: $projectId})
-       OPTIONAL MATCH (n {projectId: $projectId})
-       WITH p, count(n) as nodeCount
-       RETURN p.projectId as id, p.rootPath as path, p.type as type,
-              p.lastAccessed as lastAccessed, p.excluded as excluded,
-              p.autoCleanup as autoCleanup, p.name as displayName,
-              nodeCount`,
-      { projectId }
-    );
-
-    if (result.records.length === 0) return null;
-
-    const record = result.records[0];
-    return {
-      id: record.get('id'),
-      path: record.get('path'),
-      type: record.get('type') || 'quick-ingest',
-      lastAccessed: record.get('lastAccessed') ? new Date(record.get('lastAccessed')) : new Date(),
-      nodeCount: record.get('nodeCount')?.toNumber?.() || record.get('nodeCount') || 0,
-      excluded: record.get('excluded') || false,
-      autoCleanup: record.get('autoCleanup') ?? true,
-      displayName: record.get('displayName') || undefined,
-    };
   }
 
   /**
@@ -1632,21 +1499,130 @@ volumes:
   }
 
   /**
-   * Refresh the in-memory projects cache from Neo4j
-   * This is called on init and after project changes
+   * Get a single project from Neo4j by ID
    */
-  private async refreshProjectsCache(): Promise<void> {
-    const projects = await this.listProjectsFromDb();
-    this.registeredProjects.clear();
-    for (const project of projects) {
-      this.registeredProjects.set(project.id, project);
+  async getProjectFromDb(projectId: string): Promise<RegisteredProject | undefined> {
+    if (!this.neo4jClient) return undefined;
+
+    const result = await this.neo4jClient.run(
+      `MATCH (p:Project {projectId: $projectId})
+       OPTIONAL MATCH (n {projectId: p.projectId})
+       WITH p, count(n) as nodeCount
+       RETURN p.projectId as id, p.rootPath as path, p.type as type,
+              p.lastAccessed as lastAccessed, p.excluded as excluded,
+              p.autoCleanup as autoCleanup, p.name as displayName,
+              nodeCount`,
+      { projectId }
+    );
+
+    if (result.records.length === 0) return undefined;
+
+    const record = result.records[0];
+    return {
+      id: record.get('id'),
+      path: record.get('path'),
+      type: record.get('type') || 'quick-ingest',
+      lastAccessed: record.get('lastAccessed') ? new Date(record.get('lastAccessed')) : new Date(),
+      nodeCount: record.get('nodeCount')?.toNumber?.() || record.get('nodeCount') || 0,
+      excluded: record.get('excluded') || false,
+      autoCleanup: record.get('autoCleanup') ?? true,
+      displayName: record.get('displayName') || undefined,
+    };
+  }
+
+  /**
+   * Find project by path in Neo4j
+   */
+  async findProjectByPathFromDb(projectPath: string): Promise<RegisteredProject | undefined> {
+    if (!this.neo4jClient) return undefined;
+
+    const absolutePath = path.resolve(projectPath);
+    const result = await this.neo4jClient.run(
+      `MATCH (p:Project {rootPath: $path})
+       OPTIONAL MATCH (n {projectId: p.projectId})
+       WITH p, count(n) as nodeCount
+       RETURN p.projectId as id, p.rootPath as path, p.type as type,
+              p.lastAccessed as lastAccessed, p.excluded as excluded,
+              p.autoCleanup as autoCleanup, p.name as displayName,
+              nodeCount`,
+      { path: absolutePath }
+    );
+
+    if (result.records.length === 0) return undefined;
+
+    const record = result.records[0];
+    return {
+      id: record.get('id'),
+      path: record.get('path'),
+      type: record.get('type') || 'quick-ingest',
+      lastAccessed: record.get('lastAccessed') ? new Date(record.get('lastAccessed')) : new Date(),
+      nodeCount: record.get('nodeCount')?.toNumber?.() || record.get('nodeCount') || 0,
+      excluded: record.get('excluded') || false,
+      autoCleanup: record.get('autoCleanup') ?? true,
+      displayName: record.get('displayName') || undefined,
+    };
+  }
+
+  /**
+   * Restore watchers for all quick-ingest projects at daemon startup.
+   * Called after initialize() to resume watching for file changes.
+   */
+  private async restoreWatchers(): Promise<void> {
+    const projectsToWatch: RegisteredProject[] = [];
+    const allProjects = await this.listProjectsFromDb();
+
+    for (const project of allProjects) {
+      // Only restore watchers for quick-ingest projects (not web-crawl, touched-files, etc.)
+      if (project.type !== 'quick-ingest') {
+        continue;
+      }
+
+      // Skip if no valid path
+      if (!project.path) {
+        console.log(`[Brain] Skipping watcher restore for ${project.id}: no path`);
+        continue;
+      }
+
+      // Check if path still exists on disk
+      try {
+        await fs.access(project.path);
+        projectsToWatch.push(project);
+      } catch {
+        console.log(`[Brain] Skipping watcher restore for ${project.id}: path no longer exists (${project.path})`);
+      }
     }
+
+    if (projectsToWatch.length === 0) {
+      console.log('[Brain] No projects to restore watchers for');
+      return;
+    }
+
+    console.log(`[Brain] Restoring watchers for ${projectsToWatch.length} projects...`);
+
+    // Start watchers sequentially to avoid overwhelming the system at startup
+    for (const project of projectsToWatch) {
+      try {
+        await this.startWatching(project.path, {
+          projectId: project.id,
+          verbose: false,
+          // skipInitialSync will be auto-determined by startWatching based on node count
+        });
+        console.log(`[Brain] ✓ Restored watcher for ${project.id}`);
+      } catch (err: any) {
+        console.error(`[Brain] ✗ Failed to restore watcher for ${project.id}: ${err.message}`);
+      }
+    }
+
+    console.log(`[Brain] Watcher restoration complete`);
   }
 
   /**
    * Connect to Neo4j
    */
   private async connectNeo4j(): Promise<void> {
+    // Debug: log connection details
+    console.log(`[Brain] Connecting to Neo4j: uri=${this.config.neo4j.uri}, user=${this.config.neo4j.username}, pass=${this.config.neo4j.password}`);
+
     this.neo4jClient = new Neo4jClient({
       uri: this.config.neo4j.uri!,
       username: this.config.neo4j.username!,
@@ -1725,18 +1701,13 @@ volumes:
     const projectId = ProjectRegistry.generateId(absolutePath);
     const now = new Date();
 
-    // Check if already registered (in cache or DB)
-    const existingInCache = this.registeredProjects.get(projectId);
-    if (existingInCache) {
-      // Update lastAccessed and displayName
-      existingInCache.lastAccessed = now;
-      if (displayName) {
-        existingInCache.displayName = displayName;
-      }
-      // Update in DB (also ensure rootPath is set if missing)
+    // Check if already registered in DB
+    const existingInDb = await this.getProjectFromDb(projectId);
+    if (existingInDb) {
+      // Update lastAccessed and displayName in DB
       await this.updateProjectMetadataInDb(projectId, {
         lastAccessed: now,
-        displayName: displayName || existingInCache.displayName,
+        displayName: displayName || existingInDb.displayName,
         rootPath: absolutePath, // Ensure rootPath is always set
       });
       return projectId;
@@ -1744,22 +1715,22 @@ volumes:
 
     // Check if this path is a subdirectory of an existing project
     // If so, use the parent project instead of creating a new sub-project
-    for (const [existingId, existingProject] of this.registeredProjects) {
-      if (absolutePath.startsWith(existingProject.path + path.sep)) {
-        console.log(`[Brain] Path ${absolutePath} is inside existing project ${existingId}, reusing parent project`);
-        existingProject.lastAccessed = now;
+    const allProjects = await this.listProjectsFromDb();
+    for (const existingProject of allProjects) {
+      if (existingProject.path && absolutePath.startsWith(existingProject.path + path.sep)) {
+        console.log(`[Brain] Path ${absolutePath} is inside existing project ${existingProject.id}, reusing parent project`);
         // Note: Don't update rootPath here - keep parent's rootPath
-        await this.updateProjectMetadataInDb(existingId, { lastAccessed: now });
-        return existingId;
+        await this.updateProjectMetadataInDb(existingProject.id, { lastAccessed: now });
+        return existingProject.id;
       }
     }
 
     // Check if this path is a PARENT of existing projects
     // If so, migrate the child projects' nodes to the parent (preserves embeddings)
     const childProjects: string[] = [];
-    for (const [existingId, existingProject] of this.registeredProjects) {
-      if (existingProject.path.startsWith(absolutePath + path.sep)) {
-        childProjects.push(existingId);
+    for (const existingProject of allProjects) {
+      if (existingProject.path && existingProject.path.startsWith(absolutePath + path.sep)) {
+        childProjects.push(existingProject.id);
       }
     }
     if (childProjects.length > 0) {
@@ -1769,21 +1740,6 @@ volumes:
         console.log(`[Brain] Migrated ${stats.migratedFiles} files, ${stats.migratedScopes} scopes from ${childId}`);
       }
     }
-
-    // Count nodes for this project (may be 0 if not yet ingested)
-    const nodeCount = await this.countProjectNodes(projectId);
-
-    // Register in cache
-    const registered: RegisteredProject = {
-      id: projectId,
-      path: absolutePath,
-      type,
-      lastAccessed: now,
-      nodeCount,
-      autoCleanup: type === 'quick-ingest',
-      displayName,
-    };
-    this.registeredProjects.set(projectId, registered);
 
     // The Project node will be created by the ingestion process.
     // We just need to update its metadata after ingestion completes.
@@ -1800,66 +1756,37 @@ volumes:
   }
 
   /**
-   * Get a registered project
+   * Get a registered project (now queries DB directly)
    */
-  getProject(projectId: string): RegisteredProject | undefined {
-    const project = this.registeredProjects.get(projectId);
+  async getProject(projectId: string): Promise<RegisteredProject | undefined> {
+    const project = await this.getProjectFromDb(projectId);
     if (project) {
-      project.lastAccessed = new Date();
+      // Update lastAccessed in DB
+      await this.updateProjectMetadataInDb(projectId, { lastAccessed: new Date() });
     }
     return project;
   }
 
   /**
-   * List all registered projects (sync, cached nodeCount)
+   * List all registered projects (now queries DB directly)
    */
-  listProjects(): RegisteredProject[] {
-    return Array.from(this.registeredProjects.values());
+  async listProjects(): Promise<RegisteredProject[]> {
+    return this.listProjectsFromDb();
   }
 
   /**
    * List all registered projects with real-time node counts from Neo4j
+   * (Same as listProjects now since we always query DB)
    */
   async listProjectsWithCounts(): Promise<RegisteredProject[]> {
-    const projects = Array.from(this.registeredProjects.values());
-
-    // Query real counts in parallel
-    const counts = await Promise.all(
-      projects.map(p => this.countProjectNodes(p.id))
-    );
-
-    // Return projects with updated counts
-    return projects.map((p, i) => ({
-      ...p,
-      nodeCount: counts[i],
-    }));
+    return this.listProjectsFromDb();
   }
 
   /**
-   * Clear all projects from registry (used by cleanup)
-   * Note: This only clears the cache. The Project nodes remain in Neo4j.
-   * Use forgetPath() to delete nodes from Neo4j.
+   * Find project by path (now queries DB directly)
    */
-  async clearProjectsRegistry(): Promise<void> {
-    this.registeredProjects.clear();
-  }
-
-  /**
-   * Unregister a specific project from the registry (cache only)
-   * Note: The Project node remains in Neo4j. Use forgetPath() to delete nodes.
-   */
-  async unregisterProject(projectId: string): Promise<boolean> {
-    return this.registeredProjects.delete(projectId);
-  }
-
-  /**
-   * Find project by path
-   */
-  findProjectByPath(projectPath: string): RegisteredProject | undefined {
-    const absolutePath = path.resolve(projectPath);
-    return Array.from(this.registeredProjects.values()).find(
-      p => p.path === absolutePath
-    );
+  async findProjectByPath(projectPath: string): Promise<RegisteredProject | undefined> {
+    return this.findProjectByPathFromDb(projectPath);
   }
 
   /**
@@ -1868,10 +1795,9 @@ volumes:
    * @returns true if project was found and excluded
    */
   async excludeProject(projectId: string): Promise<boolean> {
-    const project = this.registeredProjects.get(projectId);
+    const project = await this.getProjectFromDb(projectId);
     if (!project) return false;
 
-    project.excluded = true;
     await this.updateProjectMetadataInDb(projectId, { excluded: true });
     return true;
   }
@@ -1881,10 +1807,9 @@ volumes:
    * @returns true if project was found and included
    */
   async includeProject(projectId: string): Promise<boolean> {
-    const project = this.registeredProjects.get(projectId);
+    const project = await this.getProjectFromDb(projectId);
     if (!project) return false;
 
-    project.excluded = false;
     await this.updateProjectMetadataInDb(projectId, { excluded: false });
     return true;
   }
@@ -1894,12 +1819,12 @@ volumes:
    * @returns the new exclusion status, or undefined if project not found
    */
   async toggleProjectExclusion(projectId: string): Promise<boolean | undefined> {
-    const project = this.registeredProjects.get(projectId);
+    const project = await this.getProjectFromDb(projectId);
     if (!project) return undefined;
 
-    project.excluded = !project.excluded;
-    await this.updateProjectMetadataInDb(projectId, { excluded: project.excluded });
-    return project.excluded;
+    const newExcluded = !project.excluded;
+    await this.updateProjectMetadataInDb(projectId, { excluded: newExcluded });
+    return newExcluded;
   }
 
   /**
@@ -1930,15 +1855,16 @@ volumes:
    * Check if a file path is inside any registered project
    * @returns The project containing the file, or undefined if not in any project
    */
-  findProjectForFile(filePath: string): RegisteredProject | undefined {
+  async findProjectForFile(filePath: string): Promise<RegisteredProject | undefined> {
     const absolutePath = path.resolve(filePath);
+    const allProjects = await this.listProjectsFromDb();
 
-    for (const project of this.registeredProjects.values()) {
+    for (const project of allProjects) {
       // Skip the touched-files project itself
       if (project.type === 'touched-files') continue;
 
       // Check if file is inside this project's directory
-      if (absolutePath.startsWith(project.path + path.sep) || absolutePath === project.path) {
+      if (project.path && (absolutePath.startsWith(project.path + path.sep) || absolutePath === project.path)) {
         return project;
       }
     }
@@ -1969,7 +1895,7 @@ volumes:
       MATCH (f:File {projectId: $orphanProjectId})
       WHERE f.absolutePath STARTS WITH $projectPathPrefix
          OR f.absolutePath = $projectPath
-      RETURN f.uuid as uuid, f.absolutePath as absolutePath, f.state as state
+      RETURN f.uuid as uuid, f.absolutePath as absolutePath, f._state as state
     `, { orphanProjectId, projectPathPrefix, projectPath });
 
     if (orphansResult.records.length === 0) {
@@ -2003,7 +1929,7 @@ volumes:
         SET f.projectId = $newProjectId,
             f.file = $relativePath,
             f.path = $relativePath
-        REMOVE f.state
+        REMOVE f._state
         MERGE (f)-[:BELONGS_TO]->(p)
         RETURN f.uuid as uuid
       `, { absolutePath, orphanProjectId, newProjectId: projectId, relativePath });
@@ -2088,10 +2014,10 @@ volumes:
       return { migratedFiles: 0, migratedScopes: 0, migratedOther: 0 };
     }
 
-    // 1. Get child project info
-    const childProject = this.registeredProjects.get(childProjectId);
-    if (!childProject) {
-      console.warn(`[Brain] Child project ${childProjectId} not found in registry`);
+    // 1. Get child project info from DB
+    const childProject = await this.getProjectFromDb(childProjectId);
+    if (!childProject || !childProject.path) {
+      console.warn(`[Brain] Child project ${childProjectId} not found in DB`);
       return { migratedFiles: 0, migratedScopes: 0, migratedOther: 0 };
     }
 
@@ -2155,8 +2081,7 @@ volumes:
       DELETE p
     `, { childProjectId });
 
-    // 8. Remove from cache and stop any watcher
-    this.registeredProjects.delete(childProjectId);
+    // 8. Stop any watcher for the child project
     const watcherId = this.activeWatchers.get(childProject.path);
     if (watcherId) {
       this.activeWatchers.delete(childProject.path);
@@ -2218,7 +2143,7 @@ volumes:
     const absolutePath = path.resolve(filePath);
 
     // Check if in a known project - if so, skip
-    if (this.findProjectForFile(absolutePath)) {
+    if (await this.findProjectForFile(absolutePath)) {
       return { created: false, previousState: null, newState: 'in_project' };
     }
 
@@ -2249,7 +2174,7 @@ volumes:
         f.uuid = $fileUuid,
         f.name = $name,
         f.extension = $extension,
-        f.state = $initialState,
+        f._state = $initialState,
         f.projectId = 'touched-files',
         f.firstAccessed = $timestamp,
         f.lastAccessed = $timestamp,
@@ -2257,20 +2182,20 @@ volumes:
       ON MATCH SET
         f.lastAccessed = $timestamp,
         f.accessCount = COALESCE(f.accessCount, 0) + 1,
-        f.state = CASE
+        f._state = CASE
           // Allow 'parsing' to claim a 'discovered' or 'mentioned' file
-          WHEN $initialState = 'parsing' AND f.state IN ['discovered', 'mentioned'] THEN 'parsing'
+          WHEN $initialState = 'parsing' AND f._state IN ['discovered', 'mentioned'] THEN 'parsing'
           // Allow 'discovered' to upgrade 'mentioned'
-          WHEN $initialState = 'discovered' AND f.state = 'mentioned' THEN 'discovered'
+          WHEN $initialState = 'discovered' AND f._state = 'mentioned' THEN 'discovered'
           // Otherwise keep current state (don't regress)
-          ELSE f.state
+          ELSE f._state
         END
       WITH f,
            CASE WHEN f.accessCount = 1 THEN true ELSE false END as wasCreated,
-           CASE WHEN f.accessCount > 1 THEN f.state ELSE null END as prevState
+           CASE WHEN f.accessCount > 1 THEN f._state ELSE null END as prevState
       MATCH (dir:Directory {path: $dirPath})
       MERGE (f)-[:IN_DIRECTORY]->(dir)
-      RETURN f.state as newState, wasCreated, prevState
+      RETURN f._state as newState, wasCreated, prevState
     `, {
       absolutePath,
       fileUuid,
@@ -2366,8 +2291,12 @@ volumes:
 
     const result = await this.neo4jClient.run(
       `MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
-       OPTIONAL MATCH (f)<-[:DEFINED_IN]-(s:Scope)
-       DETACH DELETE f, s
+       OPTIONAL MATCH (f)<-[:DEFINED_IN]-(n)
+       // Cascade delete EmbeddingChunks
+       OPTIONAL MATCH (n)-[:HAS_EMBEDDING_CHUNK]->(chunk:EmbeddingChunk)
+       DETACH DELETE chunk
+       WITH f, n
+       DETACH DELETE f, n
        RETURN count(f) as deleted`,
       { absolutePath, projectId: BrainManager.TOUCHED_FILES_PROJECT_ID }
     );
@@ -2397,7 +2326,7 @@ volumes:
 
     // Build state filter
     const stateFilter = states && states.length > 0
-      ? `AND f.state IN $states`
+      ? `AND f._state IN $states`
       : '';
 
     // Recursive: traverse IN_DIRECTORY* from files to find those under dirPath
@@ -2407,13 +2336,13 @@ volumes:
         MATCH (f:File {projectId: $projectId})-[:IN_DIRECTORY*]->(d:Directory)
         WHERE d.path = $dirPath OR d.path STARTS WITH $dirPathPrefix
         ${stateFilter}
-        RETURN DISTINCT f.absolutePath as absolutePath, f.state as state, f.name as name
+        RETURN DISTINCT f.absolutePath as absolutePath, f._state as state, f.name as name
         ORDER BY f.absolutePath
       `
       : `
         MATCH (f:File {projectId: $projectId})-[:IN_DIRECTORY]->(d:Directory {path: $dirPath})
         ${stateFilter}
-        RETURN f.absolutePath as absolutePath, f.state as state, f.name as name
+        RETURN f.absolutePath as absolutePath, f._state as state, f.name as name
         ORDER BY f.absolutePath
       `;
 
@@ -2446,7 +2375,7 @@ volumes:
     const result = await this.neo4jClient.run(`
       MATCH (f:File {projectId: $projectId})-[:IN_DIRECTORY*]->(d:Directory)
       WHERE (d.path = $dirPath OR d.path STARTS WITH $dirPathPrefix)
-        AND f.state <> 'embedded'
+        AND f._state <> 'embedded'
       RETURN count(DISTINCT f) as pending
     `, {
       projectId: BrainManager.TOUCHED_FILES_PROJECT_ID,
@@ -2516,7 +2445,7 @@ volumes:
 
     const result = await this.neo4jClient.run(`
       MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
-      SET f.state = $newState${propsSet}
+      SET f._state = $newState${propsSet}
       RETURN f.absolutePath as path
     `, params);
 
@@ -2593,7 +2522,7 @@ volumes:
         f.uuid = $fileUuid,
         f.name = $name,
         f.extension = $extension,
-        f.state = 'mentioned',
+        f._state = 'mentioned',
         f.projectId = $projectId,
         f.firstMentioned = datetime()
       WITH f, (f.firstMentioned = datetime()) as wasCreated
@@ -2616,7 +2545,7 @@ volumes:
           ELSE [x IN pending.symbols WHERE NOT x IN $symbols] + $symbols
         END
 
-      RETURN f.state as fileState, wasCreated
+      RETURN f._state as fileState, wasCreated
     `, {
       absolutePath,
       fileUuid,
@@ -2717,7 +2646,7 @@ volumes:
 
     const result = await this.neo4jClient.run(`
       MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
-      RETURN f.state as state
+      RETURN f._state as state
     `, {
       absolutePath,
       projectId: BrainManager.TOUCHED_FILES_PROJECT_ID
@@ -2749,10 +2678,11 @@ volumes:
 
     // Check if this path is inside an existing project - if so, use parent
     let projectId: string | null = null;
-    for (const [existingId, existingProject] of this.registeredProjects) {
-      if (absolutePath.startsWith(existingProject.path + path.sep)) {
-        projectId = existingId;
-        console.log(`[QuickIngest] Path is inside existing project ${existingId}, using parent`);
+    const allProjects = await this.listProjectsFromDb();
+    for (const existingProject of allProjects) {
+      if (existingProject.path && absolutePath.startsWith(existingProject.path + path.sep)) {
+        projectId = existingProject.id;
+        console.log(`[QuickIngest] Path is inside existing project ${existingProject.id}, using parent`);
         break;
       }
     }
@@ -2803,12 +2733,6 @@ volumes:
     // Get stats after ingestion
     const nodeCount = await this.countProjectNodes(finalProjectId);
 
-    // Update node count in cache (no need to persist - it's computed from DB)
-    const project = this.registeredProjects.get(finalProjectId);
-    if (project) {
-      project.nodeCount = nodeCount;
-    }
-
     // Post-ingestion analysis: analyze media files if requested
     let analyzedCount = 0;
     if (options.analyzeImages || options.analyze3d || options.ocrDocuments) {
@@ -2838,6 +2762,121 @@ volumes:
       },
       configPath: absolutePath,
       watching: true, // Toujours actif
+    };
+  }
+
+  /**
+   * Fire-and-forget ingestion - returns immediately with file counts and log path.
+   * The actual processing happens in the background via ProcessingLoop.
+   */
+  async quickIngestAsync(dirPath: string, options: QuickIngestOptions = {}): Promise<{
+    projectId: string;
+    filesByType: Record<string, number>;
+    totalFiles: number;
+    estimatedNodes: number;
+    estimatedTimeMinutes: number;
+    logPath: string;
+    message: string;
+  }> {
+    const absolutePath = path.resolve(dirPath);
+    const { glob } = await import('glob');
+
+    if (!this.ingestionManager) {
+      throw new Error('Brain not initialized. Call initialize() first.');
+    }
+
+    // Check if this path is inside an existing project - if so, use parent
+    let projectId: string | null = null;
+    const allProjects = await this.listProjectsFromDb();
+    for (const existingProject of allProjects) {
+      if (existingProject.path && absolutePath.startsWith(existingProject.path + path.sep)) {
+        projectId = existingProject.id;
+        console.log(`[QuickIngestAsync] Path is inside existing project ${existingProject.id}, using parent`);
+        break;
+      }
+    }
+
+    // If no parent found, generate new project ID
+    if (!projectId) {
+      projectId = ProjectRegistry.generateId(absolutePath);
+    }
+
+    const displayName = options.projectName;
+
+    // Use provided patterns or defaults
+    const includePatterns = options.include || DEFAULT_INCLUDE_PATTERNS;
+    const excludePatterns = options.exclude || DEFAULT_EXCLUDE_PATTERNS;
+
+    // Scan files and count by type
+    const filesByType: Record<string, number> = {};
+    let totalFiles = 0;
+
+    for (const pattern of includePatterns) {
+      const fullPattern = path.join(absolutePath, pattern);
+      try {
+        const files = await glob(fullPattern, {
+          ignore: excludePatterns.map(p => path.join(absolutePath, p)),
+          nodir: true,
+        });
+
+        for (const file of files) {
+          const ext = path.extname(file).toLowerCase() || 'no-ext';
+          filesByType[ext] = (filesByType[ext] || 0) + 1;
+          totalFiles++;
+        }
+      } catch {
+        // Pattern might not match anything
+      }
+    }
+
+    // Estimate nodes and time
+    // Rough estimates: code files ~5-10 nodes each, markdown ~3-5, other ~1-2
+    let estimatedNodes = 0;
+    for (const [ext, count] of Object.entries(filesByType)) {
+      if (['.ts', '.tsx', '.js', '.jsx', '.py', '.vue', '.svelte'].includes(ext)) {
+        estimatedNodes += count * 7; // Code files: functions, classes, etc.
+      } else if (['.md', '.mdx'].includes(ext)) {
+        estimatedNodes += count * 4; // Markdown: sections
+      } else {
+        estimatedNodes += count * 1.5; // Other files
+      }
+    }
+    estimatedNodes = Math.round(estimatedNodes);
+
+    // Estimate time: ~100 files/minute for parsing, ~50 nodes/minute for embeddings
+    const parsingMinutes = totalFiles / 100;
+    const embeddingMinutes = estimatedNodes / 50;
+    const estimatedTimeMinutes = Math.ceil(parsingMinutes + embeddingMinutes);
+
+    // Register project
+    const finalProjectId = await this.registerProject(absolutePath, 'quick-ingest', displayName);
+
+    // Migrate orphans
+    await this.migrateOrphansToProject(finalProjectId, absolutePath);
+
+    // Start watcher (fire and forget - don't wait for processing)
+    this.startWatching(absolutePath, {
+      projectId: finalProjectId,
+      includePatterns,
+      excludePatterns,
+      verbose: true,
+      skipInitialSync: false,
+    }).catch(err => {
+      console.error(`[QuickIngestAsync] Watcher error: ${err.message}`);
+    });
+
+    // Get log path
+    const projectName = path.basename(absolutePath);
+    const logPath = path.join(os.homedir(), '.ragforge', 'logs', projectName);
+
+    return {
+      projectId: finalProjectId,
+      filesByType,
+      totalFiles,
+      estimatedNodes,
+      estimatedTimeMinutes,
+      logPath,
+      message: `Ingestion started for ${totalFiles} files. Estimated ~${estimatedNodes} nodes, ~${estimatedTimeMinutes} min. Check logs at: ${logPath}`,
     };
   }
 
@@ -2945,8 +2984,8 @@ volumes:
 
     // Ensure project is registered (this creates the web-pages directory)
     const projectId = await this.registerWebProject(projectName);
-    const project = this.registeredProjects.get(projectId);
-    if (!project) {
+    const project = await this.getProjectFromDb(projectId);
+    if (!project || !project.path) {
       throw new Error(`Failed to register web project: ${projectId}`);
     }
 
@@ -3019,14 +3058,8 @@ volumes:
       }
     );
 
-    // Update project cache
-    const cachedProject = this.registeredProjects.get(projectId);
-    if (cachedProject) {
-      cachedProject.nodeCount = await this.countProjectNodes(projectId);
-      cachedProject.lastAccessed = new Date();
-      // Update lastAccessed in DB
-      await this.updateProjectMetadataInDb(projectId, { lastAccessed: cachedProject.lastAccessed });
-    }
+    // Update lastAccessed in DB
+    await this.updateProjectMetadataInDb(projectId, { lastAccessed: new Date() });
 
     // Generate embeddings if requested
     if (params.generateEmbeddings && this.embeddingService?.canGenerateEmbeddings()) {
@@ -3180,13 +3213,8 @@ volumes:
       }
     );
 
-    // Update project cache
-    const cachedProject = this.registeredProjects.get(projectId);
-    if (cachedProject) {
-      cachedProject.nodeCount = await this.countProjectNodes(projectId);
-      cachedProject.lastAccessed = new Date();
-      await this.updateProjectMetadataInDb(projectId, { lastAccessed: cachedProject.lastAccessed });
-    }
+    // Update lastAccessed in DB
+    await this.updateProjectMetadataInDb(projectId, { lastAccessed: new Date() });
 
     // Generate embeddings if requested
     // Note: We limit text for embeddings (8000 chars) but store full content in textContent
@@ -3281,13 +3309,8 @@ volumes:
       nodeProps
     );
 
-    // Update project cache
-    const cachedProject = this.registeredProjects.get(projectId);
-    if (cachedProject) {
-      cachedProject.nodeCount = await this.countProjectNodes(projectId);
-      cachedProject.lastAccessed = new Date();
-      await this.updateProjectMetadataInDb(projectId, { lastAccessed: cachedProject.lastAccessed });
-    }
+    // Update lastAccessed in DB
+    await this.updateProjectMetadataInDb(projectId, { lastAccessed: new Date() });
 
     console.log(`[Brain] Ingested media file: ${url} → project ${projectId} (${nodeLabel})`);
     return { success: true, nodeId, nodeType: nodeLabel };
@@ -3579,22 +3602,14 @@ volumes:
   private async registerWebProject(projectName: string): Promise<string> {
     const projectId = `web-${projectName.toLowerCase().replace(/\s+/g, '-')}`;
 
-    if (!this.registeredProjects.has(projectId)) {
+    // Check if project exists in DB
+    const existingProject = await this.getProjectFromDb(projectId);
+    if (!existingProject) {
       // Create a real directory for web pages: ~/.ragforge/web-pages/{projectId}
       const webPagesDir = path.join(this.config.path, 'web-pages', projectId);
       await fs.mkdir(webPagesDir, { recursive: true });
 
-      const registered: RegisteredProject = {
-        id: projectId,
-        path: webPagesDir, // Use real absolute path instead of virtual URI
-        type: 'web-crawl',
-        lastAccessed: new Date(),
-        nodeCount: 0,
-        autoCleanup: true,
-      };
-      this.registeredProjects.set(projectId, registered);
-      
-      // Create or update Project node in Neo4j with rootPath
+      // Create Project node in Neo4j with rootPath
       await this.neo4jClient!.run(
         `MERGE (p:Project {projectId: $projectId})
          SET p.rootPath = $rootPath,
@@ -3718,7 +3733,7 @@ volumes:
       const orphanResult = await this.neo4jClient.run(
         `MATCH (f:File {absolutePath: $filePath})
          WHERE f.projectId = $orphanProjectId
-         RETURN f.uuid as uuid, f.state as state`,
+         RETURN f.uuid as uuid, f._state as state`,
         { filePath, orphanProjectId: BrainManager.TOUCHED_FILES_PROJECT_ID }
       );
 
@@ -3985,7 +4000,7 @@ volumes:
     // Find the File node for this path
     const fileNodeResult = await this.neo4jClient.run(
       `MATCH (f:File {absolutePath: $filePath, projectId: $projectId})
-       RETURN f.uuid as fileUuid, f.state as state`,
+       RETURN f.uuid as fileUuid, f._state as state`,
       { filePath, projectId }
     );
 
@@ -4005,7 +4020,7 @@ volumes:
       if (currentState === 'discovered' || currentState === 'parsing' || currentState === 'mentioned') {
         await this.neo4jClient.run(
           `MATCH (f:File {uuid: $fileUuid})
-           SET f.state = 'linked', f.stateUpdatedAt = datetime()`,
+           SET f._state = 'linked', f._stateUpdatedAt = datetime()`,
           { fileUuid }
         );
         console.log(`[BrainManager] Updated File state to 'linked': ${fileName} (was: ${currentState})`);
@@ -4064,13 +4079,16 @@ volumes:
     let rawFilterClause = '';
     const rawFilterParams: Record<string, any> = {};
 
+    // Fetch all projects once for filtering and enrichment
+    const allProjects = await this.listProjectsFromDb();
+
     if (options.projects && options.projects.length > 0) {
       // Explicit project list - use exactly what was requested (ignores excluded flag)
       rawFilterClause = 'AND n.projectId IN $projectIds';
       rawFilterParams.projectIds = options.projects;
     } else {
       // No explicit list - exclude projects marked as excluded
-      const excludedProjectIds = Array.from(this.registeredProjects.values())
+      const excludedProjectIds = allProjects
         .filter(p => p.excluded)
         .map(p => p.id);
 
@@ -4116,14 +4134,21 @@ volumes:
       fuzzyDistance: options.fuzzyDistance,
       rrfK: options.rrfK,
       glob: options.glob,
+      labels: options.labels,
       rawFilterClause: rawFilterClause || undefined,
       rawFilterParams: Object.keys(rawFilterParams).length > 0 ? rawFilterParams : undefined,
     });
 
     // Map ServiceSearchResult to BrainSearchResult (enrich with project info)
+    // Build a map of projectId -> project for efficient lookup
+    const projectMap = new Map<string, RegisteredProject>();
+    for (const p of allProjects) {
+      projectMap.set(p.id, p);
+    }
+
     const results: BrainSearchResult[] = searchResult.results.map(r => {
       const projectId = r.node.projectId || 'unknown';
-      const project = this.registeredProjects.get(projectId);
+      const project = projectMap.get(projectId);
       const filePath = r.filePath || r.node.absolutePath || r.node.file || '';
 
       return {
@@ -4142,7 +4167,7 @@ volumes:
     // Build list of actually searched projects
     const searchedProjects = options.projects
       ? options.projects
-      : Array.from(this.registeredProjects.values())
+      : allProjects
           .filter(p => !p.excluded)
           .map(p => p.id);
 
@@ -4161,22 +4186,109 @@ volumes:
   // ============================================
 
   /**
-   * Forget a path (remove from brain)
+   * Batch delete all nodes for a project (handles large projects without timeout)
+   * Deletes in chunks of batchSize to avoid Neo4j transaction timeouts.
+   * @returns Total number of nodes deleted
    */
-  async forgetPath(projectPath: string): Promise<void> {
-    const project = this.findProjectByPath(projectPath);
-    if (!project) return;
-
-    // Delete nodes from Neo4j
-    if (this.neo4jClient) {
-      await this.neo4jClient.run(
-        `MATCH (n) WHERE n.projectId = $projectId DETACH DELETE n`,
-        { projectId: project.id }
-      );
+  async batchDeleteByProjectId(projectId: string, batchSize: number = 2000): Promise<number> {
+    if (!this.neo4jClient) {
+      return 0;
     }
 
-    // Remove from cache (Project node was deleted with other nodes above)
-    this.registeredProjects.delete(project.id);
+    let totalDeleted = 0;
+    let deletedThisBatch = 0;
+
+    do {
+      const result = await this.neo4jClient.run(
+        `MATCH (n) WHERE n.projectId = $projectId
+         WITH n LIMIT $batchSize
+         DETACH DELETE n
+         RETURN count(*) as deleted`,
+        { projectId, batchSize: neo4j.int(batchSize) }
+      );
+
+      const deletedValue = result.records[0]?.get('deleted');
+      deletedThisBatch = deletedValue?.toNumber?.() ?? (typeof deletedValue === 'number' ? deletedValue : 0);
+      totalDeleted += deletedThisBatch;
+
+      if (deletedThisBatch > 0) {
+        console.log(`[Brain] Batch deleted ${deletedThisBatch} nodes (total: ${totalDeleted})`);
+      }
+    } while (deletedThisBatch >= batchSize);
+
+    return totalDeleted;
+  }
+
+  /**
+   * Cleanup a project by ID - core cleanup logic used by forgetPath and cleanup_brain tool.
+   * Stops watcher, stops ProcessingLoop, batch deletes all nodes, deletes Project node.
+   * Returns details of what was cleaned up.
+   */
+  async cleanupProject(projectId: string): Promise<{
+    watcherStopped: boolean;
+    processingLoopStopped: boolean;
+    nodesDeleted: number;
+    projectNodeDeleted: boolean;
+  }> {
+    const result = {
+      watcherStopped: false,
+      processingLoopStopped: false,
+      nodesDeleted: 0,
+      projectNodeDeleted: false,
+    };
+
+    // Stop watcher if active (directly by projectId)
+    const watcher = this.activeWatchers.get(projectId);
+    if (watcher) {
+      await watcher.stop();
+      this.activeWatchers.delete(projectId);
+      result.watcherStopped = true;
+    }
+
+    // Stop ProcessingLoop and wait for current processing to complete (max 30s)
+    const loop = this._processingLoops.get(projectId);
+    if (loop) {
+      console.log(`[Brain] Stopping ProcessingLoop for ${projectId}, waiting for current processing...`);
+      await loop.stop();  // Wait for in-flight operations to complete
+      this._processingLoops.delete(projectId);
+      result.processingLoopStopped = true;
+      console.log(`[Brain] ProcessingLoop stopped for ${projectId}`);
+    }
+
+    // Also remove the UnifiedProcessor
+    if (this._unifiedProcessors.has(projectId)) {
+      this._unifiedProcessors.delete(projectId);
+    }
+
+    // Delete all nodes with this projectId in batches
+    result.nodesDeleted = await this.batchDeleteByProjectId(projectId);
+
+    // Delete the Project node itself
+    if (this.neo4jClient) {
+      try {
+        const projectResult = await this.neo4jClient.run(
+          'MATCH (p:Project {projectId: $projectId}) DETACH DELETE p RETURN count(p) as deleted',
+          { projectId }
+        );
+        const deleted = projectResult.records[0]?.get('deleted');
+        result.projectNodeDeleted = (deleted?.toNumber?.() ?? deleted ?? 0) > 0;
+      } catch {
+        // Ignore errors
+      }
+    }
+
+    console.log(`[Brain] Cleaned up project ${projectId}: ${result.nodesDeleted} nodes deleted`);
+    return result;
+  }
+
+  /**
+   * Forget a path (remove from brain) - wrapper around cleanupProject
+   */
+  async forgetPath(projectPath: string): Promise<void> {
+    const project = await this.findProjectByPath(projectPath);
+    if (!project) return;
+
+    await this.cleanupProject(project.id);
 
     // Remove .ragforge/brain-link.yaml if exists
     try {
@@ -4317,11 +4429,24 @@ volumes:
     `);
     stats.orphanedNodesRemoved = orphanResult.records[0]?.get('deleted')?.toNumber() || 0;
 
+    // Remove orphaned EmbeddingChunks (chunks whose parent no longer exists)
+    const orphanChunkResult = await this.neo4jClient.run(`
+      MATCH (chunk:EmbeddingChunk)
+      WHERE NOT EXISTS {
+        MATCH (parent {uuid: chunk.parentUuid})
+      }
+      DETACH DELETE chunk
+      RETURN count(chunk) as deleted
+    `);
+    const orphanChunksDeleted = orphanChunkResult.records[0]?.get('deleted')?.toNumber() || 0;
+    stats.orphanedNodesRemoved += orphanChunksDeleted;
+
     // Remove stale quick-ingest projects
     const now = Date.now();
     const quickIngestRetentionMs = this.config.cleanup.quickIngestRetention * 24 * 60 * 60 * 1000;
 
-    for (const project of this.registeredProjects.values()) {
+    const allProjects = await this.listProjectsFromDb();
+    for (const project of allProjects) {
       if (project.autoCleanup && project.type === 'quick-ingest') {
         const age = now - project.lastAccessed.getTime();
         if (age > quickIngestRetentionMs) {
@@ -4498,7 +4623,22 @@ volumes:
    * Build the embedding provider configuration based on brain config
    */
   private buildEmbeddingProviderConfig(): EmbeddingProviderConfig | undefined {
-    const provider = this.config.embeddings?.provider || 'gemini';
+    const provider = this.config.embeddings?.provider || 'tei';
+
+    if (provider === 'tei') {
+      // TEI doesn't require an API key
+      const teiConfig = this.config.embeddings?.tei || {};
+      return {
+        provider: 'tei',
+        model: this.config.embeddings?.model,
+        options: {
+          baseUrl: teiConfig.baseUrl || 'http://localhost:8081',
+          batchSize: teiConfig.batchSize,
+          concurrency: teiConfig.concurrency,
+          timeout: teiConfig.timeout,
+        },
+      };
+    }
 
     if (provider === 'ollama') {
       // Ollama doesn't require an API key
@@ -4514,7 +4654,7 @@ volumes:
       };
     }
 
-    // Gemini (default)
+    // Gemini (fallback)
     const geminiKey = this.config.apiKeys?.gemini || process.env.GEMINI_API_KEY;
     if (!geminiKey) {
       return undefined; // No API key, can't generate embeddings
@@ -4528,11 +4668,11 @@ volumes:
 
   /**
    * Switch the embedding provider at runtime
-   * @param provider - 'gemini' or 'ollama'
+   * @param provider - 'gemini', 'ollama', or 'tei'
    * @param config - Optional provider-specific configuration
    */
   async switchEmbeddingProvider(
-    provider: 'gemini' | 'ollama',
+    provider: 'gemini' | 'ollama' | 'tei',
     config?: { model?: string; baseUrl?: string }
   ): Promise<{ success: boolean; error?: string }> {
     try {
@@ -4549,6 +4689,19 @@ volumes:
         }
         this.embeddingService?.setProvider(ollamaProvider);
         console.log(`[Brain] Switched to Ollama provider (${ollamaProvider.getModelName()})`);
+        return { success: true };
+      } else if (provider === 'tei') {
+        const { TEIEmbeddingProvider } = await import('../runtime/embedding/tei-embedding-provider.js');
+        const teiProvider = new TEIEmbeddingProvider({
+          baseUrl: config?.baseUrl || 'http://localhost:8081',
+        });
+        // Check if TEI is running
+        const health = await teiProvider.checkHealth();
+        if (!health.ok) {
+          return { success: false, error: health.error };
+        }
+        this.embeddingService?.setProvider(teiProvider);
+        console.log(`[Brain] Switched to TEI provider (${teiProvider.getModelName()})`);
         return { success: true };
       } else {
         const geminiKey = this.config.apiKeys?.gemini || process.env.GEMINI_API_KEY;
@@ -4694,18 +4847,14 @@ volumes:
 
     // Check if already watching this exact project
     if (this.activeWatchers.has(projectId)) {
-      console.log(`[Brain] Already watching project: ${projectId}`);
       // Get existing watcher and queue the directory for processing
       const existingWatcher = this.activeWatchers.get(projectId)!;
-      console.log(`[Brain] Queuing directory ${absolutePath} for processing on existing watcher`);
       await existingWatcher.queueDirectory(absolutePath);
       // Trigger ProcessingLoop to process the newly discovered files
       const loop = this._processingLoops.get(projectId);
       if (loop) {
-        console.log(`[Brain] Triggering ProcessingLoop for ${projectId}`);
         loop.triggerProcessing();
       } else {
-        console.log(`[Brain] No ProcessingLoop found for ${projectId}, starting one`);
         await this.startProcessingLoop(projectId, existingWatcher.getRoot());
       }
       return;
@@ -4716,17 +4865,13 @@ volumes:
     for (const [watcherId, watcher] of this.activeWatchers) {
       const watcherRoot = watcher.getRoot();
       if (absolutePath.startsWith(watcherRoot + path.sep)) {
-        console.log(`[Brain] Path ${absolutePath} is inside already-watched project ${watcherId}`);
-        console.log(`[Brain] Queuing subdirectory for sync on parent watcher`);
         // Queue the subdirectory for sync on the existing watcher
         await watcher.queueDirectory(absolutePath);
         // Trigger ProcessingLoop to process the newly discovered files
         const loop = this._processingLoops.get(watcherId);
         if (loop) {
-          console.log(`[Brain] Triggering ProcessingLoop for parent ${watcherId}`);
           loop.triggerProcessing();
         } else {
-          console.log(`[Brain] No ProcessingLoop found for ${watcherId}, starting one`);
           await this.startProcessingLoop(watcherId, watcherRoot);
         }
         return;
@@ -4832,6 +4977,9 @@ volumes:
 
     await watcher.stop();
     this.activeWatchers.delete(projectId);
+
+    // Also stop the ProcessingLoop to prevent zombie state
+    await this.stopProcessingLoop(projectId);
 
     console.log(`[Brain] Stopped watching project: ${projectId}`);
   }
@@ -4991,13 +5139,17 @@ volumes:
     // Group by project
     const byProject = new Map<string, { projectRoot: string; changes: typeof changes }>();
 
+    // Fetch all projects once for matching
+    const allProjects = await this.listProjectsFromDb();
+
     for (const change of changes) {
       let projectId: string | null = null;
       let projectRoot: string | null = null;
 
-      for (const [id, project] of this.registeredProjects) {
+      // Find the project that contains this file
+      for (const project of allProjects) {
         if (change.path.startsWith(project.path)) {
-          projectId = id;
+          projectId = project.id;
           projectRoot = project.path;
           break;
         }

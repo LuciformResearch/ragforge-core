@@ -207,7 +207,7 @@ export class IncrementalIngestionManager {
       `MATCH (f:File)
        WHERE f.uuid IN $uuids
        RETURN f.uuid AS uuid, f.absolutePath AS absolutePath, f.name AS name,
-              f.extension AS extension, f.hash AS hash, f.state AS state`,
+              f.extension AS extension, f.hash AS hash, f._state AS state`,
       { uuids }
     );
 
@@ -1345,9 +1345,9 @@ export class IncrementalIngestionManager {
 
         for (const [, entries] of watcherEmbeddingCapture) {
           for (const entry of entries) {
-            if (entry.nameHash || entry.contentHash || entry.descHash ||
-                entry.embeddingName || entry.embeddingContent || entry.embeddingDescription ||
-                entry.embeddingProvider || entry.embeddingModel) {
+            // Only restore if there's at least one hash - if hashes are null but vectors exist,
+            // it means mark_file_dirty intentionally cleared hashes to force re-embedding
+            if (entry.nameHash || entry.contentHash || entry.descHash) {
               embeddingUpdates.push({
                 uuid: entry.uuid,
                 nameHash: entry.nameHash || null,
@@ -1737,8 +1737,9 @@ export class IncrementalIngestionManager {
         for (const [, entries] of existingUUIDMapping) {
           for (const entry of entries) {
             const e = entry as any; // Access additional embedding properties
-            // Only restore if there's at least one embedding, hash, or provider info
-            if (e.nameHash || e.contentHash || e.descHash || e.embeddingName || e.embeddingContent || e.embeddingDescription || e.embeddingProvider || e.embeddingModel) {
+            // Only restore if there's at least one hash - if hashes are null but vectors exist,
+            // it means mark_file_dirty intentionally cleared hashes to force re-embedding
+            if (e.nameHash || e.contentHash || e.descHash) {
               embeddingUpdates.push({
                 uuid: e.uuid,
                 nameHash: e.nameHash || null,

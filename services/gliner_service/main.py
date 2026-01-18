@@ -17,8 +17,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import settings, DOMAIN_PRESETS, reload_config, get_available_domains
-from .models import (
+from config import settings, DOMAIN_PRESETS, SKIP_EMBEDDING_TYPES, reload_config, get_available_domains
+from models import (
     ExtractionRequest,
     BatchExtractionRequest,
     ExtractionResult,
@@ -26,7 +26,7 @@ from .models import (
     HealthResponse,
     ConfigResponse,
 )
-from .extractor import get_extractor, GLiNERExtractor
+from extractor import get_extractor, GLiNERExtractor
 
 # Configure logging with file output
 LOG_DIR = Path.home() / ".ragforge" / "logs" / "gliner-service"
@@ -96,7 +96,7 @@ async def health_check():
     """Check service health and model status."""
     try:
         extractor = get_extractor()
-        model_loaded = extractor._model is not None
+        model_loaded = extractor.is_loaded()
         return HealthResponse(
             status="ok",
             model_loaded=model_loaded,
@@ -112,6 +112,54 @@ async def health_check():
         )
 
 
+@app.post("/model/unload")
+async def unload_model():
+    """
+    Unload the model from GPU to free VRAM.
+
+    Use this before running Ollama embeddings to free up GPU memory.
+    The model will be automatically reloaded on the next extraction request.
+    """
+    try:
+        extractor = get_extractor()
+        was_loaded = extractor.unload()
+        return {
+            "status": "ok",
+            "was_loaded": was_loaded,
+            "message": "Model unloaded, GPU memory freed" if was_loaded else "Model was already unloaded",
+        }
+    except Exception as e:
+        logger.error(f"Model unload failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/model/load")
+async def load_model():
+    """
+    Preload the model into GPU.
+
+    Use this after Ollama embeddings are done to prepare for entity extraction.
+    """
+    try:
+        extractor = get_extractor()
+        if extractor.is_loaded():
+            return {
+                "status": "ok",
+                "was_loaded": True,
+                "message": "Model was already loaded",
+            }
+        # Access model property to trigger lazy loading
+        _ = extractor.model
+        return {
+            "status": "ok",
+            "was_loaded": False,
+            "message": f"Model loaded on {settings.device}",
+        }
+    except Exception as e:
+        logger.error(f"Model load failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/config", response_model=ConfigResponse)
 async def get_config():
     """Get current service configuration."""
@@ -121,6 +169,7 @@ async def get_config():
         model_name=settings.model_name,
         batch_size=settings.default_batch_size,
         device=settings.device,
+        skip_embedding_types=SKIP_EMBEDDING_TYPES,
     )
 
 
@@ -318,6 +367,41 @@ async def classify_domains(
         }
     except Exception as e:
         logger.error(f"Classification failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/classify/batch")
+async def classify_domains_batch(
+    texts: list[str],
+    threshold: float = 0.3,
+    batch_size: int = 64,
+):
+    """
+    Batch classify texts into domains using multi-label classification.
+
+    More efficient than calling /classify multiple times.
+    Returns a list of domain classifications, one per input text.
+    """
+    import time
+    start_time = time.time()
+
+    try:
+        extractor = get_extractor()
+        classifications = extractor.classify_domains_batch(
+            texts=texts,
+            threshold=threshold,
+            batch_size=batch_size,
+        )
+
+        total_time = (time.time() - start_time) * 1000
+        return {
+            "classifications": classifications,
+            "total_processing_time_ms": total_time,
+            "texts_processed": len(texts),
+            "threshold": threshold,
+        }
+    except Exception as e:
+        logger.error(f"Batch classification failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

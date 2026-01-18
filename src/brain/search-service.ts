@@ -85,11 +85,35 @@ export interface SearchOptions {
   /** Parameters for rawFilterClause */
   rawFilterParams?: Record<string, any>;
 
+  // Label filtering
+  /**
+   * Neo4j labels to search (e.g., ['Scope', 'MarkdownSection']).
+   * Default: all labels with embeddings.
+   * Use ['Scope'] to search only code nodes.
+   */
+  labels?: string[];
+
   // Post-processing
   /** Glob pattern to filter results by file path */
   glob?: string;
   /** Regex patterns to exclude from results (applied to file path) */
   excludePatterns?: string[];
+
+  // Class boosting
+  /**
+   * Boost classes in results to surface them higher.
+   * Only applies to classes with score >= classBoostThreshold.
+   * Default: true
+   */
+  boostClasses?: boolean;
+  /**
+   * Minimum score for a class to receive boost (default: 0.7)
+   */
+  classBoostThreshold?: number;
+  /**
+   * Multiplier to apply to class scores (default: 1.1)
+   */
+  classBoostMultiplier?: number;
 }
 
 /**
@@ -258,6 +282,7 @@ export class SearchService {
         limit,
         minScore: minScore ?? 0.3,
         rrfK: options.rrfK ?? 60,
+        labels: options.labels,
       });
     } else if (options.semantic && this.canDoSemanticSearch()) {
       // Semantic search only
@@ -267,6 +292,7 @@ export class SearchService {
         params,
         limit,
         minScore: minScore ?? 0.3,
+        labels: options.labels,
       });
     } else {
       // Full-text BM25 search
@@ -276,6 +302,7 @@ export class SearchService {
         limit,
         minScore,
         fuzzyDistance: options.fuzzyDistance ?? 1,
+        labels: options.labels,
       });
     }
 
@@ -287,6 +314,24 @@ export class SearchService {
     // Apply minScore filter for post-processing
     if (minScore !== undefined) {
       results = results.filter(r => r.score >= minScore);
+    }
+
+    // Apply class boosting if enabled (default: true)
+    // Boosts classes with score >= threshold to surface them higher in results
+    const boostClasses = options.boostClasses ?? true;
+    if (boostClasses) {
+      const threshold = options.classBoostThreshold ?? 0.7;
+      const multiplier = options.classBoostMultiplier ?? 1.1;
+
+      for (const result of results) {
+        const nodeType = result.node.type;
+        if (nodeType === 'class' && result.score >= threshold) {
+          result.score = result.score * multiplier;
+        }
+      }
+
+      // Re-sort by score after boosting
+      results.sort((a, b) => b.score - a.score);
     }
 
     return {
@@ -540,6 +585,7 @@ export class SearchService {
       params: Record<string, any>;
       limit: number;
       minScore: number;
+      labels?: string[];
     }
   ): Promise<ServiceSearchResult[]> {
     const { embeddingType, filterClause, params, limit, minScore } = options;
@@ -593,6 +639,31 @@ export class SearchService {
       labelEmbeddingMap.set('EmbeddingChunk', new Set(['embedding_content']));
     }
 
+    // Filter labels if specified (e.g., only search Scope nodes)
+    // Track allowed parent labels for EmbeddingChunk filtering
+    let embeddingChunkParentLabels: string[] | null = null;
+    if (options.labels && options.labels.length > 0) {
+      const allowedLabels = new Set(options.labels);
+
+      // For EmbeddingChunk, we need to filter by parentLabel
+      // Keep EmbeddingChunk in the map but track which parent labels are allowed
+      if (labelEmbeddingMap.has('EmbeddingChunk')) {
+        embeddingChunkParentLabels = options.labels.filter(l => l !== 'EmbeddingChunk');
+        // Only keep EmbeddingChunk if there are parent labels to filter by
+        if (embeddingChunkParentLabels.length === 0) {
+          labelEmbeddingMap.delete('EmbeddingChunk');
+        }
+      }
+
+      for (const label of labelEmbeddingMap.keys()) {
+        // Don't filter out EmbeddingChunk here - we handle it separately
+        if (label === 'EmbeddingChunk') continue;
+        if (!allowedLabels.has(label)) {
+          labelEmbeddingMap.delete(label);
+        }
+      }
+    }
+
     // Build search tasks
     const searchTasks: Array<{ label: string; embeddingProp: string; indexName: string }> = [];
     for (const embeddingProp of embeddingProps) {
@@ -608,11 +679,20 @@ export class SearchService {
     const searchPromises = searchTasks.map(async ({ label, embeddingProp, indexName }) => {
       const results: Array<{ rawNode: any; score: number; label: string }> = [];
 
+      // Build label-specific filter clause
+      // For EmbeddingChunk, add parentLabel filter if labels were specified
+      let labelFilterClause = filterClause;
+      const queryParams = { ...params };
+      if (label === 'EmbeddingChunk' && embeddingChunkParentLabels && embeddingChunkParentLabels.length > 0) {
+        labelFilterClause += ' AND n.parentLabel IN $embeddingChunkParentLabels';
+        queryParams.embeddingChunkParentLabels = embeddingChunkParentLabels;
+      }
+
       try {
         const cypher = `
           CALL db.index.vector.queryNodes($indexName, $requestTopK, $queryEmbedding)
           YIELD node AS n, score
-          WHERE score >= $minScore ${filterClause}
+          WHERE score >= $minScore ${labelFilterClause}
           RETURN n, score
           ORDER BY score DESC
           LIMIT $limit
@@ -623,7 +703,7 @@ export class SearchService {
           requestTopK: neo4j.int(requestTopK),
           queryEmbedding,
           minScore,
-          ...params,
+          ...queryParams,
           limit: neo4j.int(limit),
         });
 
@@ -641,12 +721,12 @@ export class SearchService {
           try {
             const fallbackCypher = `
               MATCH (n:\`${label}\`)
-              WHERE n.\`${embeddingProp}\` IS NOT NULL ${filterClause}
+              WHERE n.\`${embeddingProp}\` IS NOT NULL ${labelFilterClause}
               RETURN n
               LIMIT 500
             `;
 
-            const fallbackResult = await this.neo4jClient.run(fallbackCypher, params);
+            const fallbackResult = await this.neo4jClient.run(fallbackCypher, queryParams);
 
             for (const record of fallbackResult.records) {
               const node = record.get('n');
@@ -822,9 +902,10 @@ export class SearchService {
       limit: number;
       minScore?: number;
       fuzzyDistance?: 0 | 1 | 2;
+      labels?: string[];
     }
   ): Promise<ServiceSearchResult[]> {
-    const { filterClause, params, limit, minScore, fuzzyDistance = 1 } = options;
+    const { filterClause, params, limit, minScore, fuzzyDistance = 1, labels } = options;
 
     // Escape Lucene special characters
     const escapedQuery = query.replace(/[+\-&|!(){}[\]^"~*?:\\/]/g, '\\$&');
@@ -837,11 +918,17 @@ export class SearchService {
       `(_name:${w}${fuzzy}^3 OR _description:${w}${fuzzy}^2 OR _content:${w}${fuzzy})`
     ).join(' AND ');
 
+    // Build label filter clause if labels specified
+    // Use ANY() to check if any of the node's labels are in the allowed list
+    const labelFilterClause = labels && labels.length > 0
+      ? ' AND ANY(lbl IN labels(n) WHERE lbl IN $allowedLabels)'
+      : '';
+
     // Single query on unified fulltext index
     const cypher = `
       CALL db.index.fulltext.queryNodes('unified_fulltext', $luceneQuery)
       YIELD node AS n, score
-      WHERE true ${filterClause}
+      WHERE true ${filterClause}${labelFilterClause}
       RETURN n, score
       ORDER BY score DESC
       LIMIT $limit
@@ -851,6 +938,7 @@ export class SearchService {
       const result = await this.neo4jClient.run(cypher, {
         luceneQuery,
         ...params,
+        ...(labels && labels.length > 0 ? { allowedLabels: labels } : {}),
         limit: neo4j.int(limit),
       });
 
@@ -895,9 +983,10 @@ export class SearchService {
       limit: number;
       minScore: number;
       rrfK: number;
+      labels?: string[];
     }
   ): Promise<ServiceSearchResult[]> {
-    const { embeddingType, filterClause, params, limit, minScore, rrfK } = options;
+    const { embeddingType, filterClause, params, limit, minScore, rrfK, labels } = options;
 
     // Fetch more candidates for better fusion
     const candidateLimit = Math.min(limit * 3, 150);
@@ -909,12 +998,14 @@ export class SearchService {
         params,
         limit: candidateLimit,
         minScore: Math.max(minScore * 0.5, 0.1),
+        labels,
       }),
       this.fullTextSearch(query, {
         filterClause,
         params,
         limit: candidateLimit,
         minScore: undefined,
+        labels,
       }),
     ]);
 

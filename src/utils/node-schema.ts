@@ -597,135 +597,184 @@ export interface NodeFieldMapping {
 export const FIELD_MAPPING: Record<string, NodeFieldMapping> = {
   // === CODE ===
   Scope: {
-    title: (n) => n.signature || n.name || null,
-    content: (n) => n.source || null,
-    description: (n) => n.docstring || null,
+    title: (n) => n._name || n.signature || n.name || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
     location: (n) => n.absolutePath || n.file || null,
   },
 
   File: {
-    title: (n) => n.name || n.path || null,
-    content: (n) => n.source || null,
-    description: (n) => null, // Would duplicate title
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.name || n.path || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   CodeBlock: {
-    title: (n) => n.language ? `${n.language} code block` : 'code block',
-    content: (n) => n.code || null,
-    description: (n) => null, // Language already in title
+    title: (n) => n._name || (n.language ? `${n.language} code block` : 'code block'),
+    content: (n) => n._content || n.code || null,
+    description: (n) => n._description || null,
     location: (n) => n.absolutePath || n.file || null,
   },
 
   // === MARKDOWN ===
   MarkdownDocument: {
-    title: (n) => n.title || n.file || null,
-    content: (n) => null, // No distinct content for document node
-    description: (n) => n.frontMatter || null,
+    title: (n) => n._name || n.title || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
     location: (n) => n.absolutePath || n.file || null,
   },
 
   MarkdownSection: {
-    title: (n) => n.title || null,
-    content: (n) => n.ownContent || n.content || null,
-    description: (n) => null, // rawText would duplicate content
+    title: (n) => n._name || n.title || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
     location: (n) => n.absolutePath || n.file || null,
   },
 
   // === WEB ===
   WebPage: {
-    title: (n) => n.title || null,
-    content: (n) => n.textContent || null,
-    description: (n) => n.metaDescription || n.description || null,
+    title: (n) => n._name || n.title || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
     location: (n) => n.url || null,
   },
 
   // === MEDIA ===
   MediaFile: {
-    title: (n) => n.file || null,
-    content: (n) => n.textContent || n.ocrText || null,
-    description: (n) => n.description || null, // AI visual description
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   ImageFile: {
-    title: (n) => n.file || null,
-    content: (n) => n.textContent || n.ocrText || null,
-    description: (n) => n.description || null,
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   ThreeDFile: {
-    title: (n) => n.file || null,
-    content: (n) => null, // No distinct content, only description
-    description: (n) => n.description || null,
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   // === DOCUMENTS ===
   DocumentFile: {
-    title: (n) => n.title || n.file || null,
-    content: (n) => n.textContent || n.extractedText || null,
-    description: (n) => null, // Title already used
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.title || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   PDFDocument: {
-    title: (n) => n.title || n.file || null,
-    content: (n) => n.textContent || n.extractedText || null,
-    description: (n) => null,
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.title || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   WordDocument: {
-    title: (n) => n.title || n.file || null,
-    content: (n) => n.textContent || n.extractedText || null,
-    description: (n) => null,
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.title || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   SpreadsheetDocument: {
-    title: (n) => n.file || null,
-    content: (n) => n.extractedText || null,
-    description: (n) => n.sheetNames || null,
-    location: (n) => n.path || null,
+    title: (n) => n._name || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || null,
   },
 
   // === DATA ===
   DataFile: {
-    title: (n) => n.file || n.path || null,
-    content: (n) => n.rawContent || n.preview || null,
-    description: (n) => n.structure || null,
-    location: (n) => n.path || n.file || null,
+    title: (n) => n._name || n.file || n.path || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.path || n.file || null,
+  },
+
+  DataSection: {
+    title: (n) => n._name || n.path || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   // === STRUCTURE ===
   Project: {
-    title: (n) => n.name || null,
-    content: (n) => null, // No content
-    description: (n) => n.gitRemote || null,
+    title: (n) => n._name || n.name || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || n.gitRemote || null,
     location: (n) => n.rootPath || null,
   },
 
   Directory: {
-    title: (n) => n.path || null,
-    content: (n) => null,
-    description: (n) => null,
+    title: (n) => n._name || n.path || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
     location: (n) => n.path || null,
   },
 
   ExternalLibrary: {
-    title: (n) => n.name || null,
-    content: (n) => null,
-    description: (n) => null,
-    location: (n) => null, // External, no path
+    title: (n) => n._name || n.name || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => null,
+  },
+
+  ExternalURL: {
+    title: (n) => n._name || n.url || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.url || null,
+  },
+
+  CSSVariable: {
+    title: (n) => n._name || n.name || null,
+    content: (n) => n._content || n.value || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   PackageJson: {
-    title: (n) => n.name || null,
-    content: (n) => null,
-    description: (n) => n.description || null,
-    location: (n) => n.file || null,
+    title: (n) => n._name || n.name || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.file || null,
+  },
+
+  Stylesheet: {
+    title: (n) => n._name || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || `CSS: ${n.ruleCount || 0} rules, ${n.selectorCount || 0} selectors`,
+    location: (n) => n.absolutePath || n.file || null,
+  },
+
+  WebDocument: {
+    title: (n) => n._name || n.title || n.componentName || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || n.type || 'HTML document',
+    location: (n) => n.absolutePath || n.file || null,
+  },
+
+  VueSFC: {
+    title: (n) => n._name || n.componentName || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.file || null,
+  },
+
+  SvelteComponent: {
+    title: (n) => n._name || n.componentName || n.file || null,
+    content: (n) => n._content || null,
+    description: (n) => n._description || null,
+    location: (n) => n.absolutePath || n.file || null,
   },
 
   // Entity extraction (GLiNER)
@@ -746,8 +795,8 @@ export function getNodeTitle(node: Record<string, any>, nodeType: string): strin
   if (mapping) {
     return mapping.title(node);
   }
-  // Fallback: try common fields
-  return node.signature || node.title || node.name || node.file || null;
+  // Fallback: normalized field first, then common fields
+  return node._name || node.signature || node.title || node.name || node.file || null;
 }
 
 /**

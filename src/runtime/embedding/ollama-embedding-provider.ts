@@ -167,4 +167,12 @@ export class OllamaEmbeddingProvider {
       };
     }
   }
+
+  /**
+   * Get embedding dimensions by generating a test embedding
+   */
+  async getDimensions(): Promise<number> {
+    const testEmbedding = await this.embedSingle('test');
+    return testEmbedding.length;
+  }
 }

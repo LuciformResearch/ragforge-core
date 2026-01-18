@@ -226,7 +226,7 @@ const scopeNodeType: NodeTypeDefinition = {
   label: 'Scope',
   description: 'Code scopes: functions, classes, methods, interfaces, variables, etc.',
   supportsLineNavigation: true,
-  uuidStrategy: { type: 'signature', fields: ['file', 'signature', 'startLine'] },
+  uuidStrategy: { type: 'signature', fields: ['file', 'signature'] },
   fields: scopeFieldExtractors,
   contentHashField: 'source',
   chunking: codeChunkingConfig,

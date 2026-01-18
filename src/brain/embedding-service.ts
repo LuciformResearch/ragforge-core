@@ -20,6 +20,7 @@ import neo4j from 'neo4j-driver';
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import { GeminiEmbeddingProvider, type EmbeddingProviderInterface } from '../runtime/embedding/embedding-provider.js';
 import { OllamaEmbeddingProvider } from '../runtime/embedding/ollama-embedding-provider.js';
+import { TEIEmbeddingProvider } from '../runtime/embedding/tei-embedding-provider.js';
 import { chunkText, needsChunking, type TextChunk } from '../runtime/embedding/text-chunker.js';
 import { getRecordEmbeddingExtractors } from '../utils/node-schema.js';
 import {
@@ -28,6 +29,7 @@ import {
   getRecordExtractors,
   areParsersRegistered,
 } from '../ingestion/index.js';
+import { DEFAULT_SKIP_EMBEDDING_TYPES } from '../ingestion/entity-extraction/client.js';
 
 /**
  * Threshold for chunking large content (in characters)
@@ -141,6 +143,8 @@ export interface GenerateMultiEmbeddingsOptions {
   batchSize?: number;
   /** Verbose logging (default: false) */
   verbose?: boolean;
+  /** Activity callback - called after each batch to signal liveness (for timeout reset) */
+  onActivity?: () => void;
 }
 
 /**
@@ -275,11 +279,13 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
     label: 'Scope',
     query: `MATCH (s:Scope {projectId: $projectId})
             RETURN s.uuid AS uuid, s._name AS _name, s._content AS _content, s._description AS _description,
+                   s.startLine AS startLine, s.endLine AS endLine,
                    s.embedding_name_hash AS embedding_name_hash,
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_description_hash AS embedding_description_hash,
                    s.embedding_provider AS embedding_provider,
                    s.embedding_model AS embedding_model,
+                   s.usesChunks AS usesChunks,
                    s.${P.state} AS _state
             ORDER BY s.file, s.startLine`,
     embeddings: buildEmbeddingConfigs('Scope', true),
@@ -317,6 +323,7 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    s.embedding_content_hash AS embedding_content_hash,
                    s.embedding_provider AS embedding_provider,
                    s.embedding_model AS embedding_model,
+                   s.usesChunks AS usesChunks,
                    s.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('MarkdownSection', false),
   },
@@ -359,8 +366,10 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'MediaFile',
     query: `MATCH (m:MediaFile {projectId: $projectId})
-            WHERE m._content IS NOT NULL OR m._description IS NOT NULL
-            RETURN m.uuid AS uuid, m._name AS _name, m._content AS _content, m._description AS _description,
+            RETURN m.uuid AS uuid,
+                   coalesce(m._name, m.file) AS _name,
+                   coalesce(m._content, 'Media file: ' + coalesce(m.file, 'unknown')) AS _content,
+                   m._description AS _description,
                    m.embedding_name_hash AS embedding_name_hash,
                    m.embedding_content_hash AS embedding_content_hash,
                    m.embedding_description_hash AS embedding_description_hash,
@@ -372,8 +381,10 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'ThreeDFile',
     query: `MATCH (t:ThreeDFile {projectId: $projectId})
-            WHERE t._content IS NOT NULL OR t._description IS NOT NULL
-            RETURN t.uuid AS uuid, t._name AS _name, t._content AS _content, t._description AS _description,
+            RETURN t.uuid AS uuid,
+                   coalesce(t._name, t.file) AS _name,
+                   coalesce(t._content, '3D model: ' + coalesce(t.file, 'unknown')) AS _content,
+                   t._description AS _description,
                    t.embedding_name_hash AS embedding_name_hash,
                    t.embedding_content_hash AS embedding_content_hash,
                    t.embedding_description_hash AS embedding_description_hash,
@@ -385,8 +396,10 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
   {
     label: 'DocumentFile',
     query: `MATCH (d:DocumentFile {projectId: $projectId})
-            WHERE d._content IS NOT NULL
-            RETURN d.uuid AS uuid, d._name AS _name, d._content AS _content, d._description AS _description,
+            RETURN d.uuid AS uuid,
+                   coalesce(d._name, d.file) AS _name,
+                   coalesce(d._content, 'Document: ' + coalesce(d.file, 'unknown')) AS _content,
+                   d._description AS _description,
                    d.embedding_name_hash AS embedding_name_hash,
                    d.embedding_content_hash AS embedding_content_hash,
                    d.embedding_description_hash AS embedding_description_hash,
@@ -395,12 +408,26 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    d.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('DocumentFile', true),
   },
+  // DataSection - sections within data files (JSON, YAML, etc.)
+  {
+    label: 'DataSection',
+    query: `MATCH (d:DataSection {projectId: $projectId})
+            RETURN d.uuid AS uuid, d._name AS _name, d._content AS _content,
+                   d.path AS path, d.key AS key, d.valueType AS valueType,
+                   d.embedding_name_hash AS embedding_name_hash,
+                   d.embedding_content_hash AS embedding_content_hash,
+                   d.embedding_provider AS embedding_provider,
+                   d.embedding_model AS embedding_model,
+                   d.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('DataSection', false),
+  },
   // Entity extraction (GLiNER)
   // Exclude numeric/value types from embeddings (prices, dates, quantities, etc.)
+  // List from entity-extraction.yaml via DEFAULT_SKIP_EMBEDDING_TYPES
   {
     label: 'Entity',
     query: `MATCH (e:Entity {projectId: $projectId})
-            WHERE NOT e.entityType IN ['price', 'date', 'quantity', 'amount', 'currency', 'size', 'duration']
+            WHERE NOT e.entityType IN [${DEFAULT_SKIP_EMBEDDING_TYPES.map(t => `'${t}'`).join(', ')}]
             RETURN e.uuid AS uuid, e._name AS _name, e._content AS _content,
                    e.entityType AS entityType, e.normalized AS normalized,
                    e.embedding_name_hash AS embedding_name_hash,
@@ -409,6 +436,153 @@ export const MULTI_EMBED_CONFIGS: MultiEmbedNodeTypeConfig[] = [
                    e.embedding_model AS embedding_model,
                    e.${P.state} AS _state`,
     embeddings: buildEmbeddingConfigs('Entity', false), // No separate description
+  },
+  // PackageJson - embed name and description
+  {
+    label: 'PackageJson',
+    query: `MATCH (p:PackageJson {projectId: $projectId})
+            RETURN p.uuid AS uuid, p.name AS _name, p.description AS _content,
+                   p.file AS file,
+                   p.embedding_name_hash AS embedding_name_hash,
+                   p.embedding_content_hash AS embedding_content_hash,
+                   p.embedding_provider AS embedding_provider,
+                   p.embedding_model AS embedding_model,
+                   p.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('PackageJson', false),
+  },
+  // Stylesheet - embed file path and metadata
+  {
+    label: 'Stylesheet',
+    query: `MATCH (s:Stylesheet {projectId: $projectId})
+            RETURN s.uuid AS uuid, s.file AS _name,
+                   'CSS: ' + toString(coalesce(s.ruleCount, 0)) + ' rules, ' +
+                   toString(coalesce(s.selectorCount, 0)) + ' selectors' AS _content,
+                   s.embedding_name_hash AS embedding_name_hash,
+                   s.embedding_content_hash AS embedding_content_hash,
+                   s.embedding_provider AS embedding_provider,
+                   s.embedding_model AS embedding_model,
+                   s.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('Stylesheet', false),
+  },
+  // WebDocument - embed file path and title
+  {
+    label: 'WebDocument',
+    query: `MATCH (w:WebDocument {projectId: $projectId})
+            RETURN w.uuid AS uuid,
+                   coalesce(w.title, w.componentName, w.file) AS _name,
+                   coalesce(w.type, 'HTML') + ' document' AS _content,
+                   w.embedding_name_hash AS embedding_name_hash,
+                   w.embedding_content_hash AS embedding_content_hash,
+                   w.embedding_provider AS embedding_provider,
+                   w.embedding_model AS embedding_model,
+                   w.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('WebDocument', false),
+  },
+  // ExternalLibrary - embed library name
+  {
+    label: 'ExternalLibrary',
+    query: `MATCH (l:ExternalLibrary {projectId: $projectId})
+            RETURN l.uuid AS uuid, l.name AS _name, l.name AS _content,
+                   l.embedding_name_hash AS embedding_name_hash,
+                   l.embedding_content_hash AS embedding_content_hash,
+                   l.embedding_provider AS embedding_provider,
+                   l.embedding_model AS embedding_model,
+                   l.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('ExternalLibrary', false),
+  },
+  // ImageFile - images with optional vision analysis
+  {
+    label: 'ImageFile',
+    query: `MATCH (i:ImageFile {projectId: $projectId})
+            RETURN i.uuid AS uuid,
+                   coalesce(i._name, i.file) AS _name,
+                   coalesce(i._description, 'Image: ' + coalesce(i.file, 'unknown')) AS _content,
+                   i._description AS _description,
+                   i.embedding_name_hash AS embedding_name_hash,
+                   i.embedding_content_hash AS embedding_content_hash,
+                   i.embedding_description_hash AS embedding_description_hash,
+                   i.embedding_provider AS embedding_provider,
+                   i.embedding_model AS embedding_model,
+                   i.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('ImageFile', true),
+  },
+  // VueSFC - Vue Single File Components
+  {
+    label: 'VueSFC',
+    query: `MATCH (v:VueSFC {projectId: $projectId})
+            RETURN v.uuid AS uuid,
+                   coalesce(v._name, v.componentName, v.file) AS _name,
+                   v._content AS _content,
+                   v._description AS _description,
+                   v.embedding_name_hash AS embedding_name_hash,
+                   v.embedding_content_hash AS embedding_content_hash,
+                   v.embedding_description_hash AS embedding_description_hash,
+                   v.embedding_provider AS embedding_provider,
+                   v.embedding_model AS embedding_model,
+                   v.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('VueSFC', true),
+  },
+  // SvelteComponent - Svelte components
+  {
+    label: 'SvelteComponent',
+    query: `MATCH (s:SvelteComponent {projectId: $projectId})
+            RETURN s.uuid AS uuid,
+                   coalesce(s._name, s.componentName, s.file) AS _name,
+                   s._content AS _content,
+                   s._description AS _description,
+                   s.embedding_name_hash AS embedding_name_hash,
+                   s.embedding_content_hash AS embedding_content_hash,
+                   s.embedding_description_hash AS embedding_description_hash,
+                   s.embedding_provider AS embedding_provider,
+                   s.embedding_model AS embedding_model,
+                   s.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('SvelteComponent', true),
+  },
+  // ExternalURL - embed l'URL pour recherche
+  {
+    label: 'ExternalURL',
+    query: `MATCH (u:ExternalURL {projectId: $projectId})
+            RETURN u.uuid AS uuid, u.url AS _name,
+                   u.embedding_name_hash AS embedding_name_hash,
+                   u.embedding_provider AS embedding_provider,
+                   u.embedding_model AS embedding_model,
+                   u.${P.state} AS _state`,
+    embeddings: [
+      {
+        propertyName: 'embedding_name',
+        hashProperty: 'embedding_name_hash',
+        textExtractor: (record: any) => record.get('_name') || '',
+      },
+    ],
+  },
+  // Directory - embed le chemin
+  {
+    label: 'Directory',
+    query: `MATCH (d:Directory {projectId: $projectId})
+            RETURN d.uuid AS uuid, d.path AS _name,
+                   d.embedding_name_hash AS embedding_name_hash,
+                   d.embedding_provider AS embedding_provider,
+                   d.embedding_model AS embedding_model,
+                   d.${P.state} AS _state`,
+    embeddings: [
+      {
+        propertyName: 'embedding_name',
+        hashProperty: 'embedding_name_hash',
+        textExtractor: (record: any) => record.get('_name') || '',
+      },
+    ],
+  },
+  // CSSVariable - embed nom + valeur
+  {
+    label: 'CSSVariable',
+    query: `MATCH (v:CSSVariable {projectId: $projectId})
+            RETURN v.uuid AS uuid, v.name AS _name, v.value AS _content,
+                   v.embedding_name_hash AS embedding_name_hash,
+                   v.embedding_content_hash AS embedding_content_hash,
+                   v.embedding_provider AS embedding_provider,
+                   v.embedding_model AS embedding_model,
+                   v.${P.state} AS _state`,
+    embeddings: buildEmbeddingConfigs('CSSVariable', false),
   },
 ];
 
@@ -488,9 +662,8 @@ export const DEFAULT_EMBED_CONFIGS: EmbedNodeTypeConfig[] = [
   {
     label: 'MediaFile',
     query: `MATCH (m:MediaFile {projectId: $projectId})
-            WHERE m.textContent IS NOT NULL OR m.description IS NOT NULL
             RETURN m.uuid AS uuid, m.path AS path,
-                   COALESCE(m.textContent, m.description) AS description,
+                   COALESCE(m.textContent, m.description, 'Media file') AS description,
                    m.embedding_hash AS embedding_hash
             LIMIT $limit`,
     textExtractor: (r) => {
@@ -503,9 +676,8 @@ export const DEFAULT_EMBED_CONFIGS: EmbedNodeTypeConfig[] = [
   {
     label: 'ThreeDFile',
     query: `MATCH (t:ThreeDFile {projectId: $projectId})
-            WHERE t.textContent IS NOT NULL OR t.description IS NOT NULL
             RETURN t.uuid AS uuid, t.path AS path,
-                   COALESCE(t.textContent, t.description) AS description,
+                   COALESCE(t.textContent, t.description, '3D model') AS description,
                    t.embedding_hash AS embedding_hash
             LIMIT $limit`,
     textExtractor: (r) => {
@@ -585,6 +757,13 @@ export class EmbeddingService {
           concurrency: configOrApiKey.options?.concurrency ?? configOrApiKey.options?.batchSize ?? 20,
           timeout: configOrApiKey.options?.timeout,
         });
+      } else if (provider === 'tei') {
+        this.embeddingProvider = new TEIEmbeddingProvider({
+          baseUrl: configOrApiKey.options?.baseUrl ?? 'http://localhost:8081',
+          batchSize: configOrApiKey.options?.batchSize,
+          concurrency: configOrApiKey.options?.concurrency,
+          timeout: configOrApiKey.options?.timeout,
+        });
       }
     }
   }
@@ -620,6 +799,16 @@ export class EmbeddingService {
       name: this.embeddingProvider.getProviderName(),
       model: this.embeddingProvider.getModelName(),
     };
+  }
+
+  /**
+   * Get the embedding dimension from the current provider.
+   * Returns null if no provider is configured.
+   * May generate a test embedding to determine dimension.
+   */
+  async getDimensions(): Promise<number | null> {
+    if (!this.embeddingProvider) return null;
+    return this.embeddingProvider.getDimensions();
   }
 
   /**
@@ -853,6 +1042,7 @@ export class EmbeddingService {
     const allTasks: EmbeddingTask[] = [];
     const nodesToMarkDone: NodeToMarkDone[] = [];
     const chunkedNodeUuids: Set<string> = new Set(); // Track nodes that use chunks
+    const nodesNeedingChunkCleanup: Map<string, string> = new Map(); // uuid -> label for nodes that had chunks but now have small content
     let totalNodes = 0;
     let skippedCount = 0;
     const embeddedByType = { name: 0, content: 0, description: 0 };
@@ -875,34 +1065,22 @@ export class EmbeddingService {
       allTasks.push(...collected.tasks);
       nodesToMarkDone.push(...collected.nodesToMarkDone);
       collected.chunkedNodeUuids.forEach(uuid => chunkedNodeUuids.add(uuid));
-    }
-
-    if (allTasks.length === 0) {
-      if (verbose) {
-        console.log(`[EmbeddingService] No tasks to process (all cached)`);
-      }
-      return {
-        totalNodes,
-        embeddedByType,
-        totalEmbedded: 0,
-        skippedCount,
-        durationMs: Date.now() - startTime,
-      };
-    }
-
-    if (verbose) {
-      console.log(`[EmbeddingService]   Collected ${allTasks.length} tasks (${allTasks.filter(t => t.type === 'small').length} small, ${allTasks.filter(t => t.type === 'chunk').length} chunks)`);
+      collected.nodesNeedingChunkCleanup.forEach((label, uuid) => nodesNeedingChunkCleanup.set(uuid, label));
     }
 
     // ========================================
-    // PHASE 2: Delete existing chunks for nodes that will be re-chunked
+    // PHASE 2: Delete existing chunks for nodes that will be re-chunked OR have small content now
+    // This MUST run before any early return to ensure chunks are cleaned up
     // ========================================
-    if (chunkedNodeUuids.size > 0) {
+    const needsChunkDeletion = chunkedNodeUuids.size > 0 || nodesNeedingChunkCleanup.size > 0;
+    if (needsChunkDeletion) {
       if (verbose) {
-        console.log(`[EmbeddingService] Phase 2: Deleting existing chunks for ${chunkedNodeUuids.size} nodes...`);
+        console.log(`[EmbeddingService] Phase 2: Deleting existing chunks for ${chunkedNodeUuids.size} re-chunked nodes + ${nodesNeedingChunkCleanup.size} now-small nodes...`);
       }
       // Group by label for efficient deletion
       const labelToUuids = new Map<string, string[]>();
+
+      // Add nodes that will be re-chunked
       for (const task of allTasks) {
         if (task.type === 'chunk' && task.parentUuid) {
           const label = task.label;
@@ -915,14 +1093,84 @@ export class EmbeddingService {
           }
         }
       }
+
+      // Add nodes that had chunks but now have small content
+      for (const [uuid, label] of nodesNeedingChunkCleanup) {
+        if (!labelToUuids.has(label)) {
+          labelToUuids.set(label, []);
+        }
+        const uuids = labelToUuids.get(label)!;
+        if (!uuids.includes(uuid)) {
+          uuids.push(uuid);
+        }
+      }
+
       for (const [label, uuids] of labelToUuids) {
-        await this.neo4jClient.run(
+        const deleteResult = await this.neo4jClient.run(
           `MATCH (n:${label})-[:HAS_EMBEDDING_CHUNK]->(c:EmbeddingChunk)
            WHERE n.uuid IN $uuids
-           DETACH DELETE c`,
+           DETACH DELETE c
+           RETURN count(c) as deleted`,
           { uuids }
         );
+        const deleted = deleteResult.records[0]?.get('deleted')?.toNumber?.() || 0;
+        if (deleted > 0) {
+          console.log(`[EmbeddingService] Deleted ${deleted} old chunks from ${uuids.length} ${label} nodes`);
+        }
+
+        // Also clear the usesChunks flag for nodes that now have small content
+        const cleanupUuids = uuids.filter(uuid => nodesNeedingChunkCleanup.has(uuid));
+        if (cleanupUuids.length > 0) {
+          await this.neo4jClient.run(
+            `MATCH (n:${label})
+             WHERE n.uuid IN $uuids
+             SET n.usesChunks = null, n.chunkCount = null`,
+            { uuids: cleanupUuids }
+          );
+        }
       }
+    }
+
+    if (allTasks.length === 0) {
+      console.log(`[EmbeddingService] No tasks to process (all cached). totalNodes=${totalNodes}, skippedCount=${skippedCount}, nodesToMarkDone=${nodesToMarkDone.length}`);
+
+      // Even with no tasks, we need to mark skipped nodes as 'ready'
+      // (they were in 'linked' state but already have valid embeddings)
+      if (nodesToMarkDone.length > 0) {
+        console.log(`[EmbeddingService] Marking ${nodesToMarkDone.length} cached nodes as ready...`);
+        for (const node of nodesToMarkDone.slice(0, 5)) {
+          console.log(`  -> ${node.label}: ${node.uuid.substring(0, 8)}...`);
+        }
+        const markDoneByLabel = new Map<string, NodeToMarkDone[]>();
+        for (const node of nodesToMarkDone) {
+          if (!markDoneByLabel.has(node.label)) {
+            markDoneByLabel.set(node.label, []);
+          }
+          markDoneByLabel.get(node.label)!.push(node);
+        }
+        for (const [label, nodes] of markDoneByLabel) {
+          await this.neo4jClient.run(
+            `UNWIND $uuids AS uuid
+             MATCH (n:${label} {uuid: uuid})
+             SET n.${P.state} = 'ready',
+                 n.${P.stateChangedAt} = datetime(),
+                 n.${P.embeddedAt} = datetime()`,
+            { uuids: nodes.map(n => n.uuid) }
+          );
+        }
+      }
+
+      return {
+        totalNodes,
+        embeddedByType,
+        totalEmbedded: 0,
+        skippedCount,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    if (verbose) {
+      console.log(`[EmbeddingService]   Collected ${allTasks.length} tasks (${allTasks.filter(t => t.type === 'small').length} small, ${allTasks.filter(t => t.type === 'chunk').length} chunks)`);
     }
 
     // ========================================
@@ -943,7 +1191,10 @@ export class EmbeddingService {
 
       // Generate embeddings for this batch
       const texts = batch.map(t => t.text);
+      const embedStartTime = Date.now();
       const embeddings = await this.embeddingProvider!.embed(texts);
+      const embedDuration = Date.now() - embedStartTime;
+      console.log(`[Embedding] ${this.embeddingProvider!.getProviderName()} took ${embedDuration}ms for ${texts.length} embeddings`);
 
       processedCount += batch.length;
 
@@ -978,6 +1229,8 @@ export class EmbeddingService {
       // Save small node embeddings
       const providerName = this.embeddingProvider!.getProviderName();
       const modelName = this.embeddingProvider!.getModelName();
+      const dbSaveStartTime = Date.now();
+      let dbSaveCount = 0;
 
       for (const [key, tasks] of smallTasksByKey) {
         const [label, embeddingProp] = key.split(':');
@@ -991,6 +1244,7 @@ export class EmbeddingService {
 
         const cypher = this.buildEmbeddingSaveCypher(embeddingProp, label);
         await this.neo4jClient.run(cypher, { batch: saveData });
+        dbSaveCount += tasks.length;
 
         // Count by type
         const embType = tasks[0].embeddingType;
@@ -1046,7 +1300,11 @@ export class EmbeddingService {
         );
 
         embeddedByType.content += tasks.length;
+        dbSaveCount += tasks.length;
       }
+
+      const dbSaveDuration = Date.now() - dbSaveStartTime;
+      console.log(`[Embedding] DB save took ${dbSaveDuration}ms for ${dbSaveCount} embeddings`);
 
       // Mark nodes in this batch as done (transition to 'ready' state)
       // Collect unique nodes that were in this batch
@@ -1114,6 +1372,11 @@ export class EmbeddingService {
 
       const batchProgressPct = Math.round((processedCount / totalTasks) * 100);
       console.log(`[Embedding] ✓ Batch ${batchNum}/${totalBatches} complete (${batchProgressPct}%, ${processedCount}/${totalTasks} done)`);
+
+      // Signal activity to reset timeout
+      if (options.onActivity) {
+        options.onActivity();
+      }
     }
 
     const durationMs = Date.now() - startTime;
@@ -1135,6 +1398,7 @@ export class EmbeddingService {
   /**
    * Wrap a query with state-based filtering
    * Only fetches nodes in 'linked' state (ready for embedding)
+   * Also adds usesChunks to the RETURN clause for chunk cleanup detection
    */
   private wrapQueryWithStateFilter(query: string): string {
     // Find the label from the query (e.g., "MATCH (s:Scope" -> "s")
@@ -1149,19 +1413,32 @@ export class EmbeddingService {
     // Check if there's already a WHERE clause
     const hasWhere = /WHERE/i.test(query);
 
+    let modifiedQuery = query;
+
     if (hasWhere) {
       // Add state filter to existing WHERE clause
-      return query.replace(
+      modifiedQuery = modifiedQuery.replace(
         /WHERE/i,
         `WHERE ${varName}.${P.state} = 'linked' AND`
       );
     } else {
       // Find "RETURN" and insert WHERE before it
-      return query.replace(
+      modifiedQuery = modifiedQuery.replace(
         /RETURN/i,
         `WHERE ${varName}.${P.state} = 'linked'\n            RETURN`
       );
     }
+
+    // Add usesChunks to RETURN clause if not already present
+    // Insert it right after the first RETURN and before any existing columns
+    if (!modifiedQuery.includes('usesChunks')) {
+      modifiedQuery = modifiedQuery.replace(
+        /RETURN\s+(\w+)\.uuid/i,
+        `RETURN $1.usesChunks AS usesChunks, $1.uuid`
+      );
+    }
+
+    return modifiedQuery;
   }
 
   /**
@@ -1181,6 +1458,7 @@ export class EmbeddingService {
     tasks: EmbeddingTask[];
     nodesToMarkDone: NodeToMarkDone[];
     chunkedNodeUuids: Set<string>;
+    nodesNeedingChunkCleanup: Map<string, string>; // uuid -> label for nodes that had chunks but now have small content
     totalNodes: number;
     skippedCount: number;
   }> {
@@ -1195,14 +1473,26 @@ export class EmbeddingService {
     // Apply state filtering - only fetch nodes in 'linked' state
     const query = this.wrapQueryWithStateFilter(config.query);
 
+    // DEBUG: Only log query/params when verbose is explicitly true
+    if (verbose) {
+      console.log(`[EmbeddingService] collectEmbeddingTasks(${config.label}) query:\n${query}`);
+      console.log(`[EmbeddingService] collectEmbeddingTasks(${config.label}) params:`, JSON.stringify(params));
+    }
+
     // Fetch nodes
     const result = await this.neo4jClient.run(query, params);
+
+    // Only log when there ARE records (not every empty call)
+    if (result.records.length > 0) {
+      console.log(`[EmbeddingService] collectEmbeddingTasks(${config.label}): ${result.records.length} nodes to embed`);
+    }
 
     if (result.records.length === 0) {
       return {
         tasks: [],
         nodesToMarkDone: [],
         chunkedNodeUuids: new Set(),
+        nodesNeedingChunkCleanup: new Map(),
         totalNodes: 0,
         skippedCount: 0,
       };
@@ -1211,6 +1501,7 @@ export class EmbeddingService {
     const tasks: EmbeddingTask[] = [];
     const nodesToMarkDone: NodeToMarkDone[] = [];
     const chunkedNodeUuids = new Set<string>();
+    const nodesNeedingChunkCleanup = new Map<string, string>(); // uuid -> label for nodes that had chunks but now have small content
     let skippedCount = 0;
     const label = config.label;
 
@@ -1237,9 +1528,17 @@ export class EmbeddingService {
         const existingProvider = record.get('embedding_provider') || null;
         const existingModel = record.get('embedding_model') || null;
         const nodeState = record.get('_state') || null;
+        // Check if node previously had chunks (for chunk cleanup)
+        const rawUsesChunks = record.has('usesChunks') ? record.get('usesChunks') : null;
+        const usesChunks = rawUsesChunks === true; // Ensure boolean comparison
 
-        // Skip empty/tiny texts
+        // Skip empty/tiny texts - but still mark node for state transition
         if (!rawText || rawText.length < 5) {
+          // Mark node as needing state transition (nothing to embed, but shouldn't stay in 'linked')
+          if (!nodeNeedsMarking.has(uuid)) {
+            nodeNeedsMarking.set(uuid, { needsMarking: true });
+          }
+          skippedCount++;
           continue;
         }
 
@@ -1266,6 +1565,11 @@ export class EmbeddingService {
 
           if (!needsEmbed) {
             skippedCount++;
+            // Node already has valid embedding - still mark for state transition to 'ready'
+            // This handles the case where node was re-parsed (_state='linked') but embeddings are still valid
+            if (!nodeNeedsMarking.has(uuid)) {
+              nodeNeedsMarking.set(uuid, { needsMarking: true });
+            }
             continue;
           }
 
@@ -1288,8 +1592,8 @@ export class EmbeddingService {
           chunkedNodeUuids.add(uuid);
 
           // Get parent's position info for calculating absolute positions
-          const parentStartLine = record.get('startLine') as number | null;
-          const parentPageNum = record.get('pageNum') as number | null;
+          const parentStartLine = record.has('startLine') ? record.get('startLine') as number | null : null;
+          const parentPageNum = record.has('pageNum') ? record.get('pageNum') as number | null : null;
 
           for (const chunk of chunks) {
             // Calculate absolute line numbers if parent has startLine
@@ -1328,6 +1632,12 @@ export class EmbeddingService {
             : rawText;
           const hash = hashContent(text);
 
+          // If node previously had chunks but now has small content, mark for chunk cleanup
+          if (usesChunks && isContentEmbedding) {
+            nodesNeedingChunkCleanup.set(uuid, label);
+            console.log(`[EmbeddingService] Node ${uuid} had chunks but now has small content - marking for chunk cleanup`);
+          }
+
           // Check if needs embedding
           // - No hash = new node
           // - Hash mismatch = content changed
@@ -1338,6 +1648,11 @@ export class EmbeddingService {
 
           if (!needsEmbed) {
             skippedCount++;
+            // Node already has valid embedding - still mark for state transition to 'ready'
+            // This handles the case where node was re-parsed (_state='linked') but embeddings are still valid
+            if (!nodeNeedsMarking.has(uuid)) {
+              nodeNeedsMarking.set(uuid, { needsMarking: true });
+            }
             continue;
           }
 
@@ -1388,6 +1703,7 @@ export class EmbeddingService {
       tasks,
       nodesToMarkDone,
       chunkedNodeUuids,
+      nodesNeedingChunkCleanup,
       totalNodes: result.records.length,
       skippedCount,
     };

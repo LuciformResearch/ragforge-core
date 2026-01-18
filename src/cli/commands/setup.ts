@@ -9,7 +9,7 @@
 
 import { writeFileSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { DockerManager } from '@luciformresearch/ragforge';
+import { DockerManager } from '../../index.js';
 
 export interface SetupOptions {
   force: boolean;

@@ -1,13 +1,11 @@
 import type {
   EmbeddingsConfig as CoreEmbeddingsConfig,
   EmbeddingEntityConfig as CoreEmbeddingEntityConfig,
-  EmbeddingPipelineConfig as CoreEmbeddingPipelineConfig
-} from '@luciformresearch/ragforge';
-import type {
+  EmbeddingPipelineConfig as CoreEmbeddingPipelineConfig,
   GeneratedEmbeddingsConfig,
   GeneratedEmbeddingEntityConfig,
   GeneratedEmbeddingPipelineConfig
-} from '@luciformresearch/ragforge';
+} from '../../index.js';
 
 export function toRuntimeEmbeddingsConfig(config?: CoreEmbeddingsConfig): GeneratedEmbeddingsConfig | undefined {
   if (!config) {

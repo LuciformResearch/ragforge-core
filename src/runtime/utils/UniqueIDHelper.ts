@@ -222,13 +222,14 @@ export class UniqueIDHelper {
 
   /**
    * Generate a deterministic UUID for a MarkdownSection
-   * Identity = file + position (startLine)
+   * Identity = file + section name (title + level)
+   * Using name instead of line number ensures stability when content is added/removed elsewhere in the file
    * @param absolutePath The absolute path to the markdown file
-   * @param startLine The start line of the section
+   * @param sectionName The section identifier (typically "title:level" or fallback)
    * @returns A deterministic UUID string prefixed with "section:"
    */
-  public static GenerateMarkdownSectionUUID(absolutePath: string, startLine: number): string {
-    const uuid = this.GenerateDeterministicUUID(`section:${absolutePath}:${startLine}`);
+  public static GenerateMarkdownSectionUUID(absolutePath: string, sectionName: string): string {
+    const uuid = this.GenerateDeterministicUUID(`section:${absolutePath}:${sectionName}`);
     return `section:${uuid}`;
   }
 

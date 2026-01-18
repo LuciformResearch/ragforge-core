@@ -5,6 +5,7 @@
  * Supports multiple providers:
  * - Gemini (cloud, requires API key)
  * - Ollama (local, free, private)
+ * - TEI (local, GPU-accelerated, fast)
  */
 
 // Provider interface and implementations
@@ -21,6 +22,11 @@ export {
   OllamaEmbeddingProvider,
   OllamaProviderOptions,
 } from './ollama-embedding-provider.js';
+
+export {
+  TEIEmbeddingProvider,
+  TEIProviderOptions,
+} from './tei-embedding-provider.js';
 
 // Text chunking utilities
 export {

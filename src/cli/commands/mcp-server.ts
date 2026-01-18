@@ -42,7 +42,7 @@ import {
   // Tool Logging
   ToolLogger,
   withToolLogging,
-} from '@luciformresearch/ragforge';
+} from '../../index.js';
 import { startMcpServer, type McpServerConfig } from '../mcp/server.js';
 import { ensureEnvLoaded } from '../utils/env.js';
 

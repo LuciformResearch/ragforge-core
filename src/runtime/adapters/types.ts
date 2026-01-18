@@ -143,6 +143,23 @@ export interface ParsedRelationship {
 
   /** Optional relationship properties */
   properties?: Record<string, any>;
+
+  /**
+   * Target node label (for placeholder creation)
+   * Used to create placeholder nodes when target doesn't exist yet.
+   * E.g., 'ExternalLibrary', 'Directory', 'File'
+   */
+  targetLabel?: string;
+
+  /**
+   * Target node properties (for placeholder creation)
+   * Minimum properties to create a meaningful placeholder node.
+   * Should include at least _name.
+   */
+  targetProps?: {
+    _name: string;
+    [key: string]: unknown;
+  };
 }
 
 /**

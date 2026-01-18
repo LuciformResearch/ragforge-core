@@ -2,6 +2,30 @@
 
 Microservice Python pour l'extraction d'entités et de relations avec GLiNER2.
 
+## Quick Start (Docker Compose)
+
+**C'est la méthode recommandée pour la plupart des utilisateurs.**
+
+```bash
+cd packages/ragforge-core/services
+
+# Lancer Neo4j + GLiNER
+docker compose up -d
+
+# Vérifier que tout tourne
+docker compose ps
+
+# Voir les logs
+docker compose logs -f gliner
+```
+
+Pour lancer **uniquement Neo4j** (sans extraction d'entités) :
+```bash
+docker compose up -d neo4j
+```
+
+> **Note** : L'extraction d'entités est optionnelle. RagForge fonctionne parfaitement sans GLiNER - il skip simplement l'extraction d'entités.
+
 ## Fonctionnalités
 
 - **Extraction d'entités** : Personnes, organisations, produits, etc.

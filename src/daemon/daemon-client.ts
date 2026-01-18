@@ -325,4 +325,119 @@ export async function stopDaemon(): Promise<boolean> {
   }
 }
 
+/**
+ * Wait for the daemon to fully stop (port becomes free)
+ */
+async function waitForDaemonStop(timeoutMs: number = 10000): Promise<boolean> {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    // Check if port is free
+    const portInUse = await isPortInUse(DAEMON_PORT);
+    if (!portInUse) {
+      await logToFile('debug', 'Daemon port is now free');
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  await logToFile('warn', 'Timeout waiting for daemon to stop');
+  return false;
+}
+
+export interface RestartDaemonOptions {
+  /** Whether to restart watchers after daemon restart (default: true) */
+  withWatchers?: boolean;
+  /** Verbose logging (default: false) */
+  verbose?: boolean;
+}
+
+export interface RestartDaemonResult {
+  success: boolean;
+  message: string;
+  wasRunning: boolean;
+  watchersStarted?: boolean;
+}
+
+/**
+ * Restart the daemon, optionally with watchers.
+ *
+ * This will:
+ * 1. Stop the current daemon (if running)
+ * 2. Wait for it to fully stop
+ * 3. Start a new daemon
+ * 4. If withWatchers=true (default), watchers auto-start for cwd during initialization
+ */
+export async function restartDaemon(options: RestartDaemonOptions = {}): Promise<RestartDaemonResult> {
+  const { withWatchers = true, verbose = false } = options;
+
+  await logToFile('info', 'restartDaemon called', { withWatchers, verbose });
+
+  // Check if daemon is currently running
+  const wasRunning = await isDaemonStarted();
+
+  if (wasRunning) {
+    if (verbose) console.log('⏳ Stopping daemon...');
+    await logToFile('info', 'Stopping current daemon');
+
+    // Send shutdown signal
+    const stopped = await stopDaemon();
+    if (!stopped) {
+      await logToFile('warn', 'Shutdown request failed, daemon may already be stopping');
+    }
+
+    // Wait for daemon to fully stop
+    const fullyStoped = await waitForDaemonStop(10000);
+    if (!fullyStoped) {
+      await logToFile('error', 'Failed to stop daemon within timeout');
+      return {
+        success: false,
+        message: 'Failed to stop daemon within timeout',
+        wasRunning,
+      };
+    }
+
+    if (verbose) console.log('✓ Daemon stopped');
+  } else {
+    await logToFile('info', 'Daemon was not running');
+    if (verbose) console.log('ℹ Daemon was not running');
+  }
+
+  // Small delay to ensure port is fully released
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  // Start new daemon
+  if (verbose) console.log('⏳ Starting daemon...');
+  await logToFile('info', 'Starting new daemon', { withWatchers });
+
+  // Set environment variable to control watcher auto-start
+  if (!withWatchers) {
+    process.env.RAGFORGE_SKIP_AUTO_WATCHERS = '1';
+  } else {
+    delete process.env.RAGFORGE_SKIP_AUTO_WATCHERS;
+  }
+
+  const started = await ensureDaemonRunning(verbose);
+
+  // Clean up env var
+  delete process.env.RAGFORGE_SKIP_AUTO_WATCHERS;
+
+  if (!started) {
+    await logToFile('error', 'Failed to start daemon');
+    return {
+      success: false,
+      message: 'Failed to start daemon',
+      wasRunning,
+    };
+  }
+
+  await logToFile('info', 'Daemon restarted successfully');
+  if (verbose) console.log('✓ Daemon restarted');
+
+  return {
+    success: true,
+    message: wasRunning ? 'Daemon restarted successfully' : 'Daemon started successfully',
+    wasRunning,
+    watchersStarted: withWatchers,
+  };
+}
+
 export { DAEMON_PORT, DAEMON_URL };

@@ -1,160 +1,97 @@
 # Entity Extraction Configuration
 # ================================
-# This file configures domain presets for automatic entity extraction.
-# Each domain defines:
-#   - description: Used for multi-label classification
-#   - entity_types: Types of entities to extract in this domain
-#   - relation_types: Relations between entities (key: description)
+# Optimized for speed and precision - fewer types with clear descriptions.
+# GLiNER2 supports entity descriptions to reduce false positives.
 #
-# You can add custom domains or modify existing ones without changing code.
+# Each domain can have:
+#   - enabled: true/false - whether to run entity extraction for this domain
+#   - description: Used for domain classification (always active)
+#   - entity_types: Types to extract (only if enabled)
+#   - relation_types: Relations to extract (only if enabled)
+#
+# Domains with enabled=false are still detected during classification,
+# allowing files to be SKIPPED from entity extraction entirely.
+#
+# IMPORTANT: For code/documentation files, the TypeScript parser already extracts
+# functions, classes, methods as Scope nodes. GLiNER should NOT duplicate this.
 
-# Default settings (used when no domain is detected or specified)
+# Entity types that should NOT have embeddings generated
+# These are numeric/value types where embedding similarity doesn't make sense
+skip_embedding_types:
+  - price
+  - date
+  - quantity
+  - amount
+  - currency
+  - size
+  - duration
+
+# Default settings (used when no domain is detected)
+# Focused on universal named entities
 defaults:
   entity_types:
-    - person
-    - organization
-    - location
-    - technology
-    - product
-    - price
-    - date
-    - quantity
+    person: "A human individual mentioned by their full name"
+    organization: "A company, institution, government body, or named group"
+    location: "A geographical place, city, country, or physical address"
+    technology: "A named software, framework, programming language, or tool"
+    product: "A commercial product or service with a specific name"
+    date: "A specific date, time period, or deadline"
   relation_types:
     works_for: "person works for organization"
     located_in: "entity is located in location"
     created_by: "product/technology created by person/organization"
-    costs: "product has price"
-    depends_on: "technology depends on another technology"
-    part_of: "entity is part of another entity"
+    uses: "organization/person uses technology"
 
 # Domain-specific presets
 domains:
-  ecommerce:
-    description: "Text about products, shopping, prices, brands, e-commerce"
-    entity_types:
-      - product
-      - brand
-      - price
-      - currency
-      - quantity
-      - category
-      - ingredient
-      - certification
-      - benefit
-      - hair_type
-      - skin_type
-      - size
-      - color
-      - material
-    relation_types:
-      compatible_with: "product is compatible with attribute (e.g. hair type)"
-      contains: "product contains ingredient"
-      certified_by: "product has certification"
-      provides_benefit: "product provides benefit"
-      recommended_with: "product is recommended with another product"
-      complements: "product complements another product"
-      priced_at: "product has price"
-
+  # CODE domain - DISABLED: TypeScript parser already extracts code entities as Scope nodes
   code:
-    description: "Text about programming, software, functions, APIs, code"
-    entity_types:
-      - function
-      - class
-      - method
-      - variable
-      - module
-      - library
-      - api
-      - endpoint
-      - parameter
-      - return_type
-      - error
-      - exception
-      - configuration
-    relation_types:
-      calls: "function/method calls another"
-      inherits_from: "class inherits from another class"
-      implements: "class implements interface"
-      imports: "module imports another module"
-      returns: "function returns type"
-      throws: "function throws exception"
-      depends_on: "module depends on library"
+    enabled: false
+    description: "Text about programming, software, functions, APIs, source code"
+    # No entity_types needed - detection only, extraction skipped
 
+  # DOCUMENTATION domain - DISABLED: Too noisy for technical docs
   documentation:
-    description: "Technical documentation, specifications, requirements, user stories"
-    entity_types:
-      - concept
-      - feature
-      - requirement
-      - specification
-      - user_story
-      - use_case
-      - actor
-      - system
-      - component
-      - version
-      - release
-      - milestone
-    relation_types:
-      describes: "section describes concept"
-      requires: "feature requires another feature"
-      implements: "feature implements requirement"
-      affects: "change affects component"
-      belongs_to: "feature belongs to release"
+    enabled: false
+    description: "Technical documentation, specifications, API docs, user guides"
+    # No entity_types needed - detection only, extraction skipped
 
+  # ECOMMERCE domain - ENABLED: Extract products, brands, ingredients
+  ecommerce:
+    enabled: true
+    description: "Text about products, shopping, prices, brands, beauty, cosmetics"
+    entity_types:
+      product: "A specific commercial product with a name (e.g., 'Shampoing Réparateur', 'iPhone 15')"
+      brand: "A company brand name (e.g., 'L'Oréal', 'Apple', 'Nivea')"
+      category: "A product category (e.g., 'shampoo', 'moisturizer', 'electronics')"
+      price: "A monetary amount with currency (e.g., '12.99€', '$50')"
+      ingredient: "A specific ingredient in a product (e.g., 'Kératine', 'Vitamine E', 'Rétinol')"
+      certification: "A quality certification or label (e.g., 'Bio', 'Cruelty-free', 'Vegan')"
+      benefit: "A product benefit or claim (e.g., 'hydratant', 'anti-âge', 'réparateur')"
+      usage: "Target usage or e.g. skin/hair type (e.g., 'cheveux secs', 'peau sensible', 'anti-pelliculaire')"
+    relation_types:
+      made_by: "product is made by brand"
+      contains: "product contains ingredient"
+      certified_as: "product has certification"
+      provides: "product provides benefit"
+      suitable_for: "product is suitable for usage/type"
+      priced_at: "product has price"
+      in_category: "product belongs to category"
+
+  # LEGAL domain - ENABLED
   legal:
+    enabled: true
     description: "Legal documents, contracts, terms, obligations, agreements"
     entity_types:
-      - person
-      - organization
-      - contract
-      - clause
-      - obligation
-      - right
-      - party
-      - date
-      - duration
-      - amount
-      - jurisdiction
+      person: "A human individual mentioned by their full name"
+      organization: "A company, institution, or legal entity name"
+      contract: "A named legal agreement or contract"
+      date: "A specific date or deadline"
+      duration: "A time period (e.g., '2 years', '30 days')"
+      amount: "A monetary amount in a legal context"
+      jurisdiction: "A legal jurisdiction (e.g., 'French law', 'State of California')"
     relation_types:
       party_to: "person/organization is party to contract"
-      obligated_to: "party has obligation"
-      grants_right: "clause grants right to party"
-      effective_date: "contract has effective date"
+      effective_on: "contract is effective on date"
       governed_by: "contract governed by jurisdiction"
-
-  # Example custom domain - uncomment and modify as needed
-  # medical:
-  #   description: "Medical and healthcare content, symptoms, treatments"
-  #   entity_types:
-  #     - symptom
-  #     - diagnosis
-  #     - treatment
-  #     - medication
-  #     - dosage
-  #     - condition
-  #     - patient
-  #     - doctor
-  #   relation_types:
-  #     treats: "medication/treatment treats condition"
-  #     causes: "condition causes symptom"
-  #     prescribed_by: "medication prescribed by doctor"
-  #     contraindicated_with: "medication contraindicated with another"
-
-  # scientific:
-  #   description: "Scientific papers, research, experiments, hypotheses"
-  #   entity_types:
-  #     - researcher
-  #     - institution
-  #     - hypothesis
-  #     - experiment
-  #     - result
-  #     - method
-  #     - dataset
-  #     - citation
-  #   relation_types:
-  #     authored_by: "paper authored by researcher"
-  #     affiliated_with: "researcher affiliated with institution"
-  #     cites: "paper cites another paper"
-  #     proves: "experiment proves hypothesis"
-  #     uses_method: "experiment uses method"
+      valued_at: "contract valued at amount"

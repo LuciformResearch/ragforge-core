@@ -87,3 +87,7 @@ class ConfigResponse(BaseModel):
     model_name: str
     batch_size: int
     device: str
+    skip_embedding_types: list[str] = Field(
+        default_factory=list,
+        description="Entity types that should skip embedding generation (numeric/value types)"
+    )

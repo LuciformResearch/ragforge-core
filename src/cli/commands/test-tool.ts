@@ -27,7 +27,7 @@ import {
   type BrainToolsContext,
   type ImageToolsContext,
   type ThreeDToolsContext,
-} from '@luciformresearch/ragforge';
+} from '../../index.js';
 import { callToolViaDaemon, isDaemonRunning, listTools } from './daemon-client.js';
 
 export interface TestToolOptions {

@@ -3,6 +3,11 @@
 # GLiNER2 - NER model
 gliner2>=0.1.0
 
+# transformers 4.41+ fixes PyPreTokenizerTypeWrapper error
+# tokenizers 0.21+ required for compatibility
+transformers>=4.41.0
+tokenizers>=0.21.0
+
 # API server
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0

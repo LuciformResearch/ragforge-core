@@ -28,8 +28,6 @@ export interface ProcessingLoopConfig {
   busyIntervalMs?: number;
   /** Maximum idle interval for backoff (ms, default: 10000) */
   maxIdleIntervalMs?: number;
-  /** Batch size per iteration (default: 10) */
-  batchSize?: number;
   /** Verbose logging */
   verbose?: boolean;
   /** Run recovery on start (default: true) */
@@ -53,6 +51,8 @@ export interface LoopStats {
   startedAt: Date;
   /** Last iteration time */
   lastIterationAt?: Date;
+  /** Last time any activity was detected (for timeout reset) */
+  lastActivityAt?: Date;
   /** Is currently running */
   isRunning: boolean;
   /** Is currently processing */
@@ -68,7 +68,6 @@ export class ProcessingLoop extends EventEmitter {
   private idleIntervalMs: number;
   private busyIntervalMs: number;
   private maxIdleIntervalMs: number;
-  private batchSize: number;
   private verbose: boolean;
   private recoverOnStart: boolean;
 
@@ -96,7 +95,6 @@ export class ProcessingLoop extends EventEmitter {
     this.idleIntervalMs = config.idleIntervalMs ?? 1000;
     this.busyIntervalMs = config.busyIntervalMs ?? 100;
     this.maxIdleIntervalMs = config.maxIdleIntervalMs ?? 10000;
-    this.batchSize = config.batchSize ?? 10;
     this.verbose = config.verbose ?? false;
     this.recoverOnStart = config.recoverOnStart ?? true;
     this.currentIntervalMs = this.idleIntervalMs;
@@ -142,7 +140,7 @@ export class ProcessingLoop extends EventEmitter {
   }
 
   /**
-   * Stop the processing loop gracefully
+   * Stop the processing loop gracefully (waits for current processing to complete)
    */
   async stop(): Promise<void> {
     if (!this.isRunning) {
@@ -158,8 +156,9 @@ export class ProcessingLoop extends EventEmitter {
       this.timeoutId = undefined;
     }
 
-    // Wait for current processing to complete
-    while (this.isProcessing) {
+    // Wait for current processing to complete (max 30s)
+    const startTime = Date.now();
+    while (this.isProcessing && Date.now() - startTime < 30000) {
       await this.sleep(100);
     }
 
@@ -171,12 +170,27 @@ export class ProcessingLoop extends EventEmitter {
   }
 
   /**
+   * Force stop immediately without waiting for current processing
+   */
+  forceStop(): void {
+    this.isRunning = false;
+    this.isProcessing = false;
+    this.stats.isRunning = false;
+
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId);
+      this.timeoutId = undefined;
+    }
+
+    this.emit('stopped');
+    console.log('[ProcessingLoop] Force stopped');
+  }
+
+  /**
    * Trigger immediate processing (for external events like file changes)
    */
   triggerProcessing(): void {
-    console.log(`[ProcessingLoop] triggerProcessing called (isRunning=${this.isRunning}, isProcessing=${this.isProcessing})`);
     if (!this.isRunning || this.isProcessing) {
-      console.log('[ProcessingLoop] Skipping trigger - not running or already processing');
       return;
     }
 
@@ -187,7 +201,7 @@ export class ProcessingLoop extends EventEmitter {
     }
 
     this.consecutiveIdleCount = 0;
-    console.log('[ProcessingLoop] Scheduling immediate iteration');
+    console.log('[ProcessingLoop] Triggered');
     this.scheduleNextIteration(0);
   }
 
@@ -216,23 +230,32 @@ export class ProcessingLoop extends EventEmitter {
     this.stats.isProcessing = true;
     this.stats.iterations++;
     this.stats.lastIterationAt = new Date();
-
-    console.log(`[ProcessingLoop] Starting iteration #${this.stats.iterations}`);
+    this.recordActivity(); // Record activity at start
 
     try {
-      // 1. Process discovered files first
-      console.log('[ProcessingLoop] Calling processDiscovered...');
-      const discoveredStats = await this.processor.processDiscovered({
-        limit: this.batchSize,
-      });
-      console.log(`[ProcessingLoop] processDiscovered: processed=${discoveredStats.filesProcessed}, skipped=${discoveredStats.filesSkipped}, errored=${discoveredStats.filesErrored}`);
+      // Phase 1: Process ALL discovered files (parsing)
+      this.recordActivity();
+      const discoveredStats = await this.processor.processDiscovered();
+      this.recordActivity(); // Record activity after phase
+      if (discoveredStats.filesProcessed > 0 || discoveredStats.filesErrored > 0) {
+        console.log(`[ProcessingLoop] Parsing: processed=${discoveredStats.filesProcessed}, skipped=${discoveredStats.filesSkipped}, errored=${discoveredStats.filesErrored}`);
+      }
 
-      // 2. Then process linked files (entities + embeddings)
-      console.log('[ProcessingLoop] Calling processLinked...');
-      const linkedStats = await this.processor.processLinked({
-        limit: this.batchSize,
-      });
-      console.log(`[ProcessingLoop] processLinked: processed=${linkedStats.filesProcessed}, entities=${linkedStats.entitiesCreated}, embeddings=${linkedStats.embeddingsGenerated}`);
+      // Phase 2: Process ALL linked files (entities + embeddings)
+      this.recordActivity();
+      const linkedStats = await this.processor.processLinked();
+      this.recordActivity(); // Record activity after phase
+      if (linkedStats.filesProcessed > 0 || linkedStats.entitiesCreated > 0 || linkedStats.embeddingsGenerated > 0) {
+        console.log(`[ProcessingLoop] Linked: files=${linkedStats.filesProcessed}, entities=${linkedStats.entitiesCreated}, embeddings=${linkedStats.embeddingsGenerated}`);
+      }
+
+      // Phase 3: Process nodes directly (handles re-parsed files where File stayed 'embedded' but nodes became 'linked')
+      this.recordActivity();
+      const nodesStats = await this.processor.processLinkedNodes();
+      this.recordActivity(); // Record activity after phase
+      if (nodesStats.nodesProcessed > 0 || nodesStats.embeddingsGenerated > 0) {
+        console.log(`[ProcessingLoop] Nodes: processed=${nodesStats.nodesProcessed}, embeddings=${nodesStats.embeddingsGenerated}`);
+      }
 
       // Aggregate stats
       const totalProcessed = discoveredStats.filesProcessed + linkedStats.filesProcessed;
@@ -243,7 +266,7 @@ export class ProcessingLoop extends EventEmitter {
       this.stats.filesSkipped += totalSkipped;
       this.stats.filesErrored += totalErrored;
       this.stats.entitiesCreated += discoveredStats.entitiesCreated + linkedStats.entitiesCreated;
-      this.stats.embeddingsGenerated += discoveredStats.embeddingsGenerated + linkedStats.embeddingsGenerated;
+      this.stats.embeddingsGenerated += discoveredStats.embeddingsGenerated + linkedStats.embeddingsGenerated + nodesStats.embeddingsGenerated;
 
       // Emit progress event
       if (totalProcessed > 0 || totalErrored > 0) {
@@ -255,12 +278,13 @@ export class ProcessingLoop extends EventEmitter {
       }
 
       // Adjust interval based on activity
-      if (totalProcessed > 0) {
+      const hadWork = totalProcessed > 0 || nodesStats.nodesProcessed > 0;
+      if (hadWork) {
         // Busy - use short interval
         this.currentIntervalMs = this.busyIntervalMs;
         this.consecutiveIdleCount = 0;
 
-        console.log(`[ProcessingLoop] Iteration complete: processed ${totalProcessed} files, next iteration in ${this.currentIntervalMs}ms`);
+        console.log(`[ProcessingLoop] Done: ${totalProcessed} files, ${nodesStats.nodesProcessed} nodes`);
       } else {
         // Idle - use exponential backoff
         this.consecutiveIdleCount++;
@@ -268,9 +292,9 @@ export class ProcessingLoop extends EventEmitter {
           this.idleIntervalMs * Math.pow(1.5, this.consecutiveIdleCount),
           this.maxIdleIntervalMs
         );
-        // Only log idle occasionally to avoid spam
-        if (this.consecutiveIdleCount <= 3 || this.consecutiveIdleCount % 10 === 0) {
-          console.log(`[ProcessingLoop] Idle (${this.consecutiveIdleCount}x), next check in ${Math.round(this.currentIntervalMs)}ms`);
+        // Only log first idle to avoid spam
+        if (this.consecutiveIdleCount === 1) {
+          console.log(`[ProcessingLoop] Idle, backoff to ${Math.round(this.currentIntervalMs)}ms`);
         }
       }
 
@@ -320,6 +344,23 @@ export class ProcessingLoop extends EventEmitter {
    */
   async isComplete(): Promise<boolean> {
     return this.processor.isComplete();
+  }
+
+  /**
+   * Get timestamp of last activity (for timeout management)
+   * Returns undefined if no activity has occurred yet
+   */
+  getLastActivityAt(): Date | undefined {
+    return this.stats.lastActivityAt;
+  }
+
+  /**
+   * Record activity - updates lastActivityAt timestamp
+   * Call this during long-running operations to prevent timeouts
+   */
+  recordActivity(): void {
+    this.stats.lastActivityAt = new Date();
+    this.emit('activity', this.stats.lastActivityAt);
   }
 
   // ============================================

@@ -21,6 +21,7 @@
 
 import type { Driver } from 'neo4j-driver';
 import pLimit from 'p-limit';
+import * as fs from 'fs/promises';
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import { FileStateMachine, type FileState, type FileStateInfo } from '../brain/file-state-machine.js';
 import { NodeStateMachine } from './node-state-machine.js';
@@ -31,6 +32,7 @@ import { EntityExtractionClient } from './entity-extraction/client.js';
 import { createEntityExtractionTransform } from './entity-extraction/transform.js';
 import type { NodeState } from './state-types.js';
 import { type ErrorType } from '../brain/file-state-machine.js';
+import { resolvePendingImports } from '../brain/reference-extractor.js';
 
 // ============================================
 // Types
@@ -51,12 +53,12 @@ export interface UnifiedProcessorConfig {
   verbose?: boolean;
   /** Max retries for errors */
   maxRetries?: number;
-  /** Batch size for processing */
-  batchSize?: number;
   /** Concurrency limit for parallel processing (default: 10) */
   concurrency?: number;
   /** Pre-configured embedding service (optional, will create one if not provided) */
   embeddingService?: EmbeddingService;
+  /** Activity callback - called during long-running operations to signal liveness */
+  onActivity?: () => void;
 }
 
 export interface ProcessingStats {
@@ -104,8 +106,8 @@ export class UnifiedProcessor {
   private projectRoot?: string;
   private verbose: boolean;
   private maxRetries: number;
-  private batchSize: number;
   private concurrency: number;
+  private onActivity?: () => void;
 
   constructor(config: UnifiedProcessorConfig) {
     this.driver = config.driver;
@@ -114,8 +116,8 @@ export class UnifiedProcessor {
     this.projectRoot = config.projectRoot;
     this.verbose = config.verbose ?? false;
     this.maxRetries = config.maxRetries ?? 3;
-    this.batchSize = config.batchSize ?? 10;
     this.concurrency = config.concurrency ?? 10;
+    this.onActivity = config.onActivity;
 
     // Initialize state machines
     this.fileStateMachine = new FileStateMachine(config.neo4jClient);
@@ -141,9 +143,29 @@ export class UnifiedProcessor {
     }
 
     // Initialize entity extraction client
+    const glinerUrl = config.glinerServiceUrl || 'http://localhost:6971';
     this.entityClient = new EntityExtractionClient({
-      serviceUrl: config.glinerServiceUrl || 'http://localhost:6971',
+      serviceUrl: glinerUrl,
     });
+    console.log(`[UnifiedProcessor] Entity extraction client initialized: ${glinerUrl}`);
+  }
+
+  /**
+   * Signal activity for timeout reset
+   * Call this during long-running operations to prevent timeouts
+   */
+  private signalActivity(): void {
+    if (this.onActivity) {
+      this.onActivity();
+    }
+  }
+
+  /**
+   * Set the activity callback (called during long-running operations)
+   * This allows injecting the callback after creation
+   */
+  setOnActivity(callback: () => void): void {
+    this.onActivity = callback;
   }
 
   // ============================================
@@ -161,11 +183,10 @@ export class UnifiedProcessor {
    * Files are processed up to 'linked' state. Call processLinked() afterwards
    * to complete entity extraction and embedding generation.
    */
-  async processDiscovered(options?: { limit?: number }): Promise<ProcessingStats> {
+  async processDiscovered(): Promise<ProcessingStats> {
     const startTime = Date.now();
-    const batchLimit = options?.limit ?? this.batchSize;
 
-    // Get files in discovered state
+    // Get ALL files in discovered state
     console.log(`[UnifiedProcessor] Getting files in 'discovered' state for project ${this.projectId}...`);
     const discoveredFiles = await this.fileStateMachine.getFilesInState(
       this.projectId,
@@ -177,10 +198,10 @@ export class UnifiedProcessor {
       return this.emptyStats(startTime);
     }
 
-    // Process up to limit files
-    const filesToProcess = discoveredFiles.slice(0, batchLimit);
+    // Process ALL discovered files at once (adapter handles batching internally)
+    const filesToProcess = discoveredFiles;
 
-    console.log(`[UnifiedProcessor] 🚀 Batch processing ${filesToProcess.length} discovered files (limit: ${batchLimit})`);
+    console.log(`[UnifiedProcessor] 🚀 Processing ALL ${filesToProcess.length} discovered files`);
 
     // Convert FileStateInfo to FileInfo for batch processing
     const fileInfos: FileInfo[] = filesToProcess.map(f => ({
@@ -191,6 +212,13 @@ export class UnifiedProcessor {
 
     // Use batch processing (single adapter.parse() call)
     const batchResult = await this.fileProcessor.processBatchFiles(fileInfos);
+
+    // Resolve any PENDING_IMPORT relations now that all scopes exist
+    // This converts PENDING_IMPORT → CONSUMES for cross-file references
+    const pendingResult = await resolvePendingImports(this.neo4jClient, this.projectId);
+    if (pendingResult.resolved > 0) {
+      console.log(`[UnifiedProcessor] Resolved ${pendingResult.resolved} pending imports, ${pendingResult.remaining} remaining`);
+    }
 
     // Capture metadata before entity extraction (for files that succeeded)
     // This is done lazily when processLinked() is called
@@ -214,11 +242,10 @@ export class UnifiedProcessor {
   /**
    * Process files in 'linked' state through entity extraction and embedding (parallel with batch transitions)
    */
-  async processLinked(options?: { limit?: number }): Promise<ProcessingStats> {
+  async processLinked(): Promise<ProcessingStats> {
     const startTime = Date.now();
-    const batchLimit = options?.limit ?? this.batchSize;
 
-    // Get files in linked state
+    // Get ALL files in linked state
     const linkedFiles = await this.fileStateMachine.getFilesInState(
       this.projectId,
       'linked'
@@ -228,9 +255,10 @@ export class UnifiedProcessor {
       return this.emptyStats(startTime);
     }
 
-    const filesToProcess = linkedFiles.slice(0, batchLimit);
+    // Process ALL linked files (concurrency is controlled by pLimit)
+    const filesToProcess = linkedFiles;
 
-    console.log(`[UnifiedProcessor] 🚀 Starting parallel linked processing of ${filesToProcess.length} files (concurrency=${this.concurrency})`);
+    console.log(`[UnifiedProcessor] 🚀 Processing ALL ${filesToProcess.length} linked files (concurrency=${this.concurrency})`);
 
     const limit = pLimit(this.concurrency);
 
@@ -238,48 +266,200 @@ export class UnifiedProcessor {
     const successfulFiles: FileStateInfo[] = [];
     const failedFiles: Array<{ file: FileStateInfo; error: Error }> = [];
 
-    // 1. Batch transition to 'entities'
+    // 1. Check GLiNER availability ONCE (not per file)
+    const glinerConfig = this.entityClient.getConfig();
+    console.log(`[UnifiedProcessor] 🔍 Checking GLiNER availability at ${glinerConfig.serviceUrl}...`);
+    const glinerAvailable = await this.entityClient.isAvailable();
+    if (glinerAvailable) {
+      const health = await this.entityClient.getHealth();
+      console.log(`[UnifiedProcessor] ✅ GLiNER available: model=${health?.model_name}, device=${health?.device}`);
+      // Load model to GPU before extraction
+      console.log(`[UnifiedProcessor] 🔄 Loading GLiNER model to GPU...`);
+      const loadResult = await this.entityClient.loadModel();
+      if (loadResult.loaded) {
+        console.log(`[UnifiedProcessor] ✅ GLiNER model loaded${loadResult.wasAlreadyLoaded ? ' (was already loaded)' : ''}`);
+      } else {
+        console.log(`[UnifiedProcessor] ⚠️ Failed to load GLiNER model, extraction may be slow`);
+      }
+    } else {
+      console.log(`[UnifiedProcessor] ❌ GLiNER not available at ${glinerConfig.serviceUrl}, skipping entity extraction`);
+    }
+
+    // 2. Batch fetch ALL nodes for entity extraction in ONE query (not per file)
+    const nodesByFile = glinerAvailable
+      ? await this.getAllNodesForEntityExtractionBatch()
+      : new Map();
+
+    if (glinerAvailable) {
+      const totalNodes = Array.from(nodesByFile.values()).reduce((sum, nodes) => sum + nodes.length, 0);
+      console.log(`[UnifiedProcessor] 📊 Fetched ${totalNodes} nodes for entity extraction (${nodesByFile.size} files with content)`);
+    }
+
+    // 3. Batch transition to 'entities'
     await this.fileStateMachine.transitionBatch(
       filesToProcess.map(f => f.uuid),
       'entities'
     );
 
-    // 2. Parallel entity extraction
-    const entityResults = await Promise.all(
-      filesToProcess.map(file =>
-        limit(async () => {
-          try {
-            const result = await this.extractEntitiesForFile(file.file);
-            return { file, result, error: null };
-          } catch (error: any) {
-            return { file, result: null, error };
-          }
-        })
-      )
-    );
+    // 4. DOMAIN-BASED entity extraction
+    // Phase 1: Classify files by domain
+    // Phase 2: Group nodes by their file's domain
+    // Phase 3: Extract entities per domain with domain-specific entity types
+    let totalEntitiesCreated = 0;
+    let totalRelationsCreated = 0;
 
-    // Separate successful and failed entity extractions
-    const entitySuccesses: Array<{ file: FileStateInfo; result: { entitiesCreated: number; relationsCreated: number } }> = [];
-    for (const { file, result, error } of entityResults) {
-      if (error) {
-        failedFiles.push({ file, error });
-      } else if (result) {
-        entitySuccesses.push({ file, result });
-        successfulFiles.push(file);
+    if (glinerAvailable) {
+      // Flatten all nodes into a single array with file tracking
+      const allNodes: Array<{ uuid: string; content: string; label: string; filePath: string; contentHash: string }> = [];
+      for (const [filePath, nodes] of nodesByFile) {
+        for (const node of nodes) {
+          allNodes.push({ ...node, filePath });
+        }
+      }
+
+      if (allNodes.length > 0) {
+        // Get unique file paths
+        const uniqueFilePaths = Array.from(new Set(allNodes.map(n => n.filePath)));
+        console.log(`[UnifiedProcessor] 🔍 Classifying ${uniqueFilePaths.length} files by domain...`);
+
+        // Phase 1: Read file contents and classify domains
+        // Store ALL domains per file (not just primary) as a sorted combo key
+        const fileDomainCombo = new Map<string, string>(); // filePath -> "domain1|domain2|..."
+        const fileContents: string[] = [];
+        const validFilePaths: string[] = [];
+
+        for (const filePath of uniqueFilePaths) {
+          try {
+            const content = await fs.readFile(filePath, 'utf-8');
+            // Use first 2000 chars for classification (domain detection needs context)
+            fileContents.push(content.slice(0, 2000));
+            validFilePaths.push(filePath);
+          } catch (error) {
+            // File might not exist anymore, use default domain
+            fileDomainCombo.set(filePath, 'default');
+            if (this.verbose) {
+              console.warn(`[UnifiedProcessor] Could not read file for classification: ${filePath}`);
+            }
+          }
+        }
+
+        // Batch classify files
+        if (fileContents.length > 0) {
+          try {
+            this.signalActivity();
+            const classifications = await this.entityClient.classifyDomainsBatch(fileContents, 0.3);
+            this.signalActivity();
+
+            for (let i = 0; i < validFilePaths.length; i++) {
+              const domains = classifications[i] || [];
+              // Create sorted combo key from all detected domains (e.g., "legal|tech")
+              const domainLabels = domains.map(d => d.label).filter(Boolean);
+              const comboKey = domainLabels.length > 0
+                ? domainLabels.sort().join('|')
+                : 'default';
+              fileDomainCombo.set(validFilePaths[i], comboKey);
+            }
+
+            // Log domain combo distribution
+            const comboCounts = new Map<string, number>();
+            for (const combo of fileDomainCombo.values()) {
+              comboCounts.set(combo, (comboCounts.get(combo) || 0) + 1);
+            }
+            console.log(`[UnifiedProcessor] 📊 File domain combos: ${Array.from(comboCounts.entries()).map(([c, n]) => `"${c}"=${n}`).join(', ')}`);
+          } catch (error: any) {
+            console.warn(`[UnifiedProcessor] ⚠️ Domain classification failed, using default: ${error.message}`);
+            for (const filePath of validFilePaths) {
+              fileDomainCombo.set(filePath, 'default');
+            }
+          }
+        }
+
+        // Phase 2: Group nodes by their file's domain combo
+        const nodesByDomainCombo = new Map<string, typeof allNodes>();
+        for (const node of allNodes) {
+          const combo = fileDomainCombo.get(node.filePath) || 'default';
+          if (!nodesByDomainCombo.has(combo)) {
+            nodesByDomainCombo.set(combo, []);
+          }
+          nodesByDomainCombo.get(combo)!.push(node);
+        }
+
+        // Get disabled domains (enabled: false in config) - these are detected but extraction is skipped
+        const disabledDomains = await this.entityClient.getDisabledDomains();
+        if (disabledDomains.size > 0) {
+          console.log(`[UnifiedProcessor] ⏭️ Disabled domains (extraction skipped): ${Array.from(disabledDomains).join(', ')}`);
+        }
+
+        console.log(`[UnifiedProcessor] 🚀 Starting DOMAIN-BASED entity extraction: ${allNodes.length} nodes across ${nodesByDomainCombo.size} domain combo(s)`);
+
+        // Phase 3: Extract entities per domain combo
+        // Each combo gets merged entity_types from all its domains
+        let skippedNodes = 0;
+        for (const [comboKey, comboNodes] of nodesByDomainCombo) {
+          const domains = comboKey.split('|'); // e.g., "legal|tech" -> ["legal", "tech"]
+
+          // Filter out disabled domains from the combo
+          const enabledDomains = domains.filter(d => !disabledDomains.has(d));
+
+          // If ALL domains in the combo are disabled, skip extraction entirely
+          if (enabledDomains.length === 0 && comboKey !== 'default') {
+            console.log(`[UnifiedProcessor] ⏭️ Skipping "${comboKey}": all domains disabled (${comboNodes.length} nodes)`);
+            skippedNodes += comboNodes.length;
+
+            // Mark these nodes as processed so they won't be re-selected for extraction
+            await this.markNodesBatchEntityHashUpdated(comboNodes);
+
+            continue;
+          }
+
+          // Use enabled domains for extraction, or 'default' if none
+          const extractionDomains = enabledDomains.length > 0 ? enabledDomains : ['default'];
+
+          const BATCH_SIZE = 1000;
+          const totalBatches = Math.ceil(comboNodes.length / BATCH_SIZE);
+
+          console.log(`[UnifiedProcessor] 🏷️ Domain combo "${comboKey}": ${comboNodes.length} nodes in ${totalBatches} batch(es)${enabledDomains.length < domains.length ? ` (using: ${extractionDomains.join('|')})` : ''}`);
+
+          for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+            const batchStart = batchIdx * BATCH_SIZE;
+            const batchNodes = comboNodes.slice(batchStart, batchStart + BATCH_SIZE);
+
+            try {
+              this.signalActivity();
+              const batchResult = await this.extractEntitiesGlobalBatchWithDomains(batchNodes, extractionDomains);
+              this.signalActivity();
+              totalEntitiesCreated += batchResult.entitiesCreated;
+              totalRelationsCreated += batchResult.relationsCreated;
+
+              console.log(`[UnifiedProcessor] ✅ [${comboKey}] Batch ${batchIdx + 1}/${totalBatches}: ${batchResult.entitiesCreated} entities, ${batchResult.relationsCreated} relations`);
+            } catch (error: any) {
+              console.error(`[UnifiedProcessor] ❌ [${comboKey}] Batch ${batchIdx + 1}/${totalBatches} failed: ${error.message}`);
+            }
+          }
+        }
+
+        if (skippedNodes > 0) {
+          console.log(`[UnifiedProcessor] ⏭️ Total nodes skipped (disabled domains): ${skippedNodes}`);
+        }
+      }
+
+      // Unload GLiNER model from GPU to free VRAM for Ollama embeddings
+      console.log(`[UnifiedProcessor] 🔄 Unloading GLiNER model from GPU...`);
+      const unloadResult = await this.entityClient.unloadModel();
+      if (unloadResult.unloaded) {
+        console.log(`[UnifiedProcessor] ✅ GLiNER model unloaded, GPU memory freed for embeddings`);
       }
     }
 
-    // Handle failed files - transition to error state
-    if (failedFiles.length > 0) {
-      for (const { file, error } of failedFiles) {
-        await this.fileStateMachine.transition(file.uuid, 'error', {
-          errorType: 'entities',
-          errorMessage: error.message,
-        });
-        if (this.verbose) {
-          console.error(`[UnifiedProcessor] Entity extraction failed for ${file.file}: ${error.message}`);
-        }
-      }
+    // All files that had nodes processed are considered successful
+    const entitySuccesses: Array<{ file: FileStateInfo; result: { entitiesCreated: number; relationsCreated: number } }> = [];
+    for (const file of filesToProcess) {
+      const hasNodes = nodesByFile.has(file.file) && nodesByFile.get(file.file)!.length > 0;
+      entitySuccesses.push({
+        file,
+        result: { entitiesCreated: hasNodes ? 1 : 0, relationsCreated: 0 }, // Simplified - actual counts are global
+      });
+      successfulFiles.push(file);
     }
 
     if (successfulFiles.length === 0) {
@@ -288,8 +468,8 @@ export class UnifiedProcessor {
         filesSkipped: 0,
         filesErrored: failedFiles.length,
         scopesCreated: 0,
-        entitiesCreated: 0,
-        relationsCreated: 0,
+        entitiesCreated: totalEntitiesCreated,
+        relationsCreated: totalRelationsCreated,
         embeddingsGenerated: 0,
         durationMs: Date.now() - startTime,
       };
@@ -375,6 +555,89 @@ export class UnifiedProcessor {
       relationsCreated,
       embeddingsGenerated: totalEmbeddings,
       durationMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * Process nodes directly (not via Files) for embedding generation.
+   *
+   * This handles the case where:
+   * - A file was re-parsed and its nodes updated to _state='linked'
+   * - But the File itself remained _state='embedded'
+   * - So processLinked() didn't find the File
+   *
+   * This method generates embeddings for any nodes with _state='linked',
+   * regardless of their parent File's state.
+   */
+  async processLinkedNodes(): Promise<{ nodesProcessed: number; embeddingsGenerated: number }> {
+    // FIRST: Mark filtered Entity types as 'embedded' BEFORE checking for linked nodes
+    // These are entities like price, date, quantity, etc. that don't need embeddings
+    // This prevents infinite loop where skip types are found but never processed
+    const skipEmbeddingTypes = await this.entityClient.getSkipEmbeddingTypes();
+    const skipMarkedResult = await this.neo4jClient.run(`
+      MATCH (e:Entity {projectId: $projectId})
+      WHERE e._state = 'linked'
+        AND e.entityType IN $skipTypes
+      SET e._state = 'embedded'
+      RETURN count(e) AS marked
+    `, { projectId: this.projectId, skipTypes: skipEmbeddingTypes });
+
+    const skipMarkedCount = skipMarkedResult.records[0]?.get('marked')?.toNumber?.() ?? 0;
+    if (skipMarkedCount > 0) {
+      console.log(`[UnifiedProcessor] 📝 Pre-marked ${skipMarkedCount} skip-embedding Entity types as embedded`);
+    }
+
+    // Check if there are nodes needing embedding - get details for debugging
+    // Note: File is excluded because it's processed in Phase 1/2
+    // Directory, ExternalURL, etc. are now included (they have embedding configs)
+    // Project is excluded because it doesn't need embedding
+    const nodesWithLinkedState = await this.neo4jClient.run(`
+      MATCH (n)
+      WHERE n.projectId = $projectId
+        AND n._state = 'linked'
+        AND NOT n:File AND NOT n:Project
+      RETURN labels(n)[0] as label, n.uuid as uuid, n._name as name, n.file as file,
+             n.embedding_name IS NOT NULL as hasNameEmb,
+             n.embedding_content IS NOT NULL as hasContentEmb,
+             n.usesChunks as usesChunks,
+             n.embeddingsDirty as embeddingsDirty,
+             n.embedding_name_hash as nameHash,
+             n.embedding_content_hash as contentHash
+      LIMIT 10
+    `, { projectId: this.projectId });
+
+    const nodeCount = nodesWithLinkedState.records.length;
+
+    if (nodeCount === 0) {
+      return { nodesProcessed: 0, embeddingsGenerated: 0 };
+    }
+
+    // Log details of the nodes found
+    console.log(`[UnifiedProcessor] 🔄 Found ${nodeCount} nodes with _state='linked', details:`);
+    for (const record of nodesWithLinkedState.records) {
+      const label = record.get('label');
+      const uuid = record.get('uuid');
+      const name = record.get('name');
+      const file = record.get('file');
+      const hasNameEmb = record.get('hasNameEmb');
+      const hasContentEmb = record.get('hasContentEmb');
+      const usesChunks = record.get('usesChunks');
+      const embeddingsDirty = record.get('embeddingsDirty');
+      const nameHash = record.get('nameHash');
+      const contentHash = record.get('contentHash');
+      console.log(`  - ${label}: ${name} (file=${file}, uuid=${uuid?.substring(0, 8)}..., hasNameEmb=${hasNameEmb}, hasContentEmb=${hasContentEmb}, nameHash=${nameHash ? 'yes' : 'no'}, contentHash=${contentHash ? 'yes' : 'no'}, usesChunks=${usesChunks}, dirty=${embeddingsDirty})`);
+    }
+
+    console.log(`[UnifiedProcessor] Generating embeddings for project ${this.projectId}...`);
+
+    // Generate embeddings for all nodes with _state='linked'
+    const embeddingResult = await this.generateEmbeddingsForFile('nodes-batch');
+
+    console.log(`[UnifiedProcessor] ✅ Processed ${nodeCount} nodes, generated ${embeddingResult.embeddingsGenerated} embeddings`);
+
+    return {
+      nodesProcessed: nodeCount,
+      embeddingsGenerated: embeddingResult.embeddingsGenerated,
     };
   }
 
@@ -520,9 +783,9 @@ export class UnifiedProcessor {
       // 3. Restore metadata after parsing
       await this.metadataPreserver.restoreMetadata(capturedMetadata);
 
-      // 4. Entity extraction
+      // 4. Entity extraction (with domain-based skip logic)
       await this.fileStateMachine.transition(fileInfo.uuid, 'entities');
-      const entitiesResult = await this.extractEntitiesForFile(filePath);
+      const entitiesResult = await this.extractEntitiesForFileSingleWithDomainCheck(filePath);
 
       // 5. Embedding generation
       await this.fileStateMachine.transition(fileInfo.uuid, 'embedding');
@@ -618,6 +881,7 @@ export class UnifiedProcessor {
     uuid: string;
     content: string;
     label: string;
+    contentHash: string;
   }>> {
     const result = await this.neo4jClient.run(
       `
@@ -626,7 +890,8 @@ export class UnifiedProcessor {
         AND (n:MarkdownSection OR n:MarkdownDocument OR n:WebPage OR n:WebDocument)
         AND n._content IS NOT NULL
         AND n._state = 'linked'
-      RETURN n.uuid AS uuid, n._content AS content, labels(n)[0] AS label
+        AND (n._entitiesContentHash IS NULL OR n._entitiesContentHash <> n._contentHash)
+      RETURN n.uuid AS uuid, n._content AS content, labels(n)[0] AS label, n._contentHash AS contentHash
       LIMIT 100
       `,
       { filePath, projectId: this.projectId }
@@ -637,8 +902,671 @@ export class UnifiedProcessor {
         uuid: r.get('uuid'),
         content: r.get('content'),
         label: r.get('label'),
+        contentHash: r.get('contentHash') || '',
       }))
       .filter(n => n.content && n.content.length >= 50);
+  }
+
+  /**
+   * Batch fetch ALL nodes for entity extraction across ALL files (single query)
+   * Returns a Map of filePath -> nodes for that file
+   */
+  private async getAllNodesForEntityExtractionBatch(): Promise<Map<string, Array<{
+    uuid: string;
+    content: string;
+    label: string;
+    contentHash: string;
+  }>>> {
+    const result = await this.neo4jClient.run(
+      `
+      MATCH (n)-[:DEFINED_IN]->(f:File)
+      WHERE f.projectId = $projectId
+        AND (n:MarkdownSection OR n:MarkdownDocument OR n:WebPage OR n:WebDocument)
+        AND n._content IS NOT NULL
+        AND n._state = 'linked'
+        AND (n._entitiesContentHash IS NULL OR n._entitiesContentHash <> n._contentHash)
+      RETURN f.absolutePath AS filePath, n.uuid AS uuid, n._content AS content, labels(n)[0] AS label, n._contentHash AS contentHash
+      `,
+      { projectId: this.projectId }
+    );
+
+    // Group by file path
+    const nodesByFile = new Map<string, Array<{ uuid: string; content: string; label: string; contentHash: string }>>();
+
+    for (const record of result.records) {
+      const filePath = record.get('filePath');
+      const node = {
+        uuid: record.get('uuid'),
+        content: record.get('content'),
+        label: record.get('label'),
+        contentHash: record.get('contentHash') || '',
+      };
+
+      // Filter: content must exist and be >= 50 chars
+      if (!node.content || node.content.length < 50) continue;
+
+      if (!nodesByFile.has(filePath)) {
+        nodesByFile.set(filePath, []);
+      }
+      nodesByFile.get(filePath)!.push(node);
+    }
+
+    return nodesByFile;
+  }
+
+  /**
+   * Extract entities using pre-fetched nodes (most optimized version)
+   * Nodes are passed directly - no DB query needed
+   */
+  private async extractEntitiesWithNodes(
+    nodes: Array<{ uuid: string; content: string; label: string }>,
+    glinerAvailable: boolean
+  ): Promise<{ entitiesCreated: number; relationsCreated: number }> {
+    if (!glinerAvailable || nodes.length === 0) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // Parallel extraction with pLimit(5) for GLiNER concurrency
+    const glinerLimit = pLimit(5);
+    const extractions = await Promise.all(
+      nodes.map(node =>
+        glinerLimit(async () => {
+          try {
+            const result = await this.entityClient.extract(
+              node.content.slice(0, 5000)
+            );
+            return { node, result, error: null };
+          } catch (error: any) {
+            if (this.verbose) {
+              console.warn(`[UnifiedProcessor] Entity extraction failed for ${node.uuid}: ${(error as Error).message}`);
+            }
+            return { node, result: null, error };
+          }
+        })
+      )
+    );
+
+    // Filter successful extractions
+    const successfulExtractions = extractions.filter(e => e.result !== null);
+    const totalEntitiesExtracted = successfulExtractions.reduce(
+      (sum, e) => sum + (e.result?.entities?.length || 0), 0
+    );
+    const totalRelationsExtracted = successfulExtractions.reduce(
+      (sum, e) => sum + (e.result?.relations?.length || 0), 0
+    );
+
+    if (this.verbose || totalEntitiesExtracted > 0) {
+      console.log(`[UnifiedProcessor] 🧠 GLiNER extracted ${totalEntitiesExtracted} entities, ${totalRelationsExtracted} relations from ${successfulExtractions.length}/${nodes.length} nodes`);
+    }
+
+    if (successfulExtractions.length === 0) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // Collect all entities with their source info (including label for indexed queries)
+    const allEntities: Array<{
+      entityId: string;
+      name: string;
+      entityType: string;
+      confidence: number;
+      sourceUuid: string;
+      sourceLabel: string;
+    }> = [];
+
+    const entityMaps = new Map<string, Map<string, string>>();
+
+    for (const { node, result } of successfulExtractions) {
+      if (!result || !result.entities) continue;
+
+      const nodeEntityMap = new Map<string, string>();
+      entityMaps.set(node.uuid, nodeEntityMap);
+
+      for (const entity of result.entities) {
+        const normalizedName = entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+        const entityId = `entity:${entity.type}:${normalizedName}`;
+        nodeEntityMap.set(entity.name.toLowerCase(), entityId);
+        allEntities.push({
+          entityId,
+          name: entity.name,
+          entityType: entity.type,
+          confidence: entity.confidence ?? 0.5,
+          sourceUuid: node.uuid,
+          sourceLabel: node.label,
+        });
+      }
+    }
+
+    // Batch create entities with UNWIND - grouped by sourceLabel for index usage
+    let entitiesCreated = 0;
+    if (allEntities.length > 0) {
+      // Group entities by sourceLabel to use label-specific indexes
+      const entitiesByLabel = new Map<string, typeof allEntities>();
+      for (const e of allEntities) {
+        const group = entitiesByLabel.get(e.sourceLabel) || [];
+        group.push(e);
+        entitiesByLabel.set(e.sourceLabel, group);
+      }
+
+      // Run a separate query per label (uses index on Label.uuid)
+      for (const [label, entities] of entitiesByLabel) {
+        const entityResult = await this.neo4jClient.run(
+          `
+          UNWIND $entities AS entity
+          MERGE (e:Entity {uuid: entity.entityId})
+          ON CREATE SET
+            e._name = entity.name,
+            e._content = null,
+            e._description = entity.entityType,
+            e.entityType = entity.entityType,
+            e.confidence = entity.confidence,
+            e.projectId = $projectId,
+            e._state = 'linked',
+            e.embeddingsDirty = true
+          WITH e, entity
+          MATCH (n:\`${label}\` {uuid: entity.sourceUuid})
+          MERGE (n)-[r:MENTIONS]->(e)
+          ON CREATE SET r.confidence = entity.confidence
+          RETURN count(DISTINCT e) AS created
+          `,
+          { entities, projectId: this.projectId }
+        );
+
+        const createdValue = entityResult.records[0]?.get('created');
+        entitiesCreated += createdValue?.toNumber?.() ?? (typeof createdValue === 'number' ? createdValue : 0);
+      }
+    }
+
+    // Collect and create relations (same logic as before)
+    const allRelations: Array<{
+      subjectId: string;
+      objectId: string;
+      predicate: string;
+      confidence: number;
+      sourceUuid: string;
+    }> = [];
+
+    for (const { node, result } of successfulExtractions) {
+      if (!result || !result.relations) continue;
+      const nodeEntityMap = entityMaps.get(node.uuid);
+      if (!nodeEntityMap) continue;
+
+      for (const relation of result.relations) {
+        const subjectId = nodeEntityMap.get(relation.subject.toLowerCase());
+        const objectId = nodeEntityMap.get(relation.object.toLowerCase());
+        if (subjectId && objectId) {
+          allRelations.push({
+            subjectId,
+            objectId,
+            predicate: relation.predicate,
+            confidence: relation.confidence ?? 0.5,
+            sourceUuid: node.uuid,
+          });
+        }
+      }
+    }
+
+    let relationsCreated = 0;
+    if (allRelations.length > 0) {
+      const relationResult = await this.neo4jClient.run(
+        `
+        UNWIND $relations AS rel
+        MATCH (subject:Entity {uuid: rel.subjectId})
+        MATCH (object:Entity {uuid: rel.objectId})
+        MERGE (subject)-[r:RELATED_TO {type: rel.predicate}]->(object)
+        ON CREATE SET
+          r.confidence = rel.confidence,
+          r.sourceNodeUuid = rel.sourceUuid,
+          r.createdAt = datetime()
+        ON MATCH SET
+          r.confidence = CASE WHEN r.confidence < rel.confidence THEN rel.confidence ELSE r.confidence END
+        RETURN count(r) AS created
+        `,
+        { relations: allRelations }
+      );
+
+      const relCreatedValue = relationResult.records[0]?.get('created');
+      relationsCreated = relCreatedValue?.toNumber?.() ?? (typeof relCreatedValue === 'number' ? relCreatedValue : 0);
+    }
+
+    return { entitiesCreated, relationsCreated };
+  }
+
+  /**
+   * GLOBAL BATCH entity extraction - processes ALL nodes in a single GLiNER batch call.
+   * Much more efficient than per-file extraction.
+   *
+   * @param nodes - All nodes to process (with filePath for tracking)
+   */
+  private async extractEntitiesGlobalBatch(
+    nodes: Array<{ uuid: string; content: string; label: string; filePath: string; contentHash: string }>
+  ): Promise<{ entitiesCreated: number; relationsCreated: number }> {
+    if (nodes.length === 0) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 1. Extract texts (truncated to 5000 chars each)
+    const texts = nodes.map(n => n.content.slice(0, 5000));
+
+    // 2. Single batch call to GLiNER (this is the long-running operation)
+    const extractionStartTime = Date.now();
+    const results = await this.entityClient.extractBatch(texts);
+    const extractionDuration = Date.now() - extractionStartTime;
+    this.signalActivity(); // Signal activity after GLiNER extraction
+
+    const totalEntitiesExtracted = results.reduce((sum, r) => sum + (r?.entities?.length || 0), 0);
+    const totalRelationsExtracted = results.reduce((sum, r) => sum + (r?.relations?.length || 0), 0);
+
+    console.log(`[UnifiedProcessor] 🧠 GLiNER batch extracted ${totalEntitiesExtracted} entities, ${totalRelationsExtracted} relations from ${nodes.length} nodes in ${extractionDuration}ms`);
+
+    // 3. Collect all entities with source tracking (including label for indexed queries)
+    const allEntities: Array<{
+      entityId: string;
+      name: string;
+      entityType: string;
+      confidence: number;
+      sourceUuid: string;
+      sourceLabel: string;
+    }> = [];
+
+    const entityMaps = new Map<string, Map<string, string>>();
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const node = nodes[i];
+      if (!result || !result.entities) continue;
+
+      const nodeEntityMap = new Map<string, string>();
+      entityMaps.set(node.uuid, nodeEntityMap);
+
+      for (const entity of result.entities) {
+        const normalizedName = entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+        const entityId = `entity:${entity.type}:${normalizedName}`;
+        nodeEntityMap.set(entity.name.toLowerCase(), entityId);
+        allEntities.push({
+          entityId,
+          name: entity.name,
+          entityType: entity.type,
+          confidence: entity.confidence ?? 0.5,
+          sourceUuid: node.uuid,
+          sourceLabel: node.label,
+        });
+      }
+    }
+
+    // 4. Batch create entities with UNWIND - grouped by sourceLabel for index usage
+    let entitiesCreated = 0;
+    if (allEntities.length > 0) {
+      // Group entities by sourceLabel to use label-specific indexes
+      const entitiesByLabel = new Map<string, typeof allEntities>();
+      for (const e of allEntities) {
+        const group = entitiesByLabel.get(e.sourceLabel) || [];
+        group.push(e);
+        entitiesByLabel.set(e.sourceLabel, group);
+      }
+
+      // Run a separate query per label (uses index on Label.uuid)
+      for (const [label, entities] of entitiesByLabel) {
+        const entityResult = await this.neo4jClient.run(
+          `
+          UNWIND $entities AS entity
+          MERGE (e:Entity {uuid: entity.entityId})
+          ON CREATE SET
+            e._name = entity.name,
+            e._content = null,
+            e._description = entity.entityType,
+            e.entityType = entity.entityType,
+            e.confidence = entity.confidence,
+            e.projectId = $projectId,
+            e._state = 'linked',
+            e.embeddingsDirty = true
+          WITH e, entity
+          MATCH (n:\`${label}\` {uuid: entity.sourceUuid})
+          MERGE (n)-[r:MENTIONS]->(e)
+          ON CREATE SET r.confidence = entity.confidence
+          RETURN count(DISTINCT e) AS created
+          `,
+          { entities, projectId: this.projectId }
+        );
+
+        const createdValue = entityResult.records[0]?.get('created');
+        entitiesCreated += createdValue?.toNumber?.() ?? (typeof createdValue === 'number' ? createdValue : 0);
+      }
+    }
+
+    // 5. Collect and batch create relations
+    const allRelations: Array<{
+      subjectId: string;
+      objectId: string;
+      predicate: string;
+      confidence: number;
+      sourceUuid: string;
+    }> = [];
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const node = nodes[i];
+      if (!result || !result.relations) continue;
+
+      const nodeEntityMap = entityMaps.get(node.uuid);
+      if (!nodeEntityMap) continue;
+
+      for (const relation of result.relations) {
+        const subjectId = nodeEntityMap.get(relation.subject.toLowerCase());
+        const objectId = nodeEntityMap.get(relation.object.toLowerCase());
+        if (subjectId && objectId) {
+          allRelations.push({
+            subjectId,
+            objectId,
+            predicate: relation.predicate,
+            confidence: relation.confidence ?? 0.5,
+            sourceUuid: node.uuid,
+          });
+        }
+      }
+    }
+
+    let relationsCreated = 0;
+    if (allRelations.length > 0) {
+      const relationResult = await this.neo4jClient.run(
+        `
+        UNWIND $relations AS rel
+        MATCH (subject:Entity {uuid: rel.subjectId})
+        MATCH (object:Entity {uuid: rel.objectId})
+        MERGE (subject)-[r:RELATED_TO {type: rel.predicate}]->(object)
+        ON CREATE SET
+          r.confidence = rel.confidence,
+          r.sourceNodeUuid = rel.sourceUuid,
+          r.createdAt = datetime()
+        ON MATCH SET
+          r.confidence = CASE WHEN r.confidence < rel.confidence THEN rel.confidence ELSE r.confidence END
+        RETURN count(r) AS created
+        `,
+        { relations: allRelations }
+      );
+
+      const relCreatedValue = relationResult.records[0]?.get('created');
+      relationsCreated = relCreatedValue?.toNumber?.() ?? (typeof relCreatedValue === 'number' ? relCreatedValue : 0);
+    }
+
+    // 6. Update _entitiesContentHash on all processed nodes to prevent re-extraction
+    // Group by label for efficient indexed updates
+    const nodesByLabel = new Map<string, Array<{ uuid: string; contentHash: string }>>();
+    for (const node of nodes) {
+      const group = nodesByLabel.get(node.label) || [];
+      group.push({ uuid: node.uuid, contentHash: node.contentHash });
+      nodesByLabel.set(node.label, group);
+    }
+
+    for (const [label, nodeData] of nodesByLabel) {
+      await this.neo4jClient.run(
+        `
+        UNWIND $nodes AS node
+        MATCH (n:\`${label}\` {uuid: node.uuid})
+        SET n._entitiesContentHash = node.contentHash
+        `,
+        { nodes: nodeData }
+      );
+    }
+
+    return { entitiesCreated, relationsCreated };
+  }
+
+  /**
+   * Extract entities for a batch of nodes using specific domains' entity types.
+   * Similar to extractEntitiesGlobalBatch but uses merged entity types from domains.
+   *
+   * @param nodes - Nodes with content to extract from
+   * @param domains - Array of domain names (e.g., ["legal", "tech"])
+   */
+  private async extractEntitiesGlobalBatchWithDomains(
+    nodes: Array<{ uuid: string; content: string; label: string; filePath: string; contentHash: string }>,
+    domains: string[]
+  ): Promise<{ entitiesCreated: number; relationsCreated: number }> {
+    if (nodes.length === 0) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 0. Collect existing MENTIONS relationships for comparison after extraction
+    const nodeUuids = nodes.map(n => n.uuid);
+    const existingMentions = new Set<string>(); // "nodeUuid|entityUuid"
+
+    const existingResult = await this.neo4jClient.run(
+      `
+      UNWIND $uuids AS uuid
+      MATCH (n {uuid: uuid})-[:MENTIONS]->(e:Entity)
+      RETURN n.uuid AS nodeUuid, e.uuid AS entityUuid
+      `,
+      { uuids: nodeUuids }
+    );
+
+    for (const record of existingResult.records) {
+      const nodeUuid = record.get('nodeUuid');
+      const entityUuid = record.get('entityUuid');
+      existingMentions.add(`${nodeUuid}|${entityUuid}`);
+    }
+
+    if (this.verbose && existingMentions.size > 0) {
+      console.log(`[UnifiedProcessor] Found ${existingMentions.size} existing MENTIONS to compare after extraction`);
+    }
+
+    // 1. Extract texts (truncated to 5000 chars each)
+    const texts = nodes.map(n => n.content.slice(0, 5000));
+
+    // 2. Single batch call to GLiNER with domain-specific entity types
+    const extractionStartTime = Date.now();
+    const results = await this.entityClient.extractBatchWithDomains(texts, domains);
+    const extractionDuration = Date.now() - extractionStartTime;
+    this.signalActivity();
+
+    const totalEntitiesExtracted = results.reduce((sum, r) => sum + (r?.entities?.length || 0), 0);
+    const totalRelationsExtracted = results.reduce((sum, r) => sum + (r?.relations?.length || 0), 0);
+
+    console.log(`[UnifiedProcessor] 🧠 GLiNER batch [${domains.join('|')}] extracted ${totalEntitiesExtracted} entities, ${totalRelationsExtracted} relations from ${nodes.length} nodes in ${extractionDuration}ms`);
+
+    // 3. Collect all entities with source tracking
+    const allEntities: Array<{
+      entityId: string;
+      name: string;
+      entityType: string;
+      confidence: number;
+      sourceUuid: string;
+      sourceLabel: string;
+    }> = [];
+
+    const entityMaps = new Map<string, Map<string, string>>();
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const node = nodes[i];
+      if (!result || !result.entities) continue;
+
+      const nodeEntityMap = new Map<string, string>();
+      entityMaps.set(node.uuid, nodeEntityMap);
+
+      for (const entity of result.entities) {
+        const normalizedName = entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+        const entityId = `entity:${entity.type}:${normalizedName}`;
+        nodeEntityMap.set(entity.name.toLowerCase(), entityId);
+        allEntities.push({
+          entityId,
+          name: entity.name,
+          entityType: entity.type,
+          confidence: entity.confidence ?? 0.5,
+          sourceUuid: node.uuid,
+          sourceLabel: node.label,
+        });
+      }
+    }
+
+    // 4. Batch create entities with UNWIND - grouped by sourceLabel
+    let entitiesCreated = 0;
+    if (allEntities.length > 0) {
+      const entitiesByLabel = new Map<string, typeof allEntities>();
+      for (const e of allEntities) {
+        const group = entitiesByLabel.get(e.sourceLabel) || [];
+        group.push(e);
+        entitiesByLabel.set(e.sourceLabel, group);
+      }
+
+      for (const [label, entities] of entitiesByLabel) {
+        const entityResult = await this.neo4jClient.run(
+          `
+          UNWIND $entities AS entity
+          MERGE (e:Entity {uuid: entity.entityId})
+          ON CREATE SET
+            e._name = entity.name,
+            e._content = null,
+            e._description = entity.entityType,
+            e.entityType = entity.entityType,
+            e.confidence = entity.confidence,
+            e.projectId = $projectId,
+            e._state = 'linked',
+            e.embeddingsDirty = true
+          WITH e, entity
+          MATCH (n:\`${label}\` {uuid: entity.sourceUuid})
+          MERGE (n)-[r:MENTIONS]->(e)
+          ON CREATE SET r.confidence = entity.confidence
+          RETURN count(DISTINCT e) AS created
+          `,
+          { entities, projectId: this.projectId }
+        );
+
+        const createdValue = entityResult.records[0]?.get('created');
+        entitiesCreated += createdValue?.toNumber?.() ?? (typeof createdValue === 'number' ? createdValue : 0);
+      }
+    }
+
+    // 5. Collect and batch create relations
+    const allRelations: Array<{
+      subjectId: string;
+      objectId: string;
+      predicate: string;
+      confidence: number;
+      sourceUuid: string;
+    }> = [];
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const node = nodes[i];
+      if (!result || !result.relations) continue;
+
+      const nodeEntityMap = entityMaps.get(node.uuid);
+      if (!nodeEntityMap) continue;
+
+      for (const relation of result.relations) {
+        const subjectId = nodeEntityMap.get(relation.subject.toLowerCase());
+        const objectId = nodeEntityMap.get(relation.object.toLowerCase());
+        if (subjectId && objectId) {
+          allRelations.push({
+            subjectId,
+            objectId,
+            predicate: relation.predicate,
+            confidence: relation.confidence ?? 0.5,
+            sourceUuid: node.uuid,
+          });
+        }
+      }
+    }
+
+    let relationsCreated = 0;
+    if (allRelations.length > 0) {
+      const relationResult = await this.neo4jClient.run(
+        `
+        UNWIND $relations AS rel
+        MATCH (subject:Entity {uuid: rel.subjectId})
+        MATCH (object:Entity {uuid: rel.objectId})
+        MERGE (subject)-[r:RELATED_TO {type: rel.predicate}]->(object)
+        ON CREATE SET
+          r.confidence = rel.confidence,
+          r.sourceNodeUuid = rel.sourceUuid,
+          r.createdAt = datetime()
+        ON MATCH SET
+          r.confidence = CASE WHEN r.confidence < rel.confidence THEN rel.confidence ELSE r.confidence END
+        RETURN count(r) AS created
+        `,
+        { relations: allRelations }
+      );
+
+      const relCreatedValue = relationResult.records[0]?.get('created');
+      relationsCreated = relCreatedValue?.toNumber?.() ?? (typeof relCreatedValue === 'number' ? relCreatedValue : 0);
+    }
+
+    // 5.5. Cleanup stale MENTIONS relationships
+    if (existingMentions.size > 0) {
+      // Build set of new mentions from allEntities
+      const newMentions = new Set<string>();
+      for (const entity of allEntities) {
+        newMentions.add(`${entity.sourceUuid}|${entity.entityId}`);
+      }
+
+      // Find stale mentions (exist before but not after)
+      const staleMentions: Array<{ nodeUuid: string; entityUuid: string }> = [];
+      for (const key of existingMentions) {
+        if (!newMentions.has(key)) {
+          const [nodeUuid, entityUuid] = key.split('|');
+          staleMentions.push({ nodeUuid, entityUuid });
+        }
+      }
+
+      if (staleMentions.length > 0) {
+        // Delete stale MENTIONS relationships
+        const deleteResult = await this.neo4jClient.run(
+          `
+          UNWIND $staleMentions AS m
+          MATCH (n {uuid: m.nodeUuid})-[r:MENTIONS]->(e:Entity {uuid: m.entityUuid})
+          DELETE r
+          RETURN count(r) AS deleted
+          `,
+          { staleMentions }
+        );
+        const deleted = deleteResult.records[0]?.get('deleted');
+        const deletedCount = deleted?.toNumber?.() ?? (typeof deleted === 'number' ? deleted : 0);
+
+        if (deletedCount > 0) {
+          console.log(`[UnifiedProcessor] 🧹 Cleaned up ${deletedCount} stale MENTIONS relationships`);
+        }
+
+        // Delete orphaned entities (no MENTIONS relationships left)
+        const orphanResult = await this.neo4jClient.run(
+          `
+          MATCH (e:Entity {projectId: $projectId})
+          WHERE NOT (e)<-[:MENTIONS]-()
+          WITH e, e._name AS name
+          DETACH DELETE e
+          RETURN count(e) AS deleted, collect(name)[0..5] AS samples
+          `,
+          { projectId: this.projectId }
+        );
+        const orphansDeleted = orphanResult.records[0]?.get('deleted');
+        const orphanCount = orphansDeleted?.toNumber?.() ?? (typeof orphansDeleted === 'number' ? orphansDeleted : 0);
+        const samples = orphanResult.records[0]?.get('samples') || [];
+
+        if (orphanCount > 0) {
+          console.log(`[UnifiedProcessor] 🗑️ Deleted ${orphanCount} orphaned entities${samples.length > 0 ? ` (e.g., ${samples.slice(0, 3).join(', ')})` : ''}`);
+        }
+      }
+    }
+
+    // 6. Update _entitiesContentHash on all processed nodes
+    const nodesByLabel = new Map<string, Array<{ uuid: string; contentHash: string }>>();
+    for (const node of nodes) {
+      const group = nodesByLabel.get(node.label) || [];
+      group.push({ uuid: node.uuid, contentHash: node.contentHash });
+      nodesByLabel.set(node.label, group);
+    }
+
+    for (const [label, nodeData] of nodesByLabel) {
+      await this.neo4jClient.run(
+        `
+        UNWIND $nodes AS node
+        MATCH (n:\`${label}\` {uuid: node.uuid})
+        SET n._entitiesContentHash = node.contentHash
+        `,
+        { nodes: nodeData }
+      );
+    }
+
+    return { entitiesCreated, relationsCreated };
   }
 
   /**
@@ -649,17 +1577,15 @@ export class UnifiedProcessor {
    * - Batch entity creation with UNWIND
    * - Batch relation creation with UNWIND
    * - Batch MENTIONS relationship creation
+   *
+   * @param glinerAvailable - Pre-checked GLiNER availability (avoids redundant checks)
    */
-  private async extractEntitiesForFile(filePath: string): Promise<{
+  private async extractEntitiesForFileOptimized(filePath: string, glinerAvailable: boolean): Promise<{
     entitiesCreated: number;
     relationsCreated: number;
   }> {
-    // Check if GLiNER service is available
-    const isAvailable = await this.entityClient.isAvailable();
-    if (!isAvailable) {
-      if (this.verbose) {
-        console.log(`[UnifiedProcessor] GLiNER service not available, skipping entity extraction`);
-      }
+    // Use pre-checked availability to avoid redundant network calls
+    if (!glinerAvailable) {
       return { entitiesCreated: 0, relationsCreated: 0 };
     }
 
@@ -668,6 +1594,30 @@ export class UnifiedProcessor {
 
     if (nodes.length === 0) {
       return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 1.5. Collect existing MENTIONS relationships for comparison after extraction
+    // This allows us to detect which entities are no longer mentioned
+    const nodeUuids = nodes.map(n => n.uuid);
+    const existingMentions = new Set<string>(); // "nodeUuid|entityUuid"
+
+    const existingResult = await this.neo4jClient.run(
+      `
+      UNWIND $uuids AS uuid
+      MATCH (n {uuid: uuid})-[:MENTIONS]->(e:Entity)
+      RETURN n.uuid AS nodeUuid, e.uuid AS entityUuid
+      `,
+      { uuids: nodeUuids }
+    );
+
+    for (const record of existingResult.records) {
+      const nodeUuid = record.get('nodeUuid');
+      const entityUuid = record.get('entityUuid');
+      existingMentions.add(`${nodeUuid}|${entityUuid}`);
+    }
+
+    if (this.verbose && existingMentions.size > 0) {
+      console.log(`[UnifiedProcessor] Found ${existingMentions.size} existing MENTIONS to compare after extraction`);
     }
 
     // 2. Parallel extraction with pLimit(5) for GLiNER concurrency
@@ -697,13 +1647,14 @@ export class UnifiedProcessor {
       return { entitiesCreated: 0, relationsCreated: 0 };
     }
 
-    // 3. Collect all entities with their source info
+    // 3. Collect all entities with their source info (including label for indexed queries)
     const allEntities: Array<{
       entityId: string;
       name: string;
       entityType: string;
       confidence: number;
       sourceUuid: string;
+      sourceLabel: string;
     }> = [];
 
     // Track entity name -> entityId for relation creation (per source node)
@@ -727,36 +1678,49 @@ export class UnifiedProcessor {
           entityType: entity.type,
           confidence: entity.confidence ?? 0.5,
           sourceUuid: node.uuid,
+          sourceLabel: node.label,
         });
       }
     }
 
-    // 4. Batch create entities with UNWIND
+    // 4. Batch create entities with UNWIND - grouped by sourceLabel for index usage
     let entitiesCreated = 0;
     if (allEntities.length > 0) {
-      const entityResult = await this.neo4jClient.run(
-        `
-        UNWIND $entities AS entity
-        MERGE (e:Entity {uuid: entity.entityId})
-        ON CREATE SET
-          e._name = entity.name,
-          e._content = null,
-          e._description = entity.entityType,
-          e.entityType = entity.entityType,
-          e.confidence = entity.confidence,
-          e.projectId = $projectId,
-          e._state = 'linked'
-        WITH e, entity
-        MATCH (n {uuid: entity.sourceUuid})
-        MERGE (n)-[r:MENTIONS]->(e)
-        ON CREATE SET r.confidence = entity.confidence
-        RETURN count(DISTINCT e) AS created
-        `,
-        { entities: allEntities, projectId: this.projectId }
-      );
+      // Group entities by sourceLabel to use label-specific indexes
+      const entitiesByLabel = new Map<string, typeof allEntities>();
+      for (const e of allEntities) {
+        const group = entitiesByLabel.get(e.sourceLabel) || [];
+        group.push(e);
+        entitiesByLabel.set(e.sourceLabel, group);
+      }
 
-      entitiesCreated = entityResult.records[0]?.get('created')?.toNumber?.() ||
-                        entityResult.records[0]?.get('created') || 0;
+      // Run a separate query per label (uses index on Label.uuid)
+      for (const [label, entities] of entitiesByLabel) {
+        const entityResult = await this.neo4jClient.run(
+          `
+          UNWIND $entities AS entity
+          MERGE (e:Entity {uuid: entity.entityId})
+          ON CREATE SET
+            e._name = entity.name,
+            e._content = null,
+            e._description = entity.entityType,
+            e.entityType = entity.entityType,
+            e.confidence = entity.confidence,
+            e.projectId = $projectId,
+            e._state = 'linked',
+            e.embeddingsDirty = true
+          WITH e, entity
+          MATCH (n:\`${label}\` {uuid: entity.sourceUuid})
+          MERGE (n)-[r:MENTIONS]->(e)
+          ON CREATE SET r.confidence = entity.confidence
+          RETURN count(DISTINCT e) AS created
+          `,
+          { entities, projectId: this.projectId }
+        );
+
+        const createdValue = entityResult.records[0]?.get('created');
+        entitiesCreated += createdValue?.toNumber?.() ?? (typeof createdValue === 'number' ? createdValue : 0);
+      }
     }
 
     // 5. Collect all relations
@@ -812,15 +1776,253 @@ export class UnifiedProcessor {
         { relations: allRelations }
       );
 
-      relationsCreated = relationResult.records[0]?.get('created')?.toNumber?.() ||
-                         relationResult.records[0]?.get('created') || 0;
+      const relCreatedValue = relationResult.records[0]?.get('created');
+      relationsCreated = relCreatedValue?.toNumber?.() ?? (typeof relCreatedValue === 'number' ? relCreatedValue : 0);
 
       if (this.verbose && relationsCreated > 0) {
         console.log(`[UnifiedProcessor] Created ${relationsCreated} entity relations`);
       }
     }
 
+    // 6.5. Cleanup stale MENTIONS relationships
+    // Compare existing mentions with new ones and delete the stale ones
+    if (existingMentions.size > 0) {
+      // Build set of new mentions from allEntities
+      const newMentions = new Set<string>();
+      for (const entity of allEntities) {
+        // entityId is the uuid we'll use, sourceUuid is the node
+        newMentions.add(`${entity.sourceUuid}|${entity.entityId}`);
+      }
+
+      // Find stale mentions (exist before but not after)
+      const staleMentions: Array<{ nodeUuid: string; entityUuid: string }> = [];
+      for (const key of existingMentions) {
+        if (!newMentions.has(key)) {
+          const [nodeUuid, entityUuid] = key.split('|');
+          staleMentions.push({ nodeUuid, entityUuid });
+        }
+      }
+
+      if (staleMentions.length > 0) {
+        // Delete stale MENTIONS relationships
+        const deleteResult = await this.neo4jClient.run(
+          `
+          UNWIND $staleMentions AS m
+          MATCH (n {uuid: m.nodeUuid})-[r:MENTIONS]->(e:Entity {uuid: m.entityUuid})
+          DELETE r
+          RETURN count(r) AS deleted
+          `,
+          { staleMentions }
+        );
+        const deleted = deleteResult.records[0]?.get('deleted');
+        const deletedCount = deleted?.toNumber?.() ?? (typeof deleted === 'number' ? deleted : 0);
+
+        if (this.verbose || deletedCount > 0) {
+          console.log(`[UnifiedProcessor] 🧹 Cleaned up ${deletedCount} stale MENTIONS relationships`);
+        }
+
+        // Delete orphaned entities (no MENTIONS relationships left)
+        const orphanResult = await this.neo4jClient.run(
+          `
+          MATCH (e:Entity {projectId: $projectId})
+          WHERE NOT (e)<-[:MENTIONS]-()
+          WITH e, e._name AS name
+          DETACH DELETE e
+          RETURN count(e) AS deleted, collect(name)[0..5] AS samples
+          `,
+          { projectId: this.projectId }
+        );
+        const orphansDeleted = orphanResult.records[0]?.get('deleted');
+        const orphanCount = orphansDeleted?.toNumber?.() ?? (typeof orphansDeleted === 'number' ? orphansDeleted : 0);
+        const samples = orphanResult.records[0]?.get('samples') || [];
+
+        if (this.verbose || orphanCount > 0) {
+          console.log(`[UnifiedProcessor] 🗑️ Deleted ${orphanCount} orphaned entities${samples.length > 0 ? ` (e.g., ${samples.slice(0, 3).join(', ')})` : ''}`);
+        }
+      }
+    }
+
+    // 7. Update _entitiesContentHash on all processed nodes to prevent re-extraction
+    const nodesByLabel = new Map<string, Array<{ uuid: string; contentHash: string }>>();
+    for (const node of nodes) {
+      const group = nodesByLabel.get(node.label) || [];
+      group.push({ uuid: node.uuid, contentHash: node.contentHash });
+      nodesByLabel.set(node.label, group);
+    }
+
+    for (const [label, nodeData] of nodesByLabel) {
+      await this.neo4jClient.run(
+        `
+        UNWIND $nodes AS node
+        MATCH (n:\`${label}\` {uuid: node.uuid})
+        SET n._entitiesContentHash = node.contentHash
+        `,
+        { nodes: nodeData }
+      );
+    }
+
     return { entitiesCreated, relationsCreated };
+  }
+
+  /**
+   * Extract entities for a single file (backward compatible wrapper)
+   * Checks GLiNER availability internally - use extractEntitiesForFileOptimized for batch operations
+   * Handles GPU load/unload automatically
+   */
+  private async extractEntitiesForFile(filePath: string): Promise<{
+    entitiesCreated: number;
+    relationsCreated: number;
+  }> {
+    const glinerAvailable = await this.entityClient.isAvailable();
+    if (!glinerAvailable) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // Load GLiNER model to GPU
+    await this.entityClient.loadModel();
+
+    try {
+      return await this.extractEntitiesForFileOptimized(filePath, glinerAvailable);
+    } finally {
+      // Always unload to free GPU for Ollama embeddings
+      await this.entityClient.unloadModel();
+    }
+  }
+
+  /**
+   * Extract entities for a single file WITH domain classification and disabled domain check.
+   * Used by processFile() for individual file processing.
+   *
+   * This method:
+   * 1. Reads file content
+   * 2. Classifies domain
+   * 3. Checks if all domains are disabled → skip extraction
+   * 4. If enabled, extracts with domain-specific entity types
+   */
+  private async extractEntitiesForFileSingleWithDomainCheck(filePath: string): Promise<{
+    entitiesCreated: number;
+    relationsCreated: number;
+  }> {
+    const glinerAvailable = await this.entityClient.isAvailable();
+    if (!glinerAvailable) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 1. Read file content for domain classification
+    let fileContent: string;
+    try {
+      fileContent = await fs.readFile(this.resolveAbsolutePath(filePath), 'utf-8');
+    } catch (error) {
+      // File might not exist anymore
+      if (this.verbose) {
+        console.warn(`[UnifiedProcessor] Could not read file for domain check: ${filePath}`);
+      }
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 2. Classify domain
+    let domains: string[] = [];
+    try {
+      const classifications = await this.entityClient.classifyDomainsBatch(
+        [fileContent.slice(0, 2000)],
+        0.3
+      );
+      domains = (classifications[0] || []).map(d => d.label).filter(Boolean);
+    } catch (error: any) {
+      if (this.verbose) {
+        console.warn(`[UnifiedProcessor] Domain classification failed for ${filePath}: ${error.message}`);
+      }
+      // Continue with default domain
+      domains = ['default'];
+    }
+
+    // 3. Check disabled domains
+    const disabledDomains = await this.entityClient.getDisabledDomains();
+    const enabledDomains = domains.filter(d => !disabledDomains.has(d));
+
+    // If ALL detected domains are disabled, skip extraction
+    if (enabledDomains.length === 0 && domains.length > 0 && !domains.includes('default')) {
+      console.log(`[UnifiedProcessor] ⏭️ Skipping entity extraction for ${filePath}: all domains disabled (${domains.join('|')})`);
+      // Mark nodes as processed to prevent re-extraction attempts
+      await this.markNodesEntityHashUpdated(filePath);
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 4. Get nodes for this file
+    const nodes = await this.getNodesForEntityExtraction(filePath);
+    if (nodes.length === 0) {
+      return { entitiesCreated: 0, relationsCreated: 0 };
+    }
+
+    // 5. Use enabled domains (or 'default' if none)
+    const extractionDomains = enabledDomains.length > 0 ? enabledDomains : ['default'];
+
+    // Load GLiNER model to GPU
+    await this.entityClient.loadModel();
+
+    try {
+      // Extract with domain-specific entity types
+      const nodesWithFilePath = nodes.map(n => ({
+        ...n,
+        filePath,
+      }));
+
+      if (this.verbose) {
+        console.log(`[UnifiedProcessor] Extracting entities for ${filePath} with domains: ${extractionDomains.join('|')}`);
+      }
+
+      return await this.extractEntitiesGlobalBatchWithDomains(nodesWithFilePath, extractionDomains);
+    } finally {
+      // Always unload to free GPU for Ollama embeddings
+      await this.entityClient.unloadModel();
+    }
+  }
+
+  /**
+   * Mark nodes in a file as having their entity hash updated (to skip future extraction).
+   * Used when skipping extraction for disabled domains.
+   */
+  private async markNodesEntityHashUpdated(filePath: string): Promise<void> {
+    await this.neo4jClient.run(
+      `
+      MATCH (n)-[:DEFINED_IN]->(f:File)
+      WHERE f.file = $filePath AND f.projectId = $projectId
+        AND (n:MarkdownSection OR n:MarkdownDocument OR n:WebPage OR n:WebDocument)
+        AND n._content IS NOT NULL
+        AND n._state = 'linked'
+      SET n._entitiesContentHash = n._contentHash
+      `,
+      { filePath, projectId: this.projectId }
+    );
+  }
+
+  /**
+   * Mark a batch of nodes as having their entity hash updated (to skip future extraction).
+   * Used when skipping extraction for disabled domains in batch processing.
+   */
+  private async markNodesBatchEntityHashUpdated(
+    nodes: Array<{ uuid: string; label: string; contentHash: string }>
+  ): Promise<void> {
+    if (nodes.length === 0) return;
+
+    // Group by label for efficient indexed updates
+    const nodesByLabel = new Map<string, Array<{ uuid: string; contentHash: string }>>();
+    for (const node of nodes) {
+      const group = nodesByLabel.get(node.label) || [];
+      group.push({ uuid: node.uuid, contentHash: node.contentHash });
+      nodesByLabel.set(node.label, group);
+    }
+
+    for (const [label, nodeData] of nodesByLabel) {
+      await this.neo4jClient.run(
+        `
+        UNWIND $nodes AS node
+        MATCH (n:\`${label}\` {uuid: node.uuid})
+        SET n._entitiesContentHash = node.contentHash
+        `,
+        { nodes: nodeData }
+      );
+    }
   }
 
   // ============================================
@@ -843,6 +2045,7 @@ export class UnifiedProcessor {
       projectId: this.projectId,
       incrementalOnly: true,
       verbose: this.verbose,
+      onActivity: () => this.signalActivity(),
     };
 
     try {

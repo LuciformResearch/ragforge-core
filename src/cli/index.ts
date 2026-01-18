@@ -20,6 +20,7 @@ import {
 import {
   startDaemon,
   stopDaemon,
+  restartDaemonCli,
   getDaemonStatus,
   streamDaemonLogs,
 } from './commands/daemon.js';
@@ -96,11 +97,12 @@ after 5 minutes of inactivity.
 Usage:
   ragforge daemon start [-v]    Start the daemon (foreground)
   ragforge daemon stop          Stop the running daemon
+  ragforge daemon restart [-v]  Restart the daemon (stop + start)
   ragforge daemon status        Show daemon status and statistics
   ragforge daemon logs          Stream logs in real-time (Ctrl+C to stop)
 
 Options:
-  -v, --verbose    Show verbose output during daemon startup
+  -v, --verbose    Show verbose output during daemon startup/restart
   --tail=N         (logs) Show last N lines before streaming (default: 50)
   --no-follow      (logs) Show recent logs and exit (don't stream)
 
@@ -115,6 +117,7 @@ Endpoints (port 6969):
 
 Examples:
   ragforge daemon status
+  ragforge daemon restart
   ragforge daemon start -v
   ragforge daemon logs
   ragforge daemon stop
@@ -201,6 +204,9 @@ async function main(): Promise<void> {
             break;
           case 'stop':
             await stopDaemon();
+            break;
+          case 'restart':
+            await restartDaemonCli({ verbose: rest.includes('-v') || rest.includes('--verbose') });
             break;
           case 'status':
             await getDaemonStatus();

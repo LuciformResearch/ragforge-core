@@ -460,7 +460,7 @@ export class TouchedFilesWatcher {
       `MATCH (f:File)
        WHERE f.uuid IN $uuids
        RETURN f.uuid AS uuid, f.absolutePath AS absolutePath, f.name AS name,
-              f.extension AS extension, f.hash AS hash, f.state AS state`,
+              f.extension AS extension, f.hash AS hash, f._state AS state`,
       { uuids }
     );
 
@@ -489,8 +489,8 @@ export class TouchedFilesWatcher {
     const result = await this.neo4jClient.run(
       `MATCH (f:File {projectId: $projectId})
        WHERE f.absolutePath STARTS WITH $dirPathPrefix
-         AND f.state <> 'embedded'
-       RETURN DISTINCT f.absolutePath AS absolutePath, f.state AS state, f.uuid AS uuid,
+         AND f._state <> 'embedded'
+       RETURN DISTINCT f.absolutePath AS absolutePath, f._state AS state, f.uuid AS uuid,
               f.name AS name, f.extension AS extension, f.hash AS hash`,
       {
         projectId: this.projectId,

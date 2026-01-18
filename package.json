@@ -13,14 +13,14 @@
   },
   "homepage": "https://github.com/LuciformResearch/ragforge-core#readme",
   "type": "module",
-  "main": "./dist/esm/src/index.js",
-  "module": "./dist/esm/src/index.js",
-  "types": "./dist/types/src/index.d.ts",
+  "main": "./dist/esm/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/types/src/index.d.ts",
-      "import": "./dist/esm/src/index.js",
-      "default": "./dist/esm/src/index.js"
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "default": "./dist/esm/index.js"
     },
     "./cli": {
       "types": "./dist/types/cli/index.d.ts",
@@ -38,14 +38,15 @@
     "LICENSE",
     "README.md"
   ],
-    "scripts": {
+  "scripts": {
     "clean": "rm -rf dist",
     "build:esm": "tsc -p tsconfig.esm.json",
     "build:types": "tsc -p tsconfig.types.json",
     "copy:defaults": "cp -r src/defaults dist/esm/",
-    "copy:templates": "cp -r cli/commands/templates dist/esm/cli/commands/",
-    "build": "npm run clean && npm run build:esm && npm run build:types && npm run copy:defaults && npm run copy:templates && chmod +x bin/ragforge.js",
-    "prepublishOnly": "npm run build",
+    "copy:templates": "cp -r src/cli/commands/templates dist/esm/cli/commands/ 2>/dev/null || true",
+    "build": "npm run clean && npm run build:esm && npm run build:types && npm run copy:defaults && npm run copy:templates && chmod +x bin/ragforge.js && ./bin/ragforge.js daemon restart",
+    "build:ci": "npm run clean && npm run build:esm && npm run build:types && npm run copy:defaults && npm run copy:templates && chmod +x bin/ragforge.js",
+    "prepublishOnly": "npm run build:ci",
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest watch",
@@ -120,6 +121,7 @@
     "@types/react": "^18.3.3",
     "eslint": "^9.0.0",
     "prettier": "^3.3.0",
+    "tsconfig-paths": "^4.2.0",
     "typescript": "^5.3.0",
     "vitest": "^1.0.0"
   },

@@ -789,8 +789,12 @@ export interface ParsedSection {
   titleLevel?: number;
   /** Section text content */
   text: string;
-  /** Page number where this section appears */
+  /** Page number where this section appears (metadata only) */
   pageNum: number;
+  /** Start line in the extracted markdown content */
+  startLine: number;
+  /** End line in the extracted markdown content */
+  endLine: number;
   /** Paragraph type from classification (only set in 'detect' or 'llm' mode) */
   type?: ParagraphType;
 }
@@ -1313,6 +1317,7 @@ export async function parsePdfWithVision(
   let globalImageIndex = 0;
   let globalSectionIndex = 0;
   let totalImagesAnalyzed = 0;
+  let globalLineCounter = 1; // Track line position across all sections
 
   // First pass: identify which pages have images using operator list
   const pagesWithImages = new Map<number, number>(); // pageNum -> image count
@@ -1441,12 +1446,20 @@ export async function parsePdfWithVision(
         title = ''; // No title
       }
 
+      // Calculate line positions based on text content
+      const sectionLineCount = para.text.split('\n').length;
+      const startLine = globalLineCounter;
+      const endLine = globalLineCounter + sectionLineCount - 1;
+      globalLineCounter = endLine + 1; // Next section starts after this one
+
       const section: ParsedSection = {
         index: globalSectionIndex,
         title,
         titleLevel,
         text: para.text,
         pageNum,
+        startLine,
+        endLine,
         type: classified?.type,
       };
 

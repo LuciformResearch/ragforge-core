@@ -31,4 +31,9 @@ export const DEFAULT_EXCLUDE_PATTERNS = [
   '**/env/**',
   '**/*.test.ts',
   '**/*.spec.ts',
+  // Lock files - contain URLs that create noise
+  '**/package-lock.json',
+  '**/yarn.lock',
+  '**/pnpm-lock.yaml',
+  '**/bun.lockb',
 ];

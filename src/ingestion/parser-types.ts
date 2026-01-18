@@ -414,6 +414,21 @@ export interface ParserRelationship {
 
   /** Relationship properties */
   properties?: Record<string, unknown>;
+
+  /**
+   * Target node label (for placeholder creation)
+   * Used to create placeholder nodes when target doesn't exist yet.
+   */
+  targetLabel?: string;
+
+  /**
+   * Target node properties (for placeholder creation)
+   * Minimum properties to create a meaningful placeholder node.
+   */
+  targetProps?: {
+    _name: string;
+    [key: string]: unknown;
+  };
 }
 
 /**

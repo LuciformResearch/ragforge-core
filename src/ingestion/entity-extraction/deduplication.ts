@@ -9,6 +9,7 @@
  */
 
 import type { ExtractedEntity } from './types.js';
+import { DEFAULT_SKIP_EMBEDDING_TYPES } from './client.js';
 
 // =============================================================================
 // Types
@@ -49,8 +50,10 @@ export interface DeduplicationResult {
 
 /**
  * Entity types to exclude from deduplication (numeric/value types).
+ * @deprecated Use DEFAULT_SKIP_EMBEDDING_TYPES from client.ts instead.
+ * This alias is kept for backwards compatibility.
  */
-export const EXCLUDED_DEDUP_TYPES = ['price', 'date', 'quantity', 'amount', 'currency', 'size', 'duration'];
+export const EXCLUDED_DEDUP_TYPES = DEFAULT_SKIP_EMBEDDING_TYPES;
 
 /**
  * Configuration for deduplication.

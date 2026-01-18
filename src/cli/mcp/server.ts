@@ -16,7 +16,7 @@ import {
   type CallToolResult,
   type ListToolsResult,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { GeneratedToolDefinition } from '@luciformresearch/ragforge';
+import type { GeneratedToolDefinition } from '../../index.js';
 import { convertAllTools, getToolsBySection } from './tool-adapter.js';
 
 /**

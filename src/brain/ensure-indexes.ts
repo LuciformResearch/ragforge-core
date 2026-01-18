@@ -44,6 +44,82 @@ export interface IndexStats {
   created: number;
   skipped: number;
   errors: number;
+  recreated: number;
+}
+
+interface VectorIndexInfo {
+  name: string;
+  dimension: number;
+  property: string;
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+/**
+ * Get info about an existing vector index (dimension, property)
+ * Returns null if index doesn't exist
+ */
+async function getVectorIndexInfo(
+  neo4jClient: Neo4jClient,
+  indexName: string
+): Promise<VectorIndexInfo | null> {
+  try {
+    const result = await neo4jClient.run(
+      `SHOW INDEXES YIELD name, type, options
+       WHERE name = $indexName AND type = 'VECTOR'
+       RETURN name, options`,
+      { indexName }
+    );
+
+    if (result.records.length === 0) {
+      return null;
+    }
+
+    const record = result.records[0];
+    const name = record.get('name') as string;
+    const options = record.get('options') as Record<string, any>;
+
+    // Extract dimension from options.indexConfig['vector.dimensions']
+    const indexConfig = options?.indexConfig || {};
+    const dimension =
+      indexConfig['vector.dimensions'] ||
+      indexConfig['vectorDimensions'] ||
+      0;
+
+    return {
+      name,
+      dimension: typeof dimension === 'object' && 'toNumber' in dimension
+        ? dimension.toNumber()
+        : Number(dimension),
+      property: '', // Not needed for dimension check
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Drop a vector index by name
+ */
+async function dropVectorIndex(
+  neo4jClient: Neo4jClient,
+  indexName: string,
+  verbose: boolean
+): Promise<boolean> {
+  try {
+    await neo4jClient.run(`DROP INDEX ${indexName}`);
+    if (verbose) {
+      console.log(`[Indexes] Dropped vector index: ${indexName} (dimension mismatch)`);
+    }
+    return true;
+  } catch (err: any) {
+    if (verbose) {
+      console.warn(`[Indexes] Failed to drop index ${indexName}: ${err.message}`);
+    }
+    return false;
+  }
 }
 
 // ============================================
@@ -137,7 +213,7 @@ export async function ensureBaseIndexes(
   neo4jClient: Neo4jClient,
   options: { verbose?: boolean } = {}
 ): Promise<IndexStats> {
-  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
   const { verbose = false } = options;
 
   if (verbose) {
@@ -225,7 +301,7 @@ export async function ensureFulltextIndexes(
   neo4jClient: Neo4jClient,
   options: { verbose?: boolean } = {}
 ): Promise<IndexStats> {
-  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
   const { verbose = false } = options;
 
   if (verbose) {
@@ -262,14 +338,81 @@ export async function ensureFulltextIndexes(
 // ============================================
 
 /**
+ * Ensure or recreate a single vector index with correct dimensions.
+ * Drops and recreates if dimensions don't match.
+ */
+async function ensureOrRecreateVectorIndex(
+  neo4jClient: Neo4jClient,
+  indexName: string,
+  label: string,
+  property: string,
+  targetDimension: number,
+  verbose: boolean
+): Promise<{ action: 'created' | 'recreated' | 'skipped' | 'error' }> {
+  try {
+    // Check if index exists and get its dimensions
+    const existingIndex = await getVectorIndexInfo(neo4jClient, indexName);
+
+    if (existingIndex) {
+      // Index exists - check if dimensions match
+      if (existingIndex.dimension === targetDimension) {
+        // Dimensions match - skip
+        return { action: 'skipped' };
+      }
+
+      // Dimensions mismatch - drop and recreate
+      if (verbose) {
+        console.log(
+          `[Indexes] Dimension mismatch for ${indexName}: ` +
+            `existing=${existingIndex.dimension}, target=${targetDimension}. Recreating...`
+        );
+      }
+
+      const dropped = await dropVectorIndex(neo4jClient, indexName, verbose);
+      if (!dropped) {
+        return { action: 'error' };
+      }
+    }
+
+    // Create the index (new or after drop)
+    const createQuery = `
+      CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
+      FOR (n:\`${label}\`)
+      ON n.\`${property}\`
+      OPTIONS {
+        indexConfig: {
+          \`vector.dimensions\`: ${targetDimension},
+          \`vector.similarity_function\`: 'cosine'
+        }
+      }
+    `;
+
+    await neo4jClient.run(createQuery);
+
+    if (verbose) {
+      const action = existingIndex ? 'Recreated' : 'Created';
+      console.log(`[Indexes] ${action} vector index: ${indexName} (dim: ${targetDimension})`);
+    }
+
+    return { action: existingIndex ? 'recreated' : 'created' };
+  } catch (err: any) {
+    if (verbose) {
+      console.warn(`[Indexes] Vector index error for ${indexName}: ${err.message}`);
+    }
+    return { action: 'error' };
+  }
+}
+
+/**
  * Ensure vector indexes exist for semantic search.
  * Creates indexes based on MULTI_EMBED_CONFIGS.
+ * If an index exists with wrong dimensions, it will be dropped and recreated.
  */
 export async function ensureVectorIndexes(
   neo4jClient: Neo4jClient,
   options: { dimension?: number; verbose?: boolean } = {}
 ): Promise<IndexStats> {
-  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
   const { dimension = 3072, verbose = false } = options;
 
   if (verbose) {
@@ -284,82 +427,62 @@ export async function ensureVectorIndexes(
       const embeddingProp = embeddingConfig.propertyName;
       const indexName = `${label.toLowerCase()}_${embeddingProp}_vector`;
 
-      try {
-        // Check if index already exists
-        const checkResult = await neo4jClient.run(
-          `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
-          { indexName }
-        );
+      const result = await ensureOrRecreateVectorIndex(
+        neo4jClient,
+        indexName,
+        label,
+        embeddingProp,
+        dimension,
+        verbose
+      );
 
-        const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
-
-        if (!exists) {
-          const createQuery = `
-            CREATE VECTOR INDEX ${indexName} IF NOT EXISTS
-            FOR (n:\`${label}\`)
-            ON n.\`${embeddingProp}\`
-            OPTIONS {
-              indexConfig: {
-                \`vector.dimensions\`: ${dimension},
-                \`vector.similarity_function\`: 'cosine'
-              }
-            }
-          `;
-
-          await neo4jClient.run(createQuery);
+      switch (result.action) {
+        case 'created':
           stats.created++;
-
-          if (verbose) {
-            console.log(`[Indexes] Created vector index: ${indexName}`);
-          }
-        } else {
+          break;
+        case 'recreated':
+          stats.recreated++;
+          break;
+        case 'skipped':
           stats.skipped++;
-        }
-      } catch (err: any) {
-        stats.errors++;
-        if (!err.message?.includes('already exists')) {
-          if (verbose) {
-            console.warn(`[Indexes] Vector index warning for ${indexName}: ${err.message}`);
-          }
-        }
+          break;
+        case 'error':
+          stats.errors++;
+          break;
       }
     }
   }
 
   // EmbeddingChunk vector index
-  const chunkIndexName = 'embeddingchunk_embedding_content_vector';
-  try {
-    const checkResult = await neo4jClient.run(
-      `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
-      { indexName: chunkIndexName }
-    );
-    const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+  const chunkResult = await ensureOrRecreateVectorIndex(
+    neo4jClient,
+    'embeddingchunk_embedding_content_vector',
+    'EmbeddingChunk',
+    'embedding_content',
+    dimension,
+    verbose
+  );
 
-    if (!exists) {
-      await neo4jClient.run(`
-        CREATE VECTOR INDEX ${chunkIndexName} IF NOT EXISTS
-        FOR (n:EmbeddingChunk)
-        ON n.embedding_content
-        OPTIONS {
-          indexConfig: {
-            \`vector.dimensions\`: ${dimension},
-            \`vector.similarity_function\`: 'cosine'
-          }
-        }
-      `);
+  switch (chunkResult.action) {
+    case 'created':
       stats.created++;
-      if (verbose) {
-        console.log(`[Indexes] Created vector index: ${chunkIndexName}`);
-      }
-    } else {
+      break;
+    case 'recreated':
+      stats.recreated++;
+      break;
+    case 'skipped':
       stats.skipped++;
-    }
-  } catch (err: any) {
-    stats.errors++;
+      break;
+    case 'error':
+      stats.errors++;
+      break;
   }
 
   if (verbose) {
-    console.log(`[Indexes] Vector indexes: ${stats.created} created, ${stats.skipped} skipped, ${stats.errors} errors`);
+    console.log(
+      `[Indexes] Vector indexes: ${stats.created} created, ${stats.recreated} recreated, ` +
+        `${stats.skipped} skipped, ${stats.errors} errors`
+    );
   }
 
   return stats;
@@ -377,7 +500,7 @@ export async function ensureConversationIndexes(
   neo4jClient: Neo4jClient,
   options: { dimension?: number; verbose?: boolean } = {}
 ): Promise<IndexStats> {
-  const stats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const stats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
   const { dimension = 3072, verbose = false } = options;
 
   if (verbose) {
@@ -420,40 +543,43 @@ export async function ensureConversationIndexes(
     }
   }
 
-  // Vector indexes for conversation embeddings
+  // Vector indexes for conversation embeddings (with dimension check)
   const vectorIndexes = [
     { name: 'message_embedding_index', label: 'Message', prop: 'embedding' },
     { name: 'summary_embedding_index', label: 'Summary', prop: 'embedding' },
   ];
 
   for (const idx of vectorIndexes) {
-    try {
-      const checkResult = await neo4jClient.run(
-        `SHOW INDEXES YIELD name WHERE name = $indexName RETURN count(name) as count`,
-        { indexName: idx.name }
-      );
-      const exists = checkResult.records[0]?.get('count')?.toNumber() > 0;
+    const result = await ensureOrRecreateVectorIndex(
+      neo4jClient,
+      idx.name,
+      idx.label,
+      idx.prop,
+      dimension,
+      verbose
+    );
 
-      if (!exists) {
-        await neo4jClient.run(`
-          CREATE VECTOR INDEX ${idx.name} IF NOT EXISTS
-          FOR (n:${idx.label}) ON (n.${idx.prop})
-          OPTIONS {indexConfig: {
-            \`vector.dimensions\`: ${dimension},
-            \`vector.similarity_function\`: 'cosine'
-          }}
-        `);
+    switch (result.action) {
+      case 'created':
         stats.created++;
-      } else {
+        break;
+      case 'recreated':
+        stats.recreated++;
+        break;
+      case 'skipped':
         stats.skipped++;
-      }
-    } catch (err: any) {
-      stats.errors++;
+        break;
+      case 'error':
+        stats.errors++;
+        break;
     }
   }
 
   if (verbose) {
-    console.log(`[Indexes] Conversation indexes: ${stats.created} created, ${stats.skipped} skipped, ${stats.errors} errors`);
+    console.log(
+      `[Indexes] Conversation indexes: ${stats.created} created, ${stats.recreated} recreated, ` +
+        `${stats.skipped} skipped, ${stats.errors} errors`
+    );
   }
 
   return stats;
@@ -478,7 +604,7 @@ export async function ensureAllIndexes(
     skipConversationIndexes = false,
   } = options;
 
-  const totalStats: IndexStats = { created: 0, skipped: 0, errors: 0 };
+  const totalStats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
 
   if (verbose) {
     console.log('[Indexes] Ensuring all indexes...');
@@ -489,12 +615,14 @@ export async function ensureAllIndexes(
   totalStats.created += baseStats.created;
   totalStats.skipped += baseStats.skipped;
   totalStats.errors += baseStats.errors;
+  totalStats.recreated += baseStats.recreated;
 
   // Fulltext indexes
   const fulltextStats = await ensureFulltextIndexes(neo4jClient, { verbose });
   totalStats.created += fulltextStats.created;
   totalStats.skipped += fulltextStats.skipped;
   totalStats.errors += fulltextStats.errors;
+  totalStats.recreated += fulltextStats.recreated;
 
   // Vector indexes
   if (!skipVectorIndexes) {
@@ -502,6 +630,7 @@ export async function ensureAllIndexes(
     totalStats.created += vectorStats.created;
     totalStats.skipped += vectorStats.skipped;
     totalStats.errors += vectorStats.errors;
+    totalStats.recreated += vectorStats.recreated;
   }
 
   // Conversation indexes
@@ -510,10 +639,14 @@ export async function ensureAllIndexes(
     totalStats.created += convStats.created;
     totalStats.skipped += convStats.skipped;
     totalStats.errors += convStats.errors;
+    totalStats.recreated += convStats.recreated;
   }
 
   if (verbose) {
-    console.log(`[Indexes] Total: ${totalStats.created} created, ${totalStats.skipped} skipped, ${totalStats.errors} errors`);
+    console.log(
+      `[Indexes] Total: ${totalStats.created} created, ${totalStats.recreated} recreated, ` +
+        `${totalStats.skipped} skipped, ${totalStats.errors} errors`
+    );
   }
 
   return totalStats;

@@ -15,11 +15,9 @@
     "resolveJsonModule": true,
     "paths": {
       "@luciformresearch/ragforge": ["./src/index.ts"],
-      "@luciformresearch/ragforge/*": ["./src/*"],
-      "@luciformresearch/codeparsers": ["./packages/codeparsers/dist/types/index.d.ts"],
-      "@luciformresearch/codeparsers/*": ["./packages/codeparsers/dist/types/*"]
+      "@luciformresearch/ragforge/*": ["./src/*"]
     }
   },
-  "include": ["src/**/*", "cli/**/*"],
+  "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "**/*.test.ts", "**/test-*.ts", "packages"]
 }

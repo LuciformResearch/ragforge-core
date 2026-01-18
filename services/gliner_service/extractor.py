@@ -12,8 +12,8 @@ from collections import defaultdict
 
 from gliner2 import GLiNER2
 
-from .config import settings, DOMAIN_PRESETS, CLASSIFICATION_SCHEMA
-from .models import ExtractedEntity, ExtractedRelation, ExtractionResult
+from config import settings, DOMAIN_PRESETS, CLASSIFICATION_SCHEMA
+from models import ExtractedEntity, ExtractedRelation, ExtractionResult
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +47,52 @@ class GLiNERExtractor:
             logger.info(f"Model loaded on {self.device}")
         return self._model
 
+    def unload(self) -> bool:
+        """
+        Unload the model from GPU to free VRAM.
+
+        Returns True if model was unloaded, False if already unloaded.
+        """
+        if self._model is None:
+            logger.info("Model already unloaded")
+            return False
+
+        logger.info("Unloading GLiNER2 model from GPU...")
+
+        # Move model to CPU first, then delete
+        try:
+            self._model = self._model.to("cpu")
+        except Exception as e:
+            logger.warning(f"Failed to move model to CPU: {e}")
+
+        # Delete the model
+        del self._model
+        self._model = None
+
+        # Clear CUDA cache
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("CUDA cache cleared")
+        except Exception as e:
+            logger.warning(f"Failed to clear CUDA cache: {e}")
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        logger.info("Model unloaded successfully")
+        return True
+
+    def is_loaded(self) -> bool:
+        """Check if model is currently loaded."""
+        return self._model is not None
+
     def extract(
         self,
         text: str,
-        entity_types: list[str] | None = None,
+        entity_types: list[str] | dict[str, str] | None = None,
         relation_types: dict[str, str] | None = None,
         include_confidence: bool = True,
         include_spans: bool = True,
@@ -60,7 +102,10 @@ class GLiNERExtractor:
 
         Args:
             text: Text to extract from
-            entity_types: Entity types to extract (default: from settings)
+            entity_types: Entity types to extract. Can be:
+                - list[str]: ["person", "organization"] (legacy)
+                - dict[str, str]: {"person": "A human individual..."} (with descriptions)
+                GLiNER2 uses descriptions to improve precision.
             relation_types: Relation types with descriptions (default: from settings)
             include_confidence: Include confidence scores
             include_spans: Include character spans
@@ -88,94 +133,17 @@ class GLiNERExtractor:
         # Extract with GLiNER2
         try:
             raw_result = self.model.extract(text, schema, include_confidence=include_confidence)
-            logger.info(f"GLiNER2 raw_result: {raw_result}")
+            logger.debug(f"GLiNER2 raw_result: {raw_result}")
         except Exception as e:
             logger.error(f"Extraction failed: {e}")
             raw_result = {"entities": {}, "relation_extraction": {}}
 
-        # Parse entities from GLiNER2 format
-        # GLiNER2 returns: {'entities': {'person': [...], 'organization': [...]}, ...}
-        entities = []
-        entities_dict = raw_result.get("entities", {})
+        # Use shared parsing logic
+        result = self._parse_extraction_result(raw_result, include_confidence, include_spans)
 
-        for entity_type, entity_list in entities_dict.items():
-            if isinstance(entity_list, list):
-                for item in entity_list:
-                    # Handle both dict format and string format
-                    if isinstance(item, dict):
-                        entity = ExtractedEntity(
-                            name=item.get("text", item.get("name", str(item))),
-                            type=entity_type,
-                            confidence=item.get("score", item.get("confidence")) if include_confidence else None,
-                            span=(item.get("start"), item.get("end")) if include_spans and "start" in item else None,
-                        )
-                    else:
-                        # Simple string entity
-                        entity = ExtractedEntity(
-                            name=str(item),
-                            type=entity_type,
-                            confidence=None,
-                            span=None,
-                        )
-                    entities.append(entity)
-
-        # Parse relations from GLiNER2 format
-        # GLiNER2 returns: {'relation_extraction': {'works_for': [('subject', 'object'), ...], ...}}
-        # With include_confidence=True, subject/object can be dicts: {'text': '...', 'confidence': ...}
-        relations = []
-        relations_dict = raw_result.get("relation_extraction", {})
-
-        def extract_entity_text(entity) -> str:
-            """Extract text from entity (can be string or dict with 'text' key)."""
-            if isinstance(entity, dict):
-                return entity.get("text", entity.get("name", str(entity)))
-            return str(entity)
-
-        def extract_entity_confidence(entity) -> float | None:
-            """Extract confidence from entity dict if available."""
-            if isinstance(entity, dict):
-                return entity.get("confidence", entity.get("score"))
-            return None
-
-        for relation_type, relation_list in relations_dict.items():
-            if isinstance(relation_list, list):
-                for item in relation_list:
-                    if isinstance(item, tuple) and len(item) >= 2:
-                        # With include_confidence, tuple items can be dicts
-                        subj_text = extract_entity_text(item[0])
-                        obj_text = extract_entity_text(item[1])
-                        # Get confidence from entities or tuple[2] if available
-                        rel_confidence = None
-                        if include_confidence:
-                            subj_conf = extract_entity_confidence(item[0])
-                            obj_conf = extract_entity_confidence(item[1])
-                            # Use average of subject/object confidence, or tuple[2] if present
-                            if len(item) > 2 and item[2] is not None:
-                                rel_confidence = item[2]
-                            elif subj_conf is not None and obj_conf is not None:
-                                rel_confidence = (subj_conf + obj_conf) / 2
-                        relation = ExtractedRelation(
-                            subject=subj_text,
-                            predicate=relation_type,
-                            object=obj_text,
-                            confidence=rel_confidence,
-                        )
-                        relations.append(relation)
-                    elif isinstance(item, dict):
-                        relation = ExtractedRelation(
-                            subject=extract_entity_text(item.get("subject", item.get("head", ""))),
-                            predicate=relation_type,
-                            object=extract_entity_text(item.get("object", item.get("tail", ""))),
-                            confidence=item.get("score", item.get("confidence")) if include_confidence else None,
-                        )
-                        relations.append(relation)
-
-        processing_time = (time.time() - start_time) * 1000
-        return ExtractionResult(
-            entities=entities,
-            relations=relations,
-            processing_time_ms=processing_time,
-        )
+        # Override with total time (extraction + parsing)
+        result.processing_time_ms = (time.time() - start_time) * 1000
+        return result
 
     def classify_domains(
         self,
@@ -334,7 +302,7 @@ class GLiNERExtractor:
 
         return sorted(detected, key=lambda x: -x.get("confidence", 0))
 
-    def get_preset_schema(self, domains: list[str]) -> tuple[list[str], dict[str, str]]:
+    def get_preset_schema(self, domains: list[str]) -> tuple[dict[str, str] | list[str], dict[str, str]]:
         """
         Merge presets for multiple domains.
 
@@ -343,27 +311,43 @@ class GLiNERExtractor:
 
         Returns:
             Tuple of (entity_types, relation_types)
+            entity_types can be dict[str, str] (with descriptions) or list[str] (legacy)
         """
-        entity_types = set()
-        relation_types = {}
+        entity_types: dict[str, str] = {}
+        relation_types: dict[str, str] = {}
 
         for domain in domains:
             if domain in DOMAIN_PRESETS:
                 preset = DOMAIN_PRESETS[domain]
-                entity_types.update(preset["entity_types"])
+                preset_entities = preset["entity_types"]
+                # Handle both dict (with descriptions) and list (legacy) formats
+                if isinstance(preset_entities, dict):
+                    entity_types.update(preset_entities)
+                else:
+                    # Legacy list format - convert to dict without descriptions
+                    for et in preset_entities:
+                        if et not in entity_types:
+                            entity_types[et] = ""
                 relation_types.update(preset["relation_types"])
 
         # Add defaults if no domains matched
         if not entity_types:
-            entity_types = set(settings.default_entity_types)
+            default_entities = settings.default_entity_types
+            if isinstance(default_entities, dict):
+                entity_types = default_entities.copy()
+            else:
+                entity_types = {et: "" for et in default_entities}
             relation_types = settings.default_relation_types
 
-        return list(entity_types), relation_types
+        # Return dict if we have descriptions, otherwise list for backward compat
+        if all(desc == "" for desc in entity_types.values()):
+            return list(entity_types.keys()), relation_types
+        return entity_types, relation_types
 
     def batch_extract(
         self,
         texts: list[str],
-        entity_types: list[str] | None = None,
+        entity_types: list[str] | dict[str, str] | None = None,
         relation_types: dict[str, str] | None = None,
         batch_size: int = 32,
         include_confidence: bool = True,
@@ -374,7 +358,9 @@ class GLiNERExtractor:
 
         Args:
             texts: List of texts to extract from
-            entity_types: Entity types to extract
+            entity_types: Entity types to extract. Can be:
+                - list[str]: ["person", "organization"] (legacy)
+                - dict[str, str]: {"person": "A human individual..."} (with descriptions)
             relation_types: Relation types with descriptions
             batch_size: Processing batch size
             include_confidence: Include confidence scores

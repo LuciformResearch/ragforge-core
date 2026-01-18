@@ -3,6 +3,7 @@
  *
  * Manages the lifecycle states of files during ingestion.
  * Replaces the simple schemaDirty/embeddingsDirty booleans with a proper state machine.
+ * Updated: 2026-01-17 - Added _pending cleanup on File node MERGE
  *
  * States:
  * - discovered: File detected by watcher, needs parsing
@@ -18,6 +19,7 @@
 
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import type { Record as Neo4jRecord } from 'neo4j-driver';
+import { UniqueIDHelper } from '../runtime/utils/UniqueIDHelper.js';
 
 /**
  * File states in the ingestion pipeline:
@@ -132,8 +134,8 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {uuid: $uuid})
-      SET f.state = $newState,
-          f.stateUpdatedAt = datetime(),
+      SET f._state = $newState,
+          f._stateUpdatedAt = datetime(),
           f.errorType = $errorType,
           f.errorMessage = $errorMessage,
           f.parsedContentHash = CASE WHEN $newState = 'parsed' AND $contentHash IS NOT NULL
@@ -145,7 +147,7 @@ export class FileStateMachine {
           f.retryCount = CASE WHEN $newState = 'error'
                               THEN coalesce(f.retryCount, 0) + 1
                               ELSE CASE WHEN $newState = 'discovered' THEN 0 ELSE f.retryCount END END
-      RETURN f.state as state
+      RETURN f._state as state
     `,
       {
         uuid: fileUuid,
@@ -169,8 +171,8 @@ export class FileStateMachine {
       `
       MATCH (f:File)
       WHERE f.uuid IN $uuids
-      SET f.state = $newState,
-          f.stateUpdatedAt = datetime(),
+      SET f._state = $newState,
+          f._stateUpdatedAt = datetime(),
           f.errorType = $errorType,
           f.errorMessage = $errorMessage,
           f.parsedContentHash = CASE WHEN $newState = 'parsed' AND $contentHash IS NOT NULL
@@ -208,15 +210,15 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IN $states
+      WHERE f._state IN $states AND f.absolutePath IS NOT NULL
       RETURN f.uuid as uuid,
-             f.file as file,
-             f.state as state,
+             f.absolutePath as file,
+             f._state as state,
              f.errorType as errorType,
              f.errorMessage as errorMessage,
              f.retryCount as retryCount,
-             f.stateUpdatedAt as stateUpdatedAt
-      ORDER BY f.stateUpdatedAt ASC
+             f._stateUpdatedAt as stateUpdatedAt
+      ORDER BY f._stateUpdatedAt ASC
     `,
       { projectId, states }
     );
@@ -239,8 +241,8 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IS NULL
-      RETURN f.uuid as uuid, f.file as file
+      WHERE f._state IS NULL
+      RETURN f.uuid as uuid, f.absolutePath as file
     `,
       { projectId }
     );
@@ -258,7 +260,7 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      RETURN f.state as state, count(f) as count
+      RETURN f._state as state, count(f) as count
     `,
       { projectId }
     );
@@ -326,12 +328,12 @@ export class FileStateMachine {
       MATCH (f:File {projectId: $projectId, state: 'error'})
       WHERE coalesce(f.retryCount, 0) < $maxRetries
       RETURN f.uuid as uuid,
-             f.file as file,
-             f.state as state,
+             f.absolutePath as file,
+             f._state as state,
              f.errorType as errorType,
              f.errorMessage as errorMessage,
              f.retryCount as retryCount
-      ORDER BY f.retryCount ASC, f.stateUpdatedAt ASC
+      ORDER BY f.retryCount ASC, f._stateUpdatedAt ASC
     `,
       { projectId, maxRetries }
     );
@@ -353,10 +355,10 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IN ['parsing', 'relations', 'entities', 'embedding']
-        AND f.stateUpdatedAt < datetime() - duration({milliseconds: $threshold})
-      SET f.state = 'discovered',
-          f.stateUpdatedAt = datetime(),
+      WHERE f._state IN ['parsing', 'relations', 'entities', 'embedding']
+        AND f._stateUpdatedAt < datetime() - duration({milliseconds: $threshold})
+      SET f._state = 'discovered',
+          f._stateUpdatedAt = datetime(),
           f.errorMessage = 'Reset: stuck in processing state'
       RETURN count(f) as count
     `,
@@ -389,7 +391,7 @@ export class FileStateMachine {
     projectId: string,
     relativePath?: string
   ): Promise<{ created: boolean; reset: boolean; uuid: string }> {
-    const uuid = `file:${projectId}:${absolutePath}`;
+    const uuid = UniqueIDHelper.GenerateFileUUID(absolutePath);
     const now = new Date().toISOString();
 
     // MERGE: create if not exists, then conditionally update state
@@ -400,30 +402,31 @@ export class FileStateMachine {
         f.file = $relativePath,
         f.absolutePath = $absolutePath,
         f.projectId = $projectId,
-        f.state = 'discovered',
-        f.stateUpdatedAt = datetime(),
+        f._state = 'discovered',
+        f._stateUpdatedAt = datetime(),
         f.createdAt = $now,
         f.retryCount = 0,
         f._wasCreated = true
       ON MATCH SET
         f._wasCreated = false,
-        f._previousState = f.state,
-        f.state = CASE
-          WHEN f.state = 'embedded' THEN 'discovered'
-          WHEN f.state = 'error' THEN 'discovered'
-          ELSE f.state
+        f._previousState = f._state,
+        f._pending = null,
+        f._state = CASE
+          WHEN f._state = 'embedded' THEN 'discovered'
+          WHEN f._state = 'error' THEN 'discovered'
+          ELSE f._state
         END,
-        f.stateUpdatedAt = CASE
-          WHEN f.state IN ['embedded', 'error'] THEN datetime()
-          ELSE f.stateUpdatedAt
+        f._stateUpdatedAt = CASE
+          WHEN f._state IN ['embedded', 'error'] THEN datetime()
+          ELSE f._stateUpdatedAt
         END,
         f.retryCount = CASE
-          WHEN f.state IN ['embedded', 'error'] THEN 0
+          WHEN f._state IN ['embedded', 'error'] THEN 0
           ELSE f.retryCount
         END
       RETURN f._wasCreated as wasCreated,
              f._previousState as previousState,
-             f.state as currentState,
+             f._state as currentState,
              f.uuid as uuid
     `,
       {
@@ -480,7 +483,7 @@ export class FileStateMachine {
 
     const now = new Date().toISOString();
     const fileData = files.map((f) => ({
-      uuid: `file:${projectId}:${f.absolutePath}`,
+      uuid: UniqueIDHelper.GenerateFileUUID(f.absolutePath),
       absolutePath: f.absolutePath,
       relativePath: f.relativePath || f.absolutePath,
     }));
@@ -493,26 +496,27 @@ export class FileStateMachine {
         f.file = fileData.relativePath,
         f.absolutePath = fileData.absolutePath,
         f.projectId = $projectId,
-        f.state = 'discovered',
-        f.stateUpdatedAt = datetime(),
+        f._state = 'discovered',
+        f._stateUpdatedAt = datetime(),
         f.createdAt = $now,
         f.retryCount = 0,
         f._action = 'created'
       ON MATCH SET
         f._action = CASE
-          WHEN f.state IN ['embedded', 'error'] THEN 'reset'
+          WHEN f._state IN ['embedded', 'error'] THEN 'reset'
           ELSE 'skipped'
         END,
-        f.state = CASE
-          WHEN f.state IN ['embedded', 'error'] THEN 'discovered'
-          ELSE f.state
+        f._pending = null,
+        f._state = CASE
+          WHEN f._state IN ['embedded', 'error'] THEN 'discovered'
+          ELSE f._state
         END,
-        f.stateUpdatedAt = CASE
-          WHEN f.state IN ['embedded', 'error'] THEN datetime()
-          ELSE f.stateUpdatedAt
+        f._stateUpdatedAt = CASE
+          WHEN f._state IN ['embedded', 'error'] THEN datetime()
+          ELSE f._stateUpdatedAt
         END,
         f.retryCount = CASE
-          WHEN f.state IN ['embedded', 'error'] THEN 0
+          WHEN f._state IN ['embedded', 'error'] THEN 0
           ELSE f.retryCount
         END
       WITH f, f._action as action
@@ -547,8 +551,8 @@ export class FileStateMachine {
       `
       MATCH (f:File {projectId: $projectId})
       WHERE f.file =~ $pattern OR f.absolutePath =~ $pattern
-      SET f.state = 'discovered',
-          f.stateUpdatedAt = datetime(),
+      SET f._state = 'discovered',
+          f._stateUpdatedAt = datetime(),
           f.retryCount = 0
       RETURN count(f) as count
     `,
@@ -605,13 +609,13 @@ export class FileStateMigration {
     const embeddedResult = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IS NULL
+      WHERE f._state IS NULL
         AND EXISTS {
           MATCH (s:Scope)-[:DEFINED_IN]->(f)
           WHERE s.embedding_content IS NOT NULL
         }
-      SET f.state = 'embedded',
-          f.stateUpdatedAt = datetime()
+      SET f._state = 'embedded',
+          f._stateUpdatedAt = datetime()
       RETURN count(f) as count
     `,
       { projectId }
@@ -621,10 +625,10 @@ export class FileStateMigration {
     const linkedResult = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IS NULL
+      WHERE f._state IS NULL
         AND EXISTS { MATCH (s:Scope)-[:DEFINED_IN]->(f) }
-      SET f.state = 'linked',
-          f.stateUpdatedAt = datetime()
+      SET f._state = 'linked',
+          f._stateUpdatedAt = datetime()
       RETURN count(f) as count
     `,
       { projectId }
@@ -634,9 +638,9 @@ export class FileStateMigration {
     const discoveredResult = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IS NULL
-      SET f.state = 'discovered',
-          f.stateUpdatedAt = datetime()
+      WHERE f._state IS NULL
+      SET f._state = 'discovered',
+          f._stateUpdatedAt = datetime()
       RETURN count(f) as count
     `,
       { projectId }
@@ -646,12 +650,12 @@ export class FileStateMigration {
     await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state = 'embedded'
+      WHERE f._state = 'embedded'
         AND EXISTS {
           MATCH (s:Scope)-[:DEFINED_IN]->(f)
           WHERE s._state IN ['linked', 'entities']
         }
-      SET f.state = 'linked'
+      SET f._state = 'linked'
     `,
       { projectId }
     );
@@ -660,12 +664,12 @@ export class FileStateMigration {
     await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IN ['linked', 'embedded']
+      WHERE f._state IN ['linked', 'embedded']
         AND EXISTS {
           MATCH (n)-[:DEFINED_IN]->(f)
           WHERE n.schemaDirty = true
         }
-      SET f.state = 'discovered'
+      SET f._state = 'discovered'
     `,
       { projectId }
     );
@@ -684,7 +688,7 @@ export class FileStateMigration {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f.state IS NULL
+      WHERE f._state IS NULL
       RETURN count(f) > 0 as needsMigration
     `,
       { projectId }

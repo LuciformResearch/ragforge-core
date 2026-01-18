@@ -11,24 +11,20 @@
 export * from './query.js';
 export * from './result.js';
 
-// Entity context types
-export {
+// Entity context types (all types, use export type)
+export type {
   EntityField,
   EnrichmentField,
   EntityContext,
-  ComputedFieldConfig,  // Unified from core
+  ComputedFieldConfig,
 } from './entity-context.js';
 
-// Config types
-export {
+// Config types (all types, use export type)
+export type {
   RuntimeConfig,
-  Neo4jConfig,           // Unified from core
-  RelationshipConfig,    // Unified from core
+  Neo4jConfig,
+  RelationshipConfig,
   RerankingStrategyConfig,
-} from './config.js';
-
-// Runtime-specific config types (different from core versions)
-export {
   EmbeddingsConfig as RuntimeEmbeddingsConfig,
   RerankingConfig as RuntimeRerankingConfig,
 } from './config.js';

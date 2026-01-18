@@ -177,7 +177,7 @@ export class FileProcessor {
       // - read_file calls updateMediaContent which sets state="linked"
       // - Watcher starts processFile with stale state info
       const currentStateResult = await this.neo4jClient.run(
-        `MATCH (f:File {uuid: $uuid}) RETURN f.state as state`,
+        `MATCH (f:File {uuid: $uuid}) RETURN f._state as state`,
         { uuid: file.uuid }
       );
 
@@ -519,33 +519,101 @@ export class FileProcessor {
     // 6. Split graph by absolutePath
     const graphsByFile = this.splitGraphByFile(parseResult?.graph);
 
-    // 7. Parallel: create nodes/relationships per file
+    // 7. GLOBAL BATCH: Collect all nodes and relationships from all files
+    console.log(`[FileProcessor] 📦 Collecting nodes/relationships from ${toProcess.length} files...`);
+
+    const allNodes: PreparedNode[] = [];
+    const allRelationships: ParsedRelationship[] = [];
+    const nodeUuidsByFile = new Map<string, Set<string>>();
+
+    // 7a. Process file-specific nodes
+    for (const d of toProcess) {
+      const fileGraph = graphsByFile.get(d.file.absolutePath);
+      nodeUuidsByFile.set(d.file.absolutePath, new Set<string>());
+
+      if (fileGraph && fileGraph.nodes.length > 0) {
+        const preparedNodes = this.prepareNodes(fileGraph.nodes, d.file.absolutePath);
+
+        // Collect UUIDs for orphan detection per file
+        for (const node of preparedNodes) {
+          nodeUuidsByFile.get(d.file.absolutePath)!.add(node.properties.uuid as string);
+        }
+
+        allNodes.push(...preparedNodes);
+      }
+
+      if (fileGraph?.relationships && fileGraph.relationships.length > 0) {
+        allRelationships.push(...fileGraph.relationships);
+      }
+    }
+
+    // 7b. Process global/structural nodes (Directory, ExternalLibrary, Project)
+    const globalGraph = graphsByFile.get('__GLOBAL__');
+    if (globalGraph && globalGraph.nodes.length > 0) {
+      console.log(`[FileProcessor] 📂 Adding ${globalGraph.nodes.length} global nodes (Directory, ExternalLibrary, Project)`);
+      const globalNodes = this.prepareGlobalNodes(globalGraph.nodes);
+      allNodes.push(...globalNodes);
+
+      if (globalGraph.relationships.length > 0) {
+        allRelationships.push(...globalGraph.relationships);
+      }
+    }
+
+    console.log(`[FileProcessor] 📊 Total: ${allNodes.length} nodes, ${allRelationships.length} relationships`);
+
+    // 8. Create ALL nodes in ONE batch (one query per label type)
+    let totalScopesCreated = 0;
+    try {
+      console.log(`[FileProcessor] 🔨 Creating nodes (global batch)...`);
+      const nodeResult = await this.createNodesBatchGlobal(allNodes);
+      totalScopesCreated = nodeResult.count;
+      console.log(`[FileProcessor] ✅ Nodes created: ${nodeResult.count} (${nodeResult.skippedCount} unchanged)`);
+    } catch (err: any) {
+      console.error(`[FileProcessor] ❌ Node creation failed: ${err.message}`);
+      // Transition all files to error state
+      for (const d of toProcess) {
+        await this.stateMachine.transition(d.file.uuid, 'error', {
+          errorType: 'parse',
+          errorMessage: err.message,
+        });
+      }
+      return {
+        processed: 0,
+        skipped: skipped.length,
+        deleted: deleted.length,
+        errors: toProcess.length,
+        totalScopesCreated: 0,
+        totalRelationshipsCreated: 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    // 9. Create ALL relationships in ONE batch (one query per relationship type)
+    // Build uuid->label map for fast indexed lookups (100x faster than unlabeled MATCH!)
+    const uuidToLabel = new Map<string, string>();
+    for (const node of allNodes) {
+      uuidToLabel.set(node.properties.uuid as string, node.label);
+    }
+
+    let totalRelationshipsCreated = 0;
+    try {
+      console.log(`[FileProcessor] 🔗 Creating relationships (global batch)...`);
+      totalRelationshipsCreated = await this.createRelationshipsBatchWithLabels(allRelationships, uuidToLabel);
+      console.log(`[FileProcessor] ✅ Relationships created: ${totalRelationshipsCreated}`);
+    } catch (err: any) {
+      console.error(`[FileProcessor] ❌ Relationship creation failed: ${err.message}`);
+      // Continue - nodes were created, relationships failed
+    }
+
+    // 10. Per-file cleanup (orphan deletion, hash update, references)
+    console.log(`[FileProcessor] 🧹 Per-file cleanup (${toProcess.length} files)...`);
     const processResults = await Promise.all(
       toProcess.map(d =>
         limit(async () => {
           try {
-            const fileGraph = graphsByFile.get(d.file.absolutePath);
-            let scopesCreated = 0;
-            let relationshipsCreated = 0;
-            const newNodeUuids = new Set<string>();
+            const newNodeUuids = nodeUuidsByFile.get(d.file.absolutePath) || new Set<string>();
 
-            if (fileGraph && fileGraph.nodes.length > 0) {
-              const preparedNodes = this.prepareNodes(fileGraph.nodes, d.file.absolutePath);
-
-              // Collect UUIDs for orphan detection
-              for (const node of preparedNodes) {
-                newNodeUuids.add(node.properties.uuid as string);
-              }
-
-              const createResult = await this.createNodesBatch(preparedNodes, d.file.absolutePath);
-              scopesCreated = createResult.count;
-
-              if (fileGraph.relationships && fileGraph.relationships.length > 0) {
-                relationshipsCreated = await this.createRelationshipsBatch(fileGraph.relationships);
-              }
-            }
-
-            // Delete orphan nodes
+            // Delete orphan nodes for this file
             await this.deleteOrphanScopes(d.file.absolutePath, newNodeUuids);
 
             // Update file hash
@@ -561,9 +629,9 @@ export class FileProcessor {
               }
             }
 
-            return { file: d.file, scopesCreated, relationshipsCreated, referencesCreated, error: null };
+            return { file: d.file, referencesCreated, error: null };
           } catch (err: any) {
-            return { file: d.file, scopesCreated: 0, relationshipsCreated: 0, referencesCreated: 0, error: err };
+            return { file: d.file, referencesCreated: 0, error: err };
           }
         })
       )
@@ -577,13 +645,13 @@ export class FileProcessor {
     for (const { file, error } of failures) {
       if (error) {
         await this.stateMachine.transition(file.uuid, 'error', {
-          errorType: 'parse',
+          errorType: 'relations',
           errorMessage: error.message,
         });
       }
     }
 
-    // 8. Batch transition successful files to 'linked'
+    // 11. Batch transition successful files to 'linked'
     if (successes.length > 0) {
       // Transition to 'relations' first, then 'linked'
       await this.stateMachine.transitionBatch(
@@ -609,13 +677,7 @@ export class FileProcessor {
       }
     }
 
-    // Aggregate results
-    let totalScopesCreated = 0;
-    let totalRelationshipsCreated = 0;
-    for (const r of successes) {
-      totalScopesCreated += r.scopesCreated;
-      totalRelationshipsCreated += r.relationshipsCreated;
-    }
+    // totalScopesCreated and totalRelationshipsCreated are already set from global batch operations
 
     const result = {
       processed: successes.length,
@@ -640,14 +702,29 @@ export class FileProcessor {
 
     if (!graph) return byFile;
 
-    // Group nodes by absolutePath
+    // Special key for global/structural nodes (Directory, ExternalLibrary, Project)
+    const GLOBAL_KEY = '__GLOBAL__';
+    byFile.set(GLOBAL_KEY, { nodes: [], relationships: [] });
+
+    // Labels that are "global" (not tied to a specific source file)
+    const globalLabels = new Set(['Directory', 'ExternalLibrary', 'Project']);
+
+    // Group nodes by absolutePath (or GLOBAL for structural nodes)
     for (const node of graph.nodes) {
-      const absPath = node.properties.absolutePath as string;
-      if (!absPath) continue;
-      if (!byFile.has(absPath)) {
-        byFile.set(absPath, { nodes: [], relationships: [] });
+      const isGlobal = node.labels.some(l => globalLabels.has(l));
+
+      if (isGlobal) {
+        // Global nodes go to special bucket
+        byFile.get(GLOBAL_KEY)!.nodes.push(node);
+      } else {
+        // File-specific nodes grouped by absolutePath
+        const absPath = node.properties.absolutePath as string;
+        if (!absPath) continue;
+        if (!byFile.has(absPath)) {
+          byFile.set(absPath, { nodes: [], relationships: [] });
+        }
+        byFile.get(absPath)!.nodes.push(node);
       }
-      byFile.get(absPath)!.nodes.push(node);
     }
 
     // Map node ID to file for relationship routing
@@ -658,7 +735,7 @@ export class FileProcessor {
       }
     }
 
-    // Route relationships to source node's file
+    // Route relationships to source node's file (or GLOBAL if source is global)
     if (graph.relationships) {
       for (const rel of graph.relationships) {
         const file = nodeToFile.get(rel.from);
@@ -735,12 +812,13 @@ export class FileProcessor {
         f.file = $relativePath,
         f.path = $relativePath,
         f.projectId = $projectId,
-        f.state = $state,
-        f.stateUpdatedAt = datetime()
+        f._state = $state,
+        f._stateUpdatedAt = datetime()
       ON MATCH SET
         f.name = $name,
-        f.extension = $extension
-      RETURN f.uuid AS uuid, f.state IS NULL AS created
+        f.extension = $extension,
+        f._pending = null
+      RETURN f.uuid AS uuid, f._state IS NULL AS created
     `, {
       absolutePath,
       fileUuid,
@@ -783,6 +861,106 @@ export class FileProcessor {
    *
    * Returns count and list of created/updated nodes (for state machine transitions)
    */
+  private async createNodesBatchGlobal(nodes: PreparedNode[]): Promise<{
+    count: number;
+    createdNodes: Array<{ uuid: string; label: string }>;
+    skippedCount: number;
+  }> {
+    if (nodes.length === 0) return { count: 0, createdNodes: [], skippedCount: 0 };
+
+    // Group nodes by label for efficient batch creation
+    const nodesByLabel = new Map<string, PreparedNode[]>();
+    for (const node of nodes) {
+      const label = node.label;
+      if (!nodesByLabel.has(label)) {
+        nodesByLabel.set(label, []);
+      }
+      nodesByLabel.get(label)!.push(node);
+    }
+
+    let totalCreated = 0;
+    let totalSkipped = 0;
+    const createdNodes: Array<{ uuid: string; label: string }> = [];
+
+    // Create/update nodes for each label type - ONE query per label for ALL files
+    for (const [label, labelNodes] of nodesByLabel) {
+      // Skip File and Project nodes - they are already managed elsewhere
+      if (label === 'File' || label === 'Project') {
+        continue;
+      }
+
+      const nodeProps = labelNodes.map(n => ({
+        uuid: n.properties.uuid,
+        contentHash: n.properties._contentHash,
+        filePath: n.properties.absolutePath, // Each node carries its own file path
+        props: n.properties,
+      }));
+
+      // Use MERGE for incremental updates
+      // DEFINED_IN relationship uses the node's own filePath (not a global parameter)
+      const result = await this.neo4jClient.run(`
+        UNWIND $nodes AS nodeData
+        MERGE (n:${label} {uuid: nodeData.uuid})
+        ON CREATE SET
+          n = nodeData.props,
+          n._state = 'linked',
+          n._linkedAt = datetime(),
+          n._wasCreated = true
+        ON MATCH SET
+          n._wasCreated = false,
+          n._wasUpdated = CASE WHEN n._contentHash <> nodeData.contentHash OR n._contentHash IS NULL THEN true ELSE false END
+        WITH n, nodeData, n.usesChunks AS preservedUsesChunks
+        WHERE n._wasCreated = true OR n._wasUpdated = true
+        SET n = nodeData.props,
+            n._state = 'linked',
+            n._linkedAt = datetime(),
+            n.usesChunks = preservedUsesChunks,
+            n._pending = null  // Clear placeholder flag when real node arrives
+        WITH n, nodeData
+        MATCH (f:File {absolutePath: nodeData.filePath})
+        MERGE (n)-[:DEFINED_IN]->(f)
+        RETURN n._wasCreated AS wasCreated, n._wasUpdated AS wasUpdated, n.uuid AS uuid
+      `, { nodes: nodeProps });
+
+      let created = 0;
+      let updated = 0;
+      for (const record of result.records) {
+        const wasCreated = record.get('wasCreated');
+        const wasUpdated = record.get('wasUpdated');
+        const uuid = record.get('uuid');
+
+        if (wasCreated) {
+          created++;
+          createdNodes.push({ uuid, label });
+        } else if (wasUpdated) {
+          updated++;
+          createdNodes.push({ uuid, label });
+        }
+      }
+
+      totalCreated += created + updated;
+      totalSkipped += labelNodes.length - (created + updated);
+
+      if (this.verbose && (created > 0 || updated > 0)) {
+        console.log(`[FileProcessor] ${label}: ${created} created, ${updated} updated, ${labelNodes.length - created - updated} unchanged`);
+      }
+    }
+
+    // Clean up temporary flags in a single query (no filePath filter needed)
+    await this.neo4jClient.run(`
+      MATCH (n)
+      WHERE n._wasCreated IS NOT NULL OR n._wasUpdated IS NOT NULL
+      REMOVE n._wasCreated, n._wasUpdated
+    `);
+
+    return { count: totalCreated, createdNodes, skippedCount: totalSkipped };
+  }
+
+  /**
+   * Create or update nodes in a batch for a single file using MERGE
+   * NOTE: This method is kept for backward compatibility. For multi-file batching,
+   * use createNodesBatchGlobal() instead.
+   */
   private async createNodesBatch(nodes: PreparedNode[], filePath: string): Promise<{
     count: number;
     createdNodes: Array<{ uuid: string; label: string }>;
@@ -824,6 +1002,7 @@ export class FileProcessor {
       // - ON CREATE: set all properties + _state='linked' (needs embedding)
       // - ON MATCH: only update if _contentHash changed, reset to 'linked' state
       // This ensures unchanged nodes keep their state (e.g., 'ready') and embeddings
+      // IMPORTANT: Preserve usesChunks so embedding service can detect when to cleanup chunks
       const result = await this.neo4jClient.run(`
         UNWIND $nodes AS nodeData
         MERGE (n:${label} {uuid: nodeData.uuid})
@@ -835,11 +1014,13 @@ export class FileProcessor {
         ON MATCH SET
           n._wasCreated = false,
           n._wasUpdated = CASE WHEN n._contentHash <> nodeData.contentHash OR n._contentHash IS NULL THEN true ELSE false END
-        WITH n, nodeData
+        WITH n, nodeData, n.usesChunks AS preservedUsesChunks
         WHERE n._wasCreated = true OR n._wasUpdated = true
         SET n = nodeData.props,
             n._state = 'linked',
-            n._linkedAt = datetime()
+            n._linkedAt = datetime(),
+            n.usesChunks = preservedUsesChunks,
+            n._pending = null  // Clear placeholder flag when real node arrives
         WITH n
         MATCH (f:File {absolutePath: $filePath})
         MERGE (n)-[:DEFINED_IN]->(f)
@@ -923,6 +1104,187 @@ export class FileProcessor {
     return totalCreated;
   }
 
+  /**
+   * Create relationships with labeled MATCH for 100x faster index lookups
+   * Groups by (relType, fromLabel, toLabel) for optimal query batching
+   * Pre-queries labels for unknown UUIDs to avoid slow unlabeled MATCH
+   */
+  private async createRelationshipsBatchWithLabels(
+    relationships: ParsedRelationship[],
+    uuidToLabel: Map<string, string>
+  ): Promise<number> {
+    if (relationships.length === 0) return 0;
+
+    // Step 1: Collect all UUIDs that aren't in our map (cross-file references)
+    const unknownUuids = new Set<string>();
+    for (const rel of relationships) {
+      if (!uuidToLabel.has(rel.from)) unknownUuids.add(rel.from);
+      if (!uuidToLabel.has(rel.to)) unknownUuids.add(rel.to);
+    }
+
+    // Step 1b: Create placeholder nodes for targets that have targetLabel/targetProps
+    // This ensures all targets exist before creating relationships (no silent failures!)
+    const placeholdersByLabel = new Map<string, Array<{ uuid: string; props: Record<string, unknown> }>>();
+    for (const rel of relationships) {
+      if (rel.targetLabel && rel.targetProps && unknownUuids.has(rel.to)) {
+        if (!placeholdersByLabel.has(rel.targetLabel)) {
+          placeholdersByLabel.set(rel.targetLabel, []);
+        }
+        // Avoid duplicates
+        const existing = placeholdersByLabel.get(rel.targetLabel)!;
+        if (!existing.some(p => p.uuid === rel.to)) {
+          existing.push({
+            uuid: rel.to,
+            props: {
+              ...rel.targetProps,
+              uuid: rel.to,
+              projectId: this.projectId,
+            }
+          });
+        }
+      }
+    }
+
+    // Create placeholders by label (one UNWIND query per label type)
+    if (placeholdersByLabel.size > 0) {
+      let totalPlaceholders = 0;
+      const placeholderCounts: string[] = [];
+
+      for (const [label, placeholders] of placeholdersByLabel) {
+        if (placeholders.length === 0) continue;
+
+        await this.neo4jClient.run(`
+          UNWIND $nodes AS nodeData
+          MERGE (n:${label} {uuid: nodeData.uuid})
+          ON CREATE SET
+            n = nodeData.props,
+            n._pending = true,
+            n._state = 'linked',
+            n._linkedAt = datetime()
+          ON MATCH SET
+            n._pending = null
+        `, { nodes: placeholders });
+
+        totalPlaceholders += placeholders.length;
+        placeholderCounts.push(`${label}: ${placeholders.length}`);
+
+        // Update uuidToLabel map with the created placeholders
+        for (const p of placeholders) {
+          uuidToLabel.set(p.uuid, label);
+          unknownUuids.delete(p.uuid); // No longer unknown
+        }
+      }
+
+      console.log(`[FileProcessor] 📦 Created ${totalPlaceholders} placeholder nodes (${placeholderCounts.join(', ')})`);
+    }
+
+    // Step 2: Pre-query labels for unknown UUIDs from Neo4j using LABELED queries (fast!)
+    if (unknownUuids.size > 0) {
+      console.log(`[FileProcessor] 🔍 Pre-querying labels for ${unknownUuids.size} cross-file references...`);
+      const unknownArray = Array.from(unknownUuids);
+
+      // Query each label type separately for indexed lookups
+      const labelsToCheck = [
+        'File', 'Directory', 'Project', 'ExternalLibrary',
+        'Scope', 'MarkdownSection', 'MarkdownDocument', 'CodeBlock',
+        'DataFile', 'PackageJson', 'WebDocument', 'WebPage',
+        'ImageFile', 'MediaFile', 'ThreeDFile', 'DocumentFile',
+        'Stylesheet', 'VueSFC', 'SvelteComponent'
+      ];
+
+      for (const label of labelsToCheck) {
+        // Skip if all UUIDs are already resolved
+        const remaining = unknownArray.filter(uuid => !uuidToLabel.has(uuid));
+        if (remaining.length === 0) break;
+
+        const result = await this.neo4jClient.run(`
+          MATCH (n:${label})
+          WHERE n.uuid IN $uuids
+          RETURN n.uuid AS uuid, '${label}' AS label
+        `, { uuids: remaining });
+
+        for (const record of result.records) {
+          const uuid = record.get('uuid');
+          if (uuid) {
+            uuidToLabel.set(uuid, label);
+          }
+        }
+      }
+
+      const resolved = unknownArray.filter(uuid => uuidToLabel.has(uuid)).length;
+      const unresolved = unknownArray.length - resolved;
+      console.log(`[FileProcessor] ✅ Labels resolved: ${resolved}/${unknownArray.length} (${unresolved} unresolved)`);
+    }
+
+    // Step 3: Group relationships by (type, fromLabel, toLabel) for specific indexed queries
+    const relsByTypeAndLabels = new Map<string, Array<{ from: string; to: string; props: Record<string, unknown> }>>();
+
+    for (const rel of relationships) {
+      const fromLabel = uuidToLabel.get(rel.from) || null; // null = truly unknown (shouldn't happen often now)
+      const toLabel = uuidToLabel.get(rel.to) || null;
+      const key = `${rel.type}|${fromLabel || '_'}|${toLabel || '_'}`;
+
+      if (!relsByTypeAndLabels.has(key)) {
+        relsByTypeAndLabels.set(key, []);
+      }
+      relsByTypeAndLabels.get(key)!.push({
+        from: rel.from,
+        to: rel.to,
+        props: rel.properties || {},
+      });
+    }
+
+    const batchSize = 500;
+    let totalCreated = 0;
+
+    // Log unlabeled matches (slow queries)
+    let unlabeledCount = 0;
+    let labeledCount = 0;
+    for (const [key, rels] of relsByTypeAndLabels) {
+      const [, fromLabelKey, toLabelKey] = key.split('|');
+      if (fromLabelKey === '_' || toLabelKey === '_') {
+        unlabeledCount += rels.length;
+        console.log(`[FileProcessor] ⚠️  UNLABELED: ${rels.length} ${key.split('|')[0]} (${fromLabelKey}→${toLabelKey})`);
+      } else {
+        labeledCount += rels.length;
+      }
+    }
+    if (unlabeledCount > 0) {
+      console.log(`[FileProcessor] 📊 Relationships: ${labeledCount} labeled (fast), ${unlabeledCount} unlabeled (slow)`);
+    }
+
+    // Step 4: Process each relationship type+label combination SEQUENTIALLY (avoids deadlocks)
+    for (const [key, rels] of relsByTypeAndLabels) {
+      const [relType, fromLabelKey, toLabelKey] = key.split('|');
+      const fromLabel = fromLabelKey === '_' ? null : fromLabelKey;
+      const toLabel = toLabelKey === '_' ? null : toLabelKey;
+
+      // Use labeled MATCH for indexed lookups (100x faster!)
+      const fromMatch = fromLabel ? `(source:${fromLabel} {uuid: relData.from})` : `(source {uuid: relData.from})`;
+      const toMatch = toLabel ? `(target:${toLabel} {uuid: relData.to})` : `(target {uuid: relData.to})`;
+
+      for (let i = 0; i < rels.length; i += batchSize) {
+        const batch = rels.slice(i, i + batchSize);
+
+        const result = await this.neo4jClient.run(`
+          UNWIND $rels AS relData
+          MATCH ${fromMatch}
+          MATCH ${toMatch}
+          MERGE (source)-[r:${relType}]->(target)
+          SET r += relData.props
+        `, { rels: batch });
+
+        totalCreated += batch.length;
+      }
+
+      const fromDisplay = fromLabel || 'Node';
+      const toDisplay = toLabel || 'Node';
+      console.log(`   🔗 ${rels.length} ${relType} (${fromDisplay}→${toDisplay})`);
+    }
+
+    return totalCreated;
+  }
+
   // ============================================
   // Helper Methods
   // ============================================
@@ -957,6 +1319,27 @@ export class FileProcessor {
   }
 
   /**
+   * Prepare global/structural nodes (Directory, ExternalLibrary, Project)
+   * These nodes keep their original absolutePath and don't get file-specific properties
+   */
+  private prepareGlobalNodes(nodes: ParsedNode[]): PreparedNode[] {
+    return nodes.map(node => {
+      const label = node.labels[0] || 'Directory';
+
+      // For global nodes, use their existing properties without overwriting
+      return {
+        label,
+        properties: {
+          ...node.properties,
+          uuid: node.id || crypto.randomUUID(),
+          projectId: this.projectId,
+          // Keep original absolutePath and path from the parser
+        },
+      };
+    });
+  }
+
+  /**
    * Compute content hash
    */
   private computeHash(content: string): string {
@@ -981,7 +1364,7 @@ export class FileProcessor {
   private async getFileState(absolutePath: string): Promise<FileState | null> {
     const result = await this.neo4jClient.run(`
       MATCH (f:File {absolutePath: $absolutePath, projectId: $projectId})
-      RETURN f.state AS state
+      RETURN f._state AS state
     `, { absolutePath, projectId: this.projectId });
 
     return result.records[0]?.get('state') || null;
@@ -999,13 +1382,17 @@ export class FileProcessor {
   }
 
   /**
-   * Delete file scopes (all nodes for this file)
+   * Delete file scopes (all nodes for this file) + their EmbeddingChunks
    * @deprecated Use deleteOrphanScopes for incremental ingestion
    */
   private async deleteFileScopes(absolutePath: string): Promise<void> {
     await this.neo4jClient.run(`
       MATCH (n)-[:DEFINED_IN]->(f:File {absolutePath: $absolutePath})
       WHERE n.projectId = $projectId
+      // First delete any EmbeddingChunk children
+      OPTIONAL MATCH (n)-[:HAS_EMBEDDING_CHUNK]->(chunk:EmbeddingChunk)
+      DETACH DELETE chunk
+      WITH n
       DETACH DELETE n
     `, { absolutePath, projectId: this.projectId });
   }
@@ -1020,11 +1407,14 @@ export class FileProcessor {
    */
   private async deleteOrphanScopes(absolutePath: string, currentUuids: Set<string>): Promise<number> {
     if (currentUuids.size === 0) {
-      // No nodes in parse = delete all scopes
+      // No nodes in parse = delete all scopes + their EmbeddingChunks
       const result = await this.neo4jClient.run(`
         MATCH (n)-[:DEFINED_IN]->(f:File {absolutePath: $absolutePath})
         WHERE n.projectId = $projectId
-        WITH n, n.uuid AS uuid
+        // First delete any EmbeddingChunk children
+        OPTIONAL MATCH (n)-[:HAS_EMBEDDING_CHUNK]->(chunk:EmbeddingChunk)
+        DETACH DELETE chunk
+        WITH n
         DETACH DELETE n
         RETURN count(*) AS deleted
       `, { absolutePath, projectId: this.projectId });
@@ -1033,11 +1423,14 @@ export class FileProcessor {
       return typeof deleted === 'number' ? deleted : deleted?.toNumber?.() || 0;
     }
 
-    // Delete nodes that are not in the current parse
+    // Delete nodes that are not in the current parse + their EmbeddingChunks
     const result = await this.neo4jClient.run(`
       MATCH (n)-[:DEFINED_IN]->(f:File {absolutePath: $absolutePath})
       WHERE n.projectId = $projectId AND NOT n.uuid IN $uuids
-      WITH n, n.uuid AS uuid
+      // First delete any EmbeddingChunk children
+      OPTIONAL MATCH (n)-[:HAS_EMBEDDING_CHUNK]->(chunk:EmbeddingChunk)
+      DETACH DELETE chunk
+      WITH n
       DETACH DELETE n
       RETURN count(*) AS deleted
     `, { absolutePath, projectId: this.projectId, uuids: Array.from(currentUuids) });

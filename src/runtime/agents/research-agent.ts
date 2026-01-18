@@ -825,11 +825,11 @@ export class ResearchAgent {
     // Get indexed projects info if brainManager is available
     if (this.brainManager) {
       try {
-        const projects = this.brainManager.listProjects();
+        const projects = await this.brainManager.listProjects();
         const normalizedCwd = this.cwd.endsWith('/') ? this.cwd.slice(0, -1) : this.cwd;
 
         // Find projects that are in or contain the cwd
-        const relevantProjects = projects.filter(p => {
+        const relevantProjects = projects.filter((p: any) => {
           const normalizedPath = p.path.endsWith('/') ? p.path.slice(0, -1) : p.path;
           // Project is inside cwd OR cwd is inside project
           return normalizedPath.startsWith(normalizedCwd) || normalizedCwd.startsWith(normalizedPath);

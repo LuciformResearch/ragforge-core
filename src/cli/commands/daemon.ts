@@ -44,7 +44,7 @@ import {
   type WebToolsContext,
   type RagAgentOptions,
   type ResearchAgent,
-} from '@luciformresearch/ragforge';
+} from '../../index.js';
 import { authManager, type AuthConfig } from './auth-config.js';
 
 // ============================================================================
@@ -283,6 +283,8 @@ class BrainDaemon {
   // Daemon status for health checks
   private status: 'starting' | 'ready' | 'error' = 'starting';
   private statusMessage: string = 'Initializing...';
+  // Track active operations to prevent idle shutdown during long tasks
+  private activeOperations: number = 0;
   // Agent conversation state (shared across all agent tool calls)
   private currentConversationId: string | undefined = undefined;
   // Research Agent for chat interface
@@ -768,9 +770,17 @@ class BrainDaemon {
    * - Projects where cwd is inside the project path
    * - Projects where the project path is inside cwd
    * - Projects where cwd exactly matches the project path
+   *
+   * Can be skipped by setting RAGFORGE_SKIP_AUTO_WATCHERS=1
    */
   private async autoStartWatchersForCwd(): Promise<void> {
     if (!this.brain) return;
+
+    // Check if auto-watchers should be skipped (e.g., during restart without watchers)
+    if (process.env.RAGFORGE_SKIP_AUTO_WATCHERS === '1') {
+      this.logger.info('Skipping auto-start watchers (RAGFORGE_SKIP_AUTO_WATCHERS=1)');
+      return;
+    }
 
     const cwd = process.cwd();
     const projects = await this.brain.listProjects();
@@ -828,7 +838,7 @@ class BrainDaemon {
    * Ensure watcher is running for a file's project (fire-and-forget)
    * Called before tool execution to auto-start watchers for known projects
    */
-  private ensureWatcherForFile(args: Record<string, any>): void {
+  private async ensureWatcherForFile(args: Record<string, any>): Promise<void> {
     if (!this.brain) return;
 
     // Extract file path from common arg names
@@ -840,7 +850,7 @@ class BrainDaemon {
       : path.resolve(process.cwd(), filePath);
 
     // Find project for this path
-    const project = this.brain.findProjectForFile(absolutePath);
+    const project = await this.brain.findProjectForFile(absolutePath);
     if (!project) return;
 
     // Check if watcher is already running
@@ -1048,8 +1058,15 @@ class BrainDaemon {
         // Auto-start watcher for file's project (fire-and-forget, non-blocking)
         this.ensureWatcherForFile(args);
 
+        // Track active operations to prevent idle shutdown during long tasks
+        this.activeOperations++;
         const startTime = Date.now();
-        const result = await handler(args);
+        let result;
+        try {
+          result = await handler(args);
+        } finally {
+          this.activeOperations--;
+        }
         const duration = Date.now() - startTime;
 
         // Write detailed brain_search log (fire-and-forget)
@@ -1128,6 +1145,7 @@ class BrainDaemon {
       const brain = await this.ensureBrain();
       this.logger.debug(`Ingest web page: ${url}`);
 
+      this.activeOperations++;
       try {
         const result = await brain.ingestWebPage({
           url,
@@ -1142,6 +1160,8 @@ class BrainDaemon {
         this.logger.error(`Web page ingestion failed: ${err.message}`);
         reply.status(500);
         return { success: false, error: err.message };
+      } finally {
+        this.activeOperations--;
       }
     });
 
@@ -1167,6 +1187,7 @@ class BrainDaemon {
       const brain = await this.ensureBrain();
       this.logger.debug(`Update media content: ${filePath}`);
 
+      this.activeOperations++;
       try {
         await brain.updateMediaContent({
           filePath,
@@ -1182,6 +1203,8 @@ class BrainDaemon {
         this.logger.error(`Media content update failed: ${err.message}`);
         reply.status(500);
         return { success: false, error: err.message };
+      } finally {
+        this.activeOperations--;
       }
     });
 
@@ -1374,6 +1397,8 @@ class BrainDaemon {
         'Access-Control-Allow-Origin': '*',
       });
 
+      // Track active operation to prevent idle shutdown during agent chat
+      this.activeOperations++;
       try {
         // Ensure brain is initialized
         const brain = await this.ensureBrain();
@@ -1486,6 +1511,8 @@ class BrainDaemon {
         } catch (writeError: any) {
           this.logger.error(`[Agent] Failed to send error to client: ${writeError.message}`);
         }
+      } finally {
+        this.activeOperations--;
       }
     });
 
@@ -1602,6 +1629,8 @@ class BrainDaemon {
         const agentConversationId = agent.getConversationId();
 
         // Run research in background (fire and forget)
+        // Track as active operation to prevent idle shutdown
+        this.activeOperations++;
         (async () => {
           try {
             this.logger.info(`[Background Research] Starting...`);
@@ -1615,6 +1644,8 @@ class BrainDaemon {
             await fs.writeFile(reportPath, result.report, 'utf-8');
           } catch (err: any) {
             this.logger.error(`[Background Research] Failed: ${err.message}`);
+          } finally {
+            this.activeOperations--;
           }
         })();
 
@@ -1640,6 +1671,8 @@ class BrainDaemon {
     this.server.post<{
       Body: { message: string; conversationId?: string; cwd?: string };
     }>('/agent/research-sync', async (request, reply) => {
+      // Track active operation to prevent idle shutdown during research
+      this.activeOperations++;
       try {
         const { message, conversationId, cwd } = request.body;
         const brain = await this.ensureBrain();
@@ -1714,6 +1747,8 @@ class BrainDaemon {
         this.logger.error(`Agent research-sync error: ${error.message}`);
         reply.status(500);
         return { success: false, error: error.message };
+      } finally {
+        this.activeOperations--;
       }
     });
 
@@ -1788,6 +1823,21 @@ class BrainDaemon {
     }
 
     this.idleTimer = setTimeout(() => {
+      // Don't shutdown if there are active operations (embeddings, ingestion, etc.)
+      if (this.activeOperations > 0) {
+        this.logger.info(`Idle timeout reached but ${this.activeOperations} operations still active, postponing shutdown...`);
+        this.resetIdleTimer(); // Reschedule
+        return;
+      }
+
+      // Also check for active processing loops (watchers doing background ingestion)
+      if (this.brain?.hasActiveProcessing()) {
+        const activeCount = this.brain.getActiveProcessingCount();
+        this.logger.info(`Idle timeout reached but ${activeCount} processing loop(s) still active, postponing shutdown...`);
+        this.resetIdleTimer(); // Reschedule
+        return;
+      }
+
       this.logger.info(`Idle timeout reached (${IDLE_TIMEOUT_MS / 1000}s), shutting down...`);
       this.shutdown();
     }, IDLE_TIMEOUT_MS);
@@ -1954,6 +2004,21 @@ export async function stopDaemon(): Promise<void> {
     }
   } catch {
     console.log('ℹ️  Daemon is not running');
+  }
+}
+
+export async function restartDaemonCli(options: { verbose?: boolean } = {}): Promise<void> {
+  const { restartDaemon } = await import('../../daemon/daemon-client.js');
+  const result = await restartDaemon({
+    withWatchers: true,
+    verbose: options.verbose ?? false,
+  });
+
+  if (result.success) {
+    console.log(`✓ ${result.message}`);
+  } else {
+    console.error(`❌ ${result.message}`);
+    process.exitCode = 1;
   }
 }
 
