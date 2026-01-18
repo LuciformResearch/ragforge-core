@@ -457,9 +457,26 @@ cd services && docker compose up -d
 
 ---
 
-## License
+## License - Luciform Research Source License (LRSL) v1.1
 
-LRSL-1.1 - See [LICENSE](LICENSE) for details.
+**2025 Luciform Research. All rights reserved except as granted below.**
+
+**Free to use for:**
+- Research, education, personal exploration
+- Freelance or small-scale projects (gross monthly revenue up to 100,000 EUR)
+- Internal tools (if your company revenue is up to 100,000 EUR/month)
+
+**Commercial use above this threshold** requires a separate agreement.
+
+Contact for commercial licensing: [legal@luciformresearch.com](mailto:legal@luciformresearch.com)
+
+**Grace period:** 60 days after crossing the revenue threshold
+
+Full text: [LICENSE](./LICENSE)
+
+---
+
+**Note:** This is a custom "source-available" license, NOT an OSI-approved open source license.
 
 ---
 
