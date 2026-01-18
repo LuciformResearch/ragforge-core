@@ -1,6 +1,6 @@
 {
   "name": "@luciformresearch/ragforge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "RagForge - RAG toolkit with Neo4j integration, code analysis, embeddings, and multi-language code parsing.",
   "license": "LRSL-1.1",
   "author": "Lucie Defraiteur <luciedefraiteur@luciformresearch.com>",
