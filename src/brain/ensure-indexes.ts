@@ -29,9 +29,18 @@ import { MULTI_EMBED_CONFIGS } from './embedding-service.js';
 // Types
 // ============================================
 
+/**
+ * Interface for embedding service dimension detection
+ */
+export interface EmbeddingDimensionProvider {
+  getDimensions(): Promise<number | null>;
+}
+
 export interface EnsureIndexesOptions {
   /** Vector embedding dimension (default: 3072 for Gemini) */
   dimension?: number;
+  /** Embedding service to auto-detect dimension (takes priority over explicit dimension) */
+  embeddingService?: EmbeddingDimensionProvider;
   /** Verbose logging */
   verbose?: boolean;
   /** Skip vector indexes (useful if no embedding service) */
@@ -407,13 +416,30 @@ async function ensureOrRecreateVectorIndex(
  * Ensure vector indexes exist for semantic search.
  * Creates indexes based on MULTI_EMBED_CONFIGS.
  * If an index exists with wrong dimensions, it will be dropped and recreated.
+ *
+ * Dimension resolution order:
+ * 1. embeddingService.getDimensions() if provided
+ * 2. explicit dimension parameter
+ * 3. default 3072 (Gemini)
  */
 export async function ensureVectorIndexes(
   neo4jClient: Neo4jClient,
-  options: { dimension?: number; verbose?: boolean } = {}
+  options: { dimension?: number; embeddingService?: EmbeddingDimensionProvider; verbose?: boolean } = {}
 ): Promise<IndexStats> {
   const stats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
-  const { dimension = 3072, verbose = false } = options;
+  const { embeddingService, verbose = false } = options;
+
+  // Resolve dimension: embeddingService > explicit > default
+  let dimension = options.dimension ?? 3072;
+  if (embeddingService) {
+    const detectedDimension = await embeddingService.getDimensions();
+    if (detectedDimension) {
+      dimension = detectedDimension;
+      if (verbose) {
+        console.log(`[Indexes] Auto-detected embedding dimension: ${dimension}`);
+      }
+    }
+  }
 
   if (verbose) {
     console.log(`[Indexes] Ensuring vector indexes (dimension: ${dimension})...`);
@@ -498,10 +524,19 @@ export async function ensureVectorIndexes(
  */
 export async function ensureConversationIndexes(
   neo4jClient: Neo4jClient,
-  options: { dimension?: number; verbose?: boolean } = {}
+  options: { dimension?: number; embeddingService?: EmbeddingDimensionProvider; verbose?: boolean } = {}
 ): Promise<IndexStats> {
   const stats: IndexStats = { created: 0, skipped: 0, errors: 0, recreated: 0 };
-  const { dimension = 3072, verbose = false } = options;
+  const { embeddingService, verbose = false } = options;
+
+  // Resolve dimension: embeddingService > explicit > default
+  let dimension = options.dimension ?? 3072;
+  if (embeddingService) {
+    const detectedDimension = await embeddingService.getDimensions();
+    if (detectedDimension) {
+      dimension = detectedDimension;
+    }
+  }
 
   if (verbose) {
     console.log('[Indexes] Ensuring conversation indexes...');
@@ -598,7 +633,8 @@ export async function ensureAllIndexes(
   options: EnsureIndexesOptions = {}
 ): Promise<IndexStats> {
   const {
-    dimension = 3072,
+    dimension,
+    embeddingService,
     verbose = false,
     skipVectorIndexes = false,
     skipConversationIndexes = false,
@@ -626,7 +662,7 @@ export async function ensureAllIndexes(
 
   // Vector indexes
   if (!skipVectorIndexes) {
-    const vectorStats = await ensureVectorIndexes(neo4jClient, { dimension, verbose });
+    const vectorStats = await ensureVectorIndexes(neo4jClient, { dimension, embeddingService, verbose });
     totalStats.created += vectorStats.created;
     totalStats.skipped += vectorStats.skipped;
     totalStats.errors += vectorStats.errors;
@@ -635,7 +671,7 @@ export async function ensureAllIndexes(
 
   // Conversation indexes
   if (!skipConversationIndexes) {
-    const convStats = await ensureConversationIndexes(neo4jClient, { dimension, verbose });
+    const convStats = await ensureConversationIndexes(neo4jClient, { dimension, embeddingService, verbose });
     totalStats.created += convStats.created;
     totalStats.skipped += convStats.skipped;
     totalStats.errors += convStats.errors;

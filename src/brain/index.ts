@@ -93,6 +93,23 @@ export {
 } from './file-processor.js';
 
 export {
+  // Interface
+  type IContentProvider,
+  // Implementations
+  DiskContentProvider,
+  VirtualContentProvider,
+  HybridContentProvider,
+  // Factory
+  createContentProvider,
+  isVirtualFile,
+  // Types
+  type ContentFileInfo,
+  type ContentReadResult,
+  type BatchContentResult,
+  type ContentSourceType,
+} from './content-provider.js';
+
+export {
   ChangeDetector,
   type ChangeResult,
   type BatchChangeResult,
@@ -165,4 +182,5 @@ export {
   ABSOLUTE_PATH_LABELS,
   type EnsureIndexesOptions,
   type IndexStats,
+  type EmbeddingDimensionProvider,
 } from './ensure-indexes.js';

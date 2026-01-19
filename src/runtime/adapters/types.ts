@@ -259,6 +259,51 @@ export interface ParseOptions {
    * Maps symbol name -> array of candidates with uuid, file, and type.
    */
   existingUUIDMapping?: Map<string, Array<{ uuid: string; file: string; type: string }>>;
+
+  /**
+   * Parser-specific options for documents and media files.
+   * These options are passed through to DocumentParser and MediaParser.
+   */
+  parserOptions?: ParserOptionsConfig;
+}
+
+/**
+ * Parser-specific options for documents and media files.
+ * Used for Vision-enhanced parsing of PDFs, images, 3D models, etc.
+ */
+export interface ParserOptionsConfig {
+  // ========== Vision Options (documents & media) ==========
+
+  /** Enable Vision-based parsing for better quality (default: false) */
+  enableVision?: boolean;
+
+  /** Vision analyzer function - analyzes images and returns text description */
+  visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+
+  // ========== Document-specific Options (PDF, DOCX) ==========
+
+  /** Section title detection mode (default: 'detect') */
+  sectionTitles?: 'none' | 'detect' | 'llm';
+
+  /** Maximum pages to process */
+  maxPages?: number;
+
+  /** Minimum paragraph length to include (default: 50) */
+  minParagraphLength?: number;
+
+  /** Generate titles for sections without one using LLM (default: false) */
+  generateTitles?: boolean;
+
+  /** Custom title generator function */
+  titleGenerator?: (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>;
+
+  // ========== Media-specific Options (images, 3D models) ==========
+
+  /** 3D render function for generating views of 3D models */
+  render3D?: (modelPath: string) => Promise<Array<{ view: string; buffer: Buffer }>>;
+
+  /** OCR provider preference */
+  ocrProvider?: 'tesseract' | 'gemini' | 'auto';
 }
 
 /**

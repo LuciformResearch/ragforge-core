@@ -562,10 +562,11 @@ export const RAW_CONTENT_PROPERTIES = [
 // ============================================================
 
 /**
- * Maximum size for _rawContent on File nodes (100KB).
+ * Maximum size for _rawContent on File nodes (500KB).
  * Files larger than this won't have _rawContent stored.
+ * This limit applies to virtual files where content needs to be stored in Neo4j.
  */
-export const MAX_RAW_CONTENT_SIZE = 100 * 1024;
+export const MAX_RAW_CONTENT_SIZE = 500 * 1024;
 
 /**
  * Check if raw content should be stored on a File node.

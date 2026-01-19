@@ -73,7 +73,8 @@ import {
   type ParsedGraph,
   type ValidationResult,
   type ParseProgress,
-  type VirtualFile
+  type VirtualFile,
+  type ParserOptionsConfig,
 } from './types.js';
 import { UniqueIDHelper } from '../utils/UniqueIDHelper.js';
 import { ImportResolver } from '../utils/ImportResolver.js';
@@ -95,11 +96,14 @@ import {
 } from './media-file-parser.js';
 import {
   parseDocumentFile,
+  parsePdfWithVision,
   isDocumentFile,
+  getDocumentFormat,
   type DocumentFileInfo,
   type SpreadsheetInfo,
   type PDFInfo,
   type DOCXInfo,
+  type ParsedSection,
 } from './document-file-parser.js';
 import { DEFAULT_EXCLUDE_PATTERNS } from '../../ingestion/constants.js';
 import {
@@ -521,7 +525,9 @@ export class CodeSourceAdapter extends SourceAdapter {
       dataFiles,
       mediaFiles,
       documentFiles,
-      fileMetadata
+      fileMetadata,
+      documentPageNumMap,
+      documentMetadata,
     } = await this.parseFiles(files, config, (current) => {
       options.onProgress?.({
         phase: 'parsing',
@@ -530,7 +536,7 @@ export class CodeSourceAdapter extends SourceAdapter {
         totalFiles: files.length,
         percentComplete: ((files.indexOf(current) + 1) / files.length) * 100
       });
-    }, contentMap);
+    }, contentMap, options.parserOptions);
 
     // Report progress: building graph
     options.onProgress?.({
@@ -560,7 +566,9 @@ export class CodeSourceAdapter extends SourceAdapter {
       dataFiles,
       mediaFiles,
       documentFiles,
-      fileMetadata
+      fileMetadata,
+      documentPageNumMap,
+      documentMetadata,
     }, config, resolver, projectInfo, generatedProjectId, options.existingUUIDMapping);
 
     // Export XML if requested
@@ -659,7 +667,8 @@ export class CodeSourceAdapter extends SourceAdapter {
     files: string[],
     config: CodeSourceConfig,
     onProgress: (file: string) => void,
-    contentMap?: Map<string, string | Buffer>
+    contentMap?: Map<string, string | Buffer>,
+    parserOptions?: ParserOptionsConfig
   ): Promise<{
     codeFiles: Map<string, ScopeFileAnalysis>;
     htmlFiles: Map<string, HTMLParseResult>;
@@ -674,6 +683,10 @@ export class CodeSourceAdapter extends SourceAdapter {
     mediaFiles: Map<string, MediaFileInfo>;
     documentFiles: Map<string, DocumentFileInfo>;
     fileMetadata: Map<string, { rawContentHash: string; mtime: string; rawContent?: string }>;
+    /** Maps document file paths to their section pageNum mapping (startLine → pageNum) */
+    documentPageNumMap: Map<string, Map<number, number>>;
+    /** Document metadata (sourceFormat, pageCount, etc.) for files converted to markdown */
+    documentMetadata: Map<string, { sourceFormat: string; pageCount?: number; parsedWith?: string }>;
   }> {
     const codeFiles = new Map<string, ScopeFileAnalysis>();
     const htmlFiles = new Map<string, HTMLParseResult>();
@@ -689,6 +702,12 @@ export class CodeSourceAdapter extends SourceAdapter {
     const documentFiles = new Map<string, DocumentFileInfo>();
     // Pre-computed file metadata (hash + mtime + optional raw content) to avoid re-reading files in buildGraph
     const fileMetadata = new Map<string, { rawContentHash: string; mtime: string; rawContent?: string }>();
+    // Document pageNum mapping: filePath → (startLine → pageNum)
+    const documentPageNumMap = new Map<string, Map<number, number>>();
+    // Document metadata for files converted to markdown
+    const documentMetadata = new Map<string, { sourceFormat: string; pageCount?: number; parsedWith?: string }>();
+    // Track which files are virtual (from contentMap) - only these get _rawContent stored
+    const virtualFiles = new Set<string>(contentMap?.keys() || []);
 
     // Use p-limit for parallel processing (10 concurrent files)
     const limit = pLimit(10);
@@ -796,16 +815,90 @@ export class CodeSourceAdapter extends SourceAdapter {
 
       console.log(`   📊 Non-code breakdown: ${binaryFiles.length} binary, ${nonCodeParsableFiles.length} parsable, ${otherTextFiles.length} other`);
 
+      // Map to store document markdown content (to be passed to markdown parser)
+      const documentMarkdownMap = new Map<string, string>();
+
       // PHASE 2a: Process binary files (documents, media) with pLimit
+      // Documents are converted to markdown and will be parsed by the standard markdown parser
       if (binaryFiles.length > 0) {
         await Promise.all(
           binaryFiles.map(file => limit(async () => {
             try {
               if (isDocumentFile(file)) {
-                const docInfo = await parseDocumentFile(file, { extractText: true });
-                if (docInfo) documentFiles.set(file, docInfo);
+                const format = getDocumentFormat(file);
+
+                if (format === 'pdf' && parserOptions?.enableVision && parserOptions?.visionAnalyzer) {
+                  // Use Vision-enhanced parsing for PDFs with images
+                  const result = await parsePdfWithVision(file, {
+                    visionAnalyzer: parserOptions.visionAnalyzer,
+                    maxPages: parserOptions.maxPages,
+                    sectionTitles: 'detect',
+                    outputFormat: 'markdown',
+                  });
+
+                  // Store pageNum mapping for each section
+                  const pageNumMap = new Map<number, number>();
+                  for (const section of result.sections) {
+                    pageNumMap.set(section.startLine, section.pageNum);
+                  }
+                  documentPageNumMap.set(file, pageNumMap);
+
+                  // Store document metadata
+                  documentMetadata.set(file, {
+                    sourceFormat: 'pdf',
+                    pageCount: result.pagesProcessed,
+                    parsedWith: 'vision',
+                  });
+
+                  // Store markdown content to be parsed by standard markdown parser
+                  documentMarkdownMap.set(file, result.content);
+
+                } else {
+                  // Basic text extraction (PDF, DOCX, etc.)
+                  const docInfo = await parseDocumentFile(file, {
+                    extractText: true,
+                    useOcr: true,
+                    visionAnalyzer: parserOptions?.visionAnalyzer,
+                    analyzeImages: parserOptions?.enableVision,
+                    extractImages: parserOptions?.enableVision,
+                    maxOcrPages: parserOptions?.maxPages,
+                  });
+
+                  if (docInfo && docInfo.textContent) {
+                    // Convert to simple markdown format
+                    let markdownContent = '';
+                    const fileName = path.basename(file);
+
+                    // Add frontmatter
+                    markdownContent += '---\n';
+                    markdownContent += `sourceFormat: "${docInfo.format}"\n`;
+                    markdownContent += `originalFileName: "${fileName}"\n`;
+                    if (docInfo.pageCount) markdownContent += `pageCount: ${docInfo.pageCount}\n`;
+                    markdownContent += '---\n\n';
+                    markdownContent += `# ${fileName}\n\n`;
+                    markdownContent += docInfo.textContent;
+
+                    // For non-Vision parsing, we don't have per-section pageNum
+                    // Just store basic metadata
+                    documentMetadata.set(file, {
+                      sourceFormat: docInfo.format,
+                      pageCount: docInfo.pageCount,
+                      parsedWith: 'text',
+                    });
+
+                    documentMarkdownMap.set(file, markdownContent);
+                  } else {
+                    // No text content could be extracted - skip this document
+                    console.warn(`[CodeSourceAdapter] Document ${file} has no extractable text content, skipping`);
+                  }
+                }
               } else if (isMediaFile(file)) {
-                const mediaInfo = await parseMediaFile(file);
+                // Map parserOptions to parseMediaFile options
+                const mediaInfo = await parseMediaFile(file, {
+                  enableVision: parserOptions?.enableVision,
+                  visionAnalyzer: parserOptions?.visionAnalyzer,
+                  render3D: parserOptions?.render3D,
+                });
                 if (mediaInfo) mediaFiles.set(file, mediaInfo);
               }
               filesProcessed++;
@@ -818,7 +911,8 @@ export class CodeSourceAdapter extends SourceAdapter {
       }
 
       // PHASE 2b: Read and parse non-code parsable files with NonCodeProjectParser
-      if (nonCodeParsableFiles.length > 0) {
+      // Also includes document files converted to markdown in PHASE 2a
+      if (nonCodeParsableFiles.length > 0 || documentMarkdownMap.size > 0) {
         // Read all non-code parsable files and compute metadata
         const nonCodeContentMap = new Map<string, string>();
         await Promise.all(
@@ -857,12 +951,28 @@ export class CodeSourceAdapter extends SourceAdapter {
           }))
         );
 
+        // Add document markdown content to be parsed as markdown files
+        // These documents (PDF, DOCX) were converted to markdown in PHASE 2a
+        for (const [docPath, markdownContent] of documentMarkdownMap) {
+          nonCodeContentMap.set(docPath, markdownContent);
+
+          // Compute metadata for the markdown content
+          const rawContentHash = createHash('sha256').update(markdownContent).digest('hex');
+          const mtime = formatLocalDate(new Date());
+          fileMetadata.set(docPath, {
+            rawContentHash,
+            mtime,
+            rawContent: getRawContentProp(markdownContent),
+          });
+        }
+
         // Parse all non-code files with NonCodeProjectParser (uses worker threads)
         const nonCodeParser = this.getNonCodeProjectParser();
         const parseInputs = Array.from(nonCodeContentMap.entries()).map(([filePath, content]) => ({
           path: filePath,
           content,
-          options: this.isMarkdownFile(filePath) ? { parseCodeBlocks: false } : {},
+          // Treat document files as markdown (they were converted in PHASE 2a)
+          options: (this.isMarkdownFile(filePath) || documentMarkdownMap.has(filePath)) ? { parseCodeBlocks: false } : {},
         }));
 
         const nonCodeResult = await nonCodeParser.parseFiles({ files: parseInputs });
@@ -972,7 +1082,7 @@ export class CodeSourceAdapter extends SourceAdapter {
       console.log(`✅ All non-code files processed. Total: ${filesProcessed}/${files.length}`);
     }
 
-    return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles, fileMetadata };
+    return { codeFiles, htmlFiles, cssFiles, scssFiles, vueFiles, svelteFiles, markdownFiles, genericFiles, packageJsonFiles, dataFiles, mediaFiles, documentFiles, fileMetadata, documentPageNumMap, documentMetadata };
   }
 
   /**
@@ -1026,6 +1136,10 @@ export class CodeSourceAdapter extends SourceAdapter {
       mediaFiles: Map<string, MediaFileInfo>;
       documentFiles: Map<string, DocumentFileInfo>;
       fileMetadata: Map<string, { rawContentHash: string; mtime: string; rawContent?: string }>;
+      /** Maps document file paths to their section pageNum mapping (startLine → pageNum) */
+      documentPageNumMap: Map<string, Map<number, number>>;
+      /** Document metadata (sourceFormat, pageCount, etc.) for files converted to markdown */
+      documentMetadata: Map<string, { sourceFormat: string; pageCount?: number; parsedWith?: string }>;
     },
     config: CodeSourceConfig,
     resolver: ImportResolver,
@@ -1046,7 +1160,9 @@ export class CodeSourceAdapter extends SourceAdapter {
       dataFiles,
       mediaFiles,
       documentFiles,
-      fileMetadata
+      fileMetadata,
+      documentPageNumMap,
+      documentMetadata,
     } = parsedFiles;
     const nodes: ParsedNode[] = [];
     const relationships: ParsedRelationship[] = [];
@@ -2128,9 +2244,15 @@ export class CodeSourceAdapter extends SourceAdapter {
       const relPath = path.relative(projectRoot, filePath);
       const doc = mdResult.document;
 
+      // Get document metadata if this is a converted document (PDF, DOCX → markdown)
+      const docMeta = documentMetadata.get(filePath);
+      const isConvertedDocument = !!docMeta;
+
       const mdId = UniqueIDHelper.GenerateMarkdownDocumentUUID(filePath);
       nodes.push({
-        labels: ['MarkdownDocument'],
+        labels: isConvertedDocument
+          ? ['MarkdownDocument', 'ConvertedDocument']  // Add label for documents converted to markdown
+          : ['MarkdownDocument'],
         id: mdId,
         properties: {
           uuid: mdId,
@@ -2146,6 +2268,10 @@ export class CodeSourceAdapter extends SourceAdapter {
           wordCount: doc.wordCount ?? 0,
           ...(doc.frontMatter && { frontMatter: JSON.stringify(doc.frontMatter) }),
           ...(doc.sections && doc.sections.length > 0 && { sections: JSON.stringify(doc.sections.map(s => ({ title: s.title, level: s.level, slug: s.slug }))) }),
+          // Add document metadata for converted files (PDF, DOCX)
+          ...(docMeta?.sourceFormat && { sourceFormat: docMeta.sourceFormat }),
+          ...(docMeta?.pageCount && { pageCount: docMeta.pageCount }),
+          ...(docMeta?.parsedWith && { parsedWith: docMeta.parsedWith }),
           indexedAt: getLocalTimestamp()
         }
       });
@@ -2265,11 +2391,17 @@ export class CodeSourceAdapter extends SourceAdapter {
           sectionStableNames.set(section.startLine, stableName);
         }
 
+        // Get pageNum mapping if this is a document file (PDF, DOCX converted to markdown)
+        const pageNumMap = documentPageNumMap.get(filePath);
+
         for (const section of doc.sections) {
           const stableName = sectionStableNames.get(section.startLine)!;
           const sectionId = UniqueIDHelper.GenerateMarkdownSectionUUID(filePath, stableName);
           // Compute hash from content for incremental ingestion
           const sectionHash = createHash('sha256').update(section.content || '').digest('hex').slice(0, 16);
+
+          // Look up pageNum from document mapping (for PDF/DOCX converted to markdown)
+          const pageNum = pageNumMap?.get(section.startLine);
 
           // Build raw props - createNodeFromRegistry normalizes to _name, _content, _description
           const sectionProps: Record<string, unknown> = {
@@ -2287,6 +2419,8 @@ export class CodeSourceAdapter extends SourceAdapter {
             startLine: section.startLine,
             endLine: section.endLine,
             ...(section.parentTitle && { parentTitle: section.parentTitle }),
+            // Add pageNum for document sections (PDF, DOCX)
+            ...(pageNum !== undefined && { pageNum }),
             indexedAt: getLocalTimestamp()
           };
           nodes.push(createNodeFromRegistry('MarkdownSection', sectionId, sectionProps));

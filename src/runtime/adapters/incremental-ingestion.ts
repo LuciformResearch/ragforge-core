@@ -636,6 +636,16 @@ export class IncrementalIngestionManager {
       // Note: _name, _content, _description are now set at parser level via createContentNode()
       // No need to extract here anymore
 
+      // Filter _rawContent for non-virtual File nodes
+      // _rawContent should only be stored for virtual files (content in Neo4j, not on disk)
+      // This prevents disk files from having unnecessary raw content stored
+      const isFileNode = node.labels.includes('File') && !node.labels.includes('MediaFile')
+        && !node.labels.includes('ImageFile') && !node.labels.includes('ThreeDFile')
+        && !node.labels.includes('DocumentFile');
+      if (isFileNode && !props.isVirtual && props._rawContent) {
+        delete props._rawContent;
+      }
+
       if (!nodesByLabel.has(labels)) {
         nodesByLabel.set(labels, []);
       }

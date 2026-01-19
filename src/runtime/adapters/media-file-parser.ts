@@ -62,6 +62,9 @@ export interface ImageFileInfo extends MediaFileInfo {
     width: number;
     height: number;
   };
+
+  /** Vision-generated description of the image */
+  description?: string;
 }
 
 /**
@@ -79,6 +82,12 @@ export interface ThreeDFileInfo extends MediaFileInfo {
     textureCount?: number;
     animationCount?: number;
   };
+
+  /** Vision-generated description of the 3D model */
+  description?: string;
+
+  /** List of rendered view names (e.g., ['front', 'right', 'perspective']) */
+  renderedViews?: string[];
 }
 
 /**
@@ -128,7 +137,7 @@ export interface MediaAnalysis {
 }
 
 /**
- * Parse options (metadata extraction only, vision handled by MediaParser)
+ * Parse options for media files
  */
 export interface MediaFileParseOptions {
   /** Try to extract image dimensions (requires reading file header) */
@@ -139,6 +148,17 @@ export interface MediaFileParseOptions {
 
   /** Base path for resolving relative paths */
   basePath?: string;
+
+  // ========== Vision Options (for enhanced parsing) ==========
+
+  /** Vision analyzer function - analyzes images and returns text description */
+  visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+
+  /** 3D render function for generating views of 3D models */
+  render3D?: (modelPath: string) => Promise<Array<{ view: string; buffer: Buffer }>>;
+
+  /** Enable Vision-based analysis (default: false) */
+  enableVision?: boolean;
 }
 
 // =============================================================================
@@ -457,6 +477,18 @@ export async function parseMediaFile(
       info.dimensions = await extractImageDimensions(resolvedPath) || undefined;
     }
 
+    // Vision analysis if enabled
+    if (options.enableVision && options.visionAnalyzer) {
+      try {
+        const imageBuffer = await fs.promises.readFile(resolvedPath);
+        const description = await options.visionAnalyzer(imageBuffer, 'Describe this image in detail.');
+        info.description = description;
+        info.analyzed = true;
+      } catch (err) {
+        console.warn(`Vision analysis failed for ${filePath}:`, err);
+      }
+    }
+
     return info;
   }
 
@@ -468,6 +500,26 @@ export async function parseMediaFile(
 
     if (options.parseGltfMetadata !== false) {
       info.gltfInfo = await extractGltfMetadata(resolvedPath) || undefined;
+    }
+
+    // 3D rendering and Vision analysis if enabled
+    if (options.enableVision && options.render3D && options.visionAnalyzer) {
+      try {
+        const renders = await options.render3D(resolvedPath);
+        const descriptions: string[] = [];
+        info.renderedViews = [];
+
+        for (const render of renders) {
+          const description = await options.visionAnalyzer(render.buffer, `Describe this ${render.view} view of a 3D model.`);
+          descriptions.push(`${render.view}: ${description}`);
+          info.renderedViews.push(render.view);
+        }
+
+        info.description = descriptions.join('\n\n');
+        info.analyzed = true;
+      } catch (err) {
+        console.warn(`3D analysis failed for ${filePath}:`, err);
+      }
     }
 
     return info;

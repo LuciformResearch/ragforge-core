@@ -74,6 +74,7 @@ import {
   createEntityExtractionTransform,
   type EntityExtractionConfig,
 } from '../ingestion/entity-extraction/index.js';
+import { type ContentSourceType } from './content-provider.js';
 
 const execAsync = promisify(exec);
 
@@ -279,6 +280,8 @@ export interface RegisteredProject {
   displayName?: string;
   /** Excluded from brain_search (reference projects) */
   excluded?: boolean;
+  /** Content source type - where file content comes from ('disk' or 'virtual') */
+  contentSourceType?: ContentSourceType;
 }
 
 export interface QuickIngestOptions {
@@ -1079,9 +1082,11 @@ export class BrainManager {
 
     // Vector indexes for semantic search (if embeddings are enabled)
     if (this.embeddingService?.canGenerateEmbeddings()) {
-      // Get actual dimension from the configured provider
-      const dimension = await this.embeddingService.getDimensions() ?? 3072;
-      await ensureVectorIndexesCentralized(this.neo4jClient, { dimension, verbose: true });
+      // Auto-detect dimension from embedding service
+      await ensureVectorIndexesCentralized(this.neo4jClient, {
+        embeddingService: this.embeddingService,
+        verbose: true
+      });
     }
 
     console.log('[Brain] Indexes ensured');
@@ -1428,6 +1433,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
       autoCleanup?: boolean;
       displayName?: string;
       rootPath?: string;
+      contentSourceType?: ContentSourceType;
     }
   ): Promise<void> {
     if (!this.neo4jClient) return;
@@ -1459,6 +1465,10 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
       setClause.push('p.rootPath = $rootPath');
       params.rootPath = metadata.rootPath;
     }
+    if (metadata.contentSourceType !== undefined) {
+      setClause.push('p.contentSourceType = $contentSourceType');
+      params.contentSourceType = metadata.contentSourceType;
+    }
 
     if (setClause.length === 0) return;
 
@@ -1482,6 +1492,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
        RETURN p.projectId as id, p.rootPath as path, p.type as type,
               p.lastAccessed as lastAccessed, p.excluded as excluded,
               p.autoCleanup as autoCleanup, p.name as displayName,
+              p.contentSourceType as contentSourceType,
               nodeCount
        ORDER BY p.lastAccessed DESC`
     );
@@ -1495,6 +1506,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
       excluded: record.get('excluded') || false,
       autoCleanup: record.get('autoCleanup') ?? true,
       displayName: record.get('displayName') || undefined,
+      contentSourceType: record.get('contentSourceType') || undefined,
     }));
   }
 
@@ -1511,6 +1523,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
        RETURN p.projectId as id, p.rootPath as path, p.type as type,
               p.lastAccessed as lastAccessed, p.excluded as excluded,
               p.autoCleanup as autoCleanup, p.name as displayName,
+              p.contentSourceType as contentSourceType,
               nodeCount`,
       { projectId }
     );
@@ -1527,6 +1540,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
       excluded: record.get('excluded') || false,
       autoCleanup: record.get('autoCleanup') ?? true,
       displayName: record.get('displayName') || undefined,
+      contentSourceType: record.get('contentSourceType') || undefined,
     };
   }
 
@@ -1544,6 +1558,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
        RETURN p.projectId as id, p.rootPath as path, p.type as type,
               p.lastAccessed as lastAccessed, p.excluded as excluded,
               p.autoCleanup as autoCleanup, p.name as displayName,
+              p.contentSourceType as contentSourceType,
               nodeCount`,
       { path: absolutePath }
     );
@@ -1560,6 +1575,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
       excluded: record.get('excluded') || false,
       autoCleanup: record.get('autoCleanup') ?? true,
       displayName: record.get('displayName') || undefined,
+      contentSourceType: record.get('contentSourceType') || undefined,
     };
   }
 
@@ -1694,8 +1710,14 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
    * @param projectPath - Absolute or relative path to the project
    * @param type - Project type
    * @param displayName - Optional display name for UI purposes
+   * @param contentSourceType - Content source type ('disk' or 'virtual')
    */
-  async registerProject(projectPath: string, type: ProjectType = 'quick-ingest', displayName?: string): Promise<string> {
+  async registerProject(
+    projectPath: string,
+    type: ProjectType = 'quick-ingest',
+    displayName?: string,
+    contentSourceType?: ContentSourceType
+  ): Promise<string> {
     const absolutePath = path.resolve(projectPath);
     // Always generate ID from path - this is the source of truth
     const projectId = ProjectRegistry.generateId(absolutePath);
@@ -1705,10 +1727,12 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
     const existingInDb = await this.getProjectFromDb(projectId);
     if (existingInDb) {
       // Update lastAccessed and displayName in DB
+      // Also update contentSourceType if provided (allows upgrading disk → virtual)
       await this.updateProjectMetadataInDb(projectId, {
         lastAccessed: now,
         displayName: displayName || existingInDb.displayName,
         rootPath: absolutePath, // Ensure rootPath is always set
+        ...(contentSourceType && { contentSourceType }),
       });
       return projectId;
     }
@@ -1750,6 +1774,7 @@ ${replicateToken ? `REPLICATE_API_TOKEN=${replicateToken}` : '# REPLICATE_API_TO
       autoCleanup: type === 'quick-ingest',
       displayName,
       rootPath: absolutePath, // Persist rootPath in Neo4j for consistent projectPath resolution
+      contentSourceType: contentSourceType ?? 'disk', // Default to disk for new projects
     });
 
     return projectId;

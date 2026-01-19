@@ -17,6 +17,7 @@ export {
   SourceAdapter,
   ValidationResult,
   VirtualFile,
+  ParserOptionsConfig,
 } from './types.js';
 export * from './code-source-adapter.js';
 // Document parsing is now handled by document-file-parser.ts (web-compatible)
@@ -28,3 +29,5 @@ export * from './file-watcher.js';
 export * from './change-tracker.js';
 export * from './universal-source-adapter.js';
 export * from './database-adapter.js';
+export * from './github-source.js';
+export * from './zip-source.js';

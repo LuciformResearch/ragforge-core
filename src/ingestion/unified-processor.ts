@@ -33,6 +33,14 @@ import { createEntityExtractionTransform } from './entity-extraction/transform.j
 import type { NodeState } from './state-types.js';
 import { type ErrorType } from '../brain/file-state-machine.js';
 import { resolvePendingImports } from '../brain/reference-extractor.js';
+import {
+  type IContentProvider,
+  type ContentSourceType,
+  type ContentFileInfo,
+  createContentProvider,
+} from '../brain/content-provider.js';
+import type { VirtualFile, ParserOptionsConfig } from '../runtime/adapters/types.js';
+import * as crypto from 'crypto';
 
 // ============================================
 // Types
@@ -59,6 +67,19 @@ export interface UnifiedProcessorConfig {
   embeddingService?: EmbeddingService;
   /** Activity callback - called during long-running operations to signal liveness */
   onActivity?: () => void;
+  /**
+   * Content source type for file content reading
+   * - 'disk': Read from file system (default)
+   * - 'virtual': Read from Neo4j _rawContent (for virtual projects)
+   */
+  contentSourceType?: ContentSourceType;
+  /** Pre-configured content provider (optional, will create one if not provided) */
+  contentProvider?: IContentProvider;
+  /**
+   * Parser-specific options for documents and media files.
+   * These options are passed to DocumentParser and MediaParser for Vision-enhanced parsing.
+   */
+  parserOptions?: ParserOptionsConfig;
 }
 
 export interface ProcessingStats {
@@ -108,6 +129,9 @@ export class UnifiedProcessor {
   private maxRetries: number;
   private concurrency: number;
   private onActivity?: () => void;
+  private contentProvider: IContentProvider;
+  private contentSourceType: ContentSourceType;
+  private parserOptions?: ParserOptionsConfig;
 
   constructor(config: UnifiedProcessorConfig) {
     this.driver = config.driver;
@@ -118,6 +142,16 @@ export class UnifiedProcessor {
     this.maxRetries = config.maxRetries ?? 3;
     this.concurrency = config.concurrency ?? 10;
     this.onActivity = config.onActivity;
+    this.contentSourceType = config.contentSourceType ?? 'disk';
+    this.parserOptions = config.parserOptions;
+
+    // Initialize content provider (for reading file content from disk or Neo4j)
+    this.contentProvider = config.contentProvider ||
+      createContentProvider(
+        this.contentSourceType,
+        config.neo4jClient,
+        config.projectId
+      );
 
     // Initialize state machines
     this.fileStateMachine = new FileStateMachine(config.neo4jClient);
@@ -129,11 +163,15 @@ export class UnifiedProcessor {
     });
 
     // Initialize file processor (handles parsing + linking)
+    // Pass content provider for virtual file support
     this.fileProcessor = new FileProcessor({
       neo4jClient: config.neo4jClient,
       projectId: config.projectId,
       projectRoot: config.projectRoot,
       verbose: config.verbose,
+      contentProvider: this.contentProvider,
+      contentSourceType: this.contentSourceType,
+      parserOptions: config.parserOptions,
     });
 
     // Use provided embedding service or create a basic one (without provider config)
@@ -330,7 +368,8 @@ export class UnifiedProcessor {
 
         for (const filePath of uniqueFilePaths) {
           try {
-            const content = await fs.readFile(filePath, 'utf-8');
+            // Use content provider to support both disk and virtual files
+            const content = await this.readFileContent(filePath);
             // Use first 2000 chars for classification (domain detection needs context)
             fileContents.push(content.slice(0, 2000));
             validFilePaths.push(filePath);
@@ -1909,9 +1948,10 @@ export class UnifiedProcessor {
     }
 
     // 1. Read file content for domain classification
+    // Use content provider to support both disk and virtual files
     let fileContent: string;
     try {
-      fileContent = await fs.readFile(this.resolveAbsolutePath(filePath), 'utf-8');
+      fileContent = await this.readFileContent(filePath);
     } catch (error) {
       // File might not exist anymore
       if (this.verbose) {
@@ -2112,6 +2152,32 @@ export class UnifiedProcessor {
     return filePath;
   }
 
+  /**
+   * Read file content using the content provider.
+   * Supports both disk-based files and virtual files (content in Neo4j).
+   *
+   * @param filePath - Absolute path to the file
+   * @param fileUuid - Optional file UUID (required for virtual files)
+   * @returns File content as string
+   * @throws Error if file doesn't exist or can't be read
+   */
+  private async readFileContent(filePath: string, fileUuid?: string): Promise<string> {
+    const contentFile: ContentFileInfo = {
+      uuid: fileUuid || '',
+      absolutePath: this.resolveAbsolutePath(filePath),
+      projectId: this.projectId,
+    };
+
+    // For disk-based projects, also try fs.readFile as fallback
+    // (in case the file exists on disk but not yet in Neo4j)
+    if (this.contentSourceType === 'disk') {
+      return fs.readFile(contentFile.absolutePath!, 'utf-8');
+    }
+
+    // For virtual projects, use the content provider
+    return this.contentProvider.readContent(contentFile);
+  }
+
   private determineErrorType(error: any): ErrorType {
     const message = error.message?.toLowerCase() || '';
 
@@ -2142,6 +2208,265 @@ export class UnifiedProcessor {
       embeddingsGenerated: 0,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  // ============================================
+  // Virtual File Ingestion
+  // ============================================
+
+  /**
+   * Ingest virtual files (files that exist only in memory, not on disk).
+   *
+   * This method:
+   * 1. Creates File nodes with _rawContent stored directly in Neo4j
+   * 2. Marks them as 'discovered' state
+   * 3. Processes them through the normal pipeline (parsing, linking, entities, embeddings)
+   *
+   * The VirtualContentProvider will read content from Neo4j _rawContent instead of disk.
+   *
+   * @param files - Array of virtual files to ingest
+   * @param options - Optional configuration
+   * @returns Processing statistics
+   *
+   * @example
+   * ```typescript
+   * const { files } = await downloadGitHubRepo('https://github.com/owner/repo');
+   * const stats = await processor.ingestVirtualFiles(files);
+   * ```
+   */
+  async ingestVirtualFiles(
+    files: VirtualFile[],
+    options?: {
+      /** Skip processing and only create File nodes (default: false) */
+      skipProcessing?: boolean;
+      /** Root path prefix to strip from virtual paths */
+      stripPrefix?: string;
+      /**
+       * Additional properties to inject on ALL nodes (File, Scope, etc.)
+       * Use this for community metadata like documentId, categoryId, userId, etc.
+       */
+      additionalProperties?: Record<string, unknown>;
+      /**
+       * Parser-specific options for documents and media files.
+       * Overrides config.parserOptions for this ingestion call.
+       * Use for Vision-enhanced parsing of PDFs, images, 3D models, etc.
+       */
+      parserOptions?: ParserOptionsConfig;
+    }
+  ): Promise<ProcessingStats> {
+    const startTime = Date.now();
+
+    if (files.length === 0) {
+      return this.emptyStats(startTime);
+    }
+
+    console.log(`[UnifiedProcessor] Ingesting ${files.length} virtual files for project ${this.projectId}`);
+
+    // 1. Create File nodes with _rawContent and additional properties
+    const createdCount = await this.createVirtualFileNodes(
+      files,
+      options?.stripPrefix,
+      options?.additionalProperties
+    );
+    console.log(`[UnifiedProcessor] Created/updated ${createdCount} virtual File nodes`);
+
+    // 2. If skipProcessing, return early
+    if (options?.skipProcessing) {
+      return {
+        filesProcessed: createdCount,
+        filesSkipped: files.length - createdCount,
+        filesErrored: 0,
+        scopesCreated: 0,
+        entitiesCreated: 0,
+        relationsCreated: 0,
+        embeddingsGenerated: 0,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    // 3. Set parserOptions if provided (for Vision-enhanced parsing)
+    if (options?.parserOptions) {
+      this.fileProcessor.setParserOptions(options.parserOptions);
+    }
+
+    // 4. Process through normal pipeline (discovered → parsed → linked)
+    // The VirtualContentProvider will read from _rawContent
+    const discoveredStats = await this.processDiscovered();
+
+    // 5. Process linked nodes (entity extraction + embeddings)
+    const linkedStats = await this.processLinked();
+
+    // Merge stats
+    const stats: ProcessingStats = {
+      filesProcessed: discoveredStats.filesProcessed,
+      filesSkipped: discoveredStats.filesSkipped,
+      filesErrored: discoveredStats.filesErrored,
+      scopesCreated: discoveredStats.scopesCreated,
+      entitiesCreated: linkedStats.entitiesCreated,
+      relationsCreated: linkedStats.relationsCreated,
+      embeddingsGenerated: linkedStats.embeddingsGenerated,
+      durationMs: discoveredStats.durationMs + linkedStats.durationMs,
+    };
+
+    // 6. Restore original parserOptions after processing
+    if (options?.parserOptions) {
+      this.fileProcessor.setParserOptions(this.parserOptions);
+    }
+
+    // 6. Propagate additional properties to all child nodes (Scope, etc.)
+    if (options?.additionalProperties && Object.keys(options.additionalProperties).length > 0) {
+      await this.propagatePropertiesToChildNodes(options.additionalProperties);
+    }
+
+    return {
+      ...stats,
+      durationMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * Propagate additional properties from File nodes to all related child nodes.
+   * This is used for community metadata injection.
+   */
+  private async propagatePropertiesToChildNodes(
+    properties: Record<string, unknown>
+  ): Promise<void> {
+    // Build SET clause dynamically for the properties
+    const propKeys = Object.keys(properties);
+    if (propKeys.length === 0) return;
+
+    const setClause = propKeys.map(k => `child.${k} = $props.${k}`).join(', ');
+
+    // Propagate to all Scope nodes linked via DEFINED_IN
+    await this.neo4jClient.run(
+      `
+      MATCH (child:Scope)-[:DEFINED_IN]->(file:File {projectId: $projectId, isVirtual: true})
+      SET ${setClause}
+      `,
+      { projectId: this.projectId, props: properties }
+    );
+
+    // Also propagate to Entity nodes linked via MENTIONS
+    await this.neo4jClient.run(
+      `
+      MATCH (child:Entity)-[:MENTIONS]-(scope:Scope)-[:DEFINED_IN]->(file:File {projectId: $projectId, isVirtual: true})
+      SET ${setClause}
+      `,
+      { projectId: this.projectId, props: properties }
+    );
+
+    console.log(`[UnifiedProcessor] Propagated ${propKeys.length} properties to child nodes`);
+  }
+
+  /**
+   * Create File nodes with _rawContent for virtual files
+   */
+  private async createVirtualFileNodes(
+    files: VirtualFile[],
+    stripPrefix?: string,
+    additionalProperties?: Record<string, unknown>
+  ): Promise<number> {
+    if (files.length === 0) return 0;
+
+    // Prepare batch data
+    const fileData = files.map(vf => {
+      // Convert Buffer to string if needed
+      const content = typeof vf.content === 'string'
+        ? vf.content
+        : vf.content.toString('utf-8');
+
+      // Compute hash
+      const hash = crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
+
+      // Clean up path
+      let filePath = vf.path;
+      if (stripPrefix && filePath.startsWith(stripPrefix)) {
+        filePath = filePath.slice(stripPrefix.length);
+      }
+      // Ensure path starts with /
+      if (!filePath.startsWith('/')) {
+        filePath = '/' + filePath;
+      }
+
+      // Extract name and extension from path
+      const fileName = filePath.split('/').pop() || filePath;
+      const extMatch = fileName.match(/(\.[^.]+)$/);
+      const extension = extMatch ? extMatch[1] : null;
+
+      // Generate deterministic UUID from projectId + path
+      const uuid = crypto.createHash('sha256')
+        .update(`${this.projectId}:${filePath}`)
+        .digest('hex')
+        .substring(0, 32);
+
+      return {
+        uuid,
+        filePath,
+        fileName,
+        extension,
+        content,
+        hash,
+        mimeType: vf.mimeType,
+      };
+    });
+
+    // Batch create/update File nodes
+    const result = await this.neo4jClient.run(
+      `
+      UNWIND $files AS f
+      MERGE (file:File {uuid: f.uuid})
+      ON CREATE SET
+        file.file = f.filePath,
+        file.absolutePath = f.filePath,
+        file.name = f.fileName,
+        file.extension = f.extension,
+        file.projectId = $projectId,
+        file._rawContent = f.content,
+        file._rawContentHash = f.hash,
+        file._state = 'discovered',
+        file._stateUpdatedAt = datetime(),
+        file.createdAt = datetime(),
+        file.isVirtual = true,
+        file.retryCount = 0,
+        file._wasCreated = true
+      ON MATCH SET
+        file.name = coalesce(file.name, f.fileName),
+        file.extension = coalesce(file.extension, f.extension),
+        file._rawContent = f.content,
+        file._rawContentHash = f.hash,
+        file._previousHash = file.hash,
+        file._state = CASE
+          WHEN file._rawContentHash <> f.hash THEN 'discovered'
+          WHEN file._state = 'error' THEN 'discovered'
+          ELSE file._state
+        END,
+        file._stateUpdatedAt = CASE
+          WHEN file._rawContentHash <> f.hash OR file._state = 'error' THEN datetime()
+          ELSE file._stateUpdatedAt
+        END,
+        file.isVirtual = true,
+        file._wasCreated = false
+      RETURN count(file) AS total,
+             sum(CASE WHEN file._wasCreated THEN 1 ELSE 0 END) AS created
+      `,
+      {
+        files: fileData,
+        projectId: this.projectId,
+      }
+    );
+
+    // Clean up temporary _wasCreated property
+    await this.neo4jClient.run(
+      `
+      MATCH (f:File {projectId: $projectId})
+      WHERE f._wasCreated IS NOT NULL
+      REMOVE f._wasCreated
+      `,
+      { projectId: this.projectId }
+    );
+
+    const total = result.records[0]?.get('total');
+    return typeof total === 'number' ? total : (total?.toNumber?.() ?? 0);
   }
 }
 

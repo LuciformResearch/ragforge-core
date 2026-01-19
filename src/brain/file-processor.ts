@@ -24,7 +24,14 @@ import pLimit from 'p-limit';
 import type { Neo4jClient } from '../runtime/client/neo4j-client.js';
 import type { EmbeddingService } from './embedding-service.js';
 import { UniversalSourceAdapter } from '../runtime/adapters/universal-source-adapter.js';
-import type { ParsedGraph, ParsedNode, ParsedRelationship } from '../runtime/adapters/types.js';
+import type { ParsedGraph, ParsedNode, ParsedRelationship, ParserOptionsConfig } from '../runtime/adapters/types.js';
+import {
+  type IContentProvider,
+  type ContentFileInfo,
+  DiskContentProvider,
+  createContentProvider,
+  type ContentSourceType,
+} from './content-provider.js';
 import {
   extractReferences,
   resolveAllReferences,
@@ -106,6 +113,18 @@ export interface FileProcessorConfig {
   /** Concurrency limit for parallel processing (default: 10) */
   concurrency?: number;
   /**
+   * Content provider for reading file content (optional)
+   * - If not provided, defaults to DiskContentProvider
+   * - Use VirtualContentProvider for virtual projects (content in Neo4j)
+   */
+  contentProvider?: IContentProvider;
+  /**
+   * Content source type (alternative to providing a contentProvider)
+   * - 'disk': Read from file system (default)
+   * - 'virtual': Read from Neo4j _rawContent
+   */
+  contentSourceType?: ContentSourceType;
+  /**
    * Callback when a file transitions to 'linked' state
    * Used to resolve PENDING_IMPORT → CONSUMES relations
    */
@@ -126,6 +145,12 @@ export interface FileProcessorConfig {
    * Callback to check if a file exists in the graph and get its state
    */
   onGetFileState?: (absolutePath: string) => Promise<string | null>;
+
+  /**
+   * Parser-specific options for documents and media files.
+   * These options are passed to DocumentParser and MediaParser for Vision-enhanced parsing.
+   */
+  parserOptions?: ParserOptionsConfig;
 }
 
 // ============================================
@@ -141,6 +166,8 @@ export class FileProcessor {
   private verbose: boolean;
   private concurrency: number;
   private config: FileProcessorConfig;
+  private contentProvider: IContentProvider;
+  private parserOptions?: ParserOptionsConfig;
 
   constructor(config: FileProcessorConfig) {
     this.config = config;
@@ -151,6 +178,26 @@ export class FileProcessor {
     this.projectRoot = config.projectRoot;
     this.verbose = config.verbose || false;
     this.concurrency = config.concurrency || 10;
+
+    // Initialize content provider:
+    // 1. Use explicit contentProvider if provided
+    // 2. Otherwise create from contentSourceType (defaults to 'disk')
+    this.contentProvider = config.contentProvider ||
+      createContentProvider(
+        config.contentSourceType || 'disk',
+        config.neo4jClient,
+        config.projectId
+      );
+
+    // Store parser options for document/media parsing with Vision
+    this.parserOptions = config.parserOptions;
+  }
+
+  /**
+   * Update parser options (for per-call configuration in ingestVirtualFiles)
+   */
+  setParserOptions(options: ParserOptionsConfig | undefined): void {
+    this.parserOptions = options;
   }
 
   /**
@@ -199,13 +246,19 @@ export class FileProcessor {
       // 1. Transition to parsing state
       await this.stateMachine.transition(file.uuid, 'parsing');
 
-      // 2. Read file content
+      // 2. Read file content using content provider
       let content: string;
       try {
-        content = await fs.readFile(file.absolutePath, 'utf-8');
+        const contentFile: ContentFileInfo = {
+          uuid: file.uuid,
+          absolutePath: file.absolutePath,
+          projectId: this.projectId,
+          state: file.state,
+        };
+        content = await this.contentProvider.readContent(contentFile);
       } catch (err: any) {
-        // File may have been deleted
-        if (err.code === 'ENOENT') {
+        // File may have been deleted (disk) or _rawContent missing (virtual)
+        if (err.code === 'ENOENT' || err.message?.includes('No _rawContent')) {
           await this.deleteFileAndScopes(file.absolutePath);
           return { status: 'deleted', scopesCreated: 0, relationshipsCreated: 0, referencesCreated: 0 };
         }
@@ -222,14 +275,30 @@ export class FileProcessor {
 
       // 4. Parse the file
       const fileName = path.basename(file.absolutePath);
-      const parseResult = await this.adapter.parse({
-        source: {
-          type: 'code',
-          root: path.dirname(file.absolutePath),
-          include: [fileName],
-        },
-        projectId: this.projectId,
-      });
+      const isVirtualMode = this.config.contentSourceType === 'virtual';
+
+      let parseResult;
+      if (isVirtualMode) {
+        // Virtual mode: pass content directly to avoid disk read
+        parseResult = await this.adapter.parse({
+          source: {
+            type: 'virtual',
+            virtualFiles: [{ path: file.absolutePath, content }],
+          },
+          projectId: this.projectId,
+          parserOptions: this.parserOptions,
+        });
+      } else {
+        parseResult = await this.adapter.parse({
+          source: {
+            type: 'code',
+            root: path.dirname(file.absolutePath),
+            include: [fileName],
+          },
+          projectId: this.projectId,
+          parserOptions: this.parserOptions,
+        });
+      }
 
       // 5. Transition to parsed state
       await this.stateMachine.transition(file.uuid, 'parsed', { contentHash: newHash });
@@ -413,17 +482,24 @@ export class FileProcessor {
 
     const limit = pLimit(this.concurrency);
 
-    // 1. Parallel: read files + compute hashes
+    // 1. Parallel: read files + compute hashes using content provider
     const fileData = await Promise.all(
       files.map(f =>
         limit(async () => {
           try {
-            const content = await fs.readFile(f.absolutePath, 'utf-8');
+            const contentFile: ContentFileInfo = {
+              uuid: f.uuid,
+              absolutePath: f.absolutePath,
+              projectId: this.projectId,
+              state: f.state,
+            };
+            const content = await this.contentProvider.readContent(contentFile);
             const newHash = this.computeHash(content);
             const storedHash = await this.getStoredHash(f.absolutePath);
             return { file: f, content, newHash, storedHash, error: null as Error | null, deleted: false };
           } catch (err: any) {
-            if (err.code === 'ENOENT') {
+            // Handle missing files: disk (ENOENT) or virtual (No _rawContent)
+            if (err.code === 'ENOENT' || err.message?.includes('No _rawContent')) {
               return { file: f, content: null, newHash: null, storedHash: null, error: null, deleted: true };
             }
             return { file: f, content: null, newHash: null, storedHash: null, error: err as Error, deleted: false };
@@ -481,15 +557,37 @@ export class FileProcessor {
 
     let parseResult;
     try {
-      console.log(`[FileProcessor] 🔄 Calling adapter.parse() with ${fileNames.length} files`);
-      parseResult = await this.adapter.parse({
-        source: {
-          type: 'code',
-          root: parseRoot,
-          include: fileNames,
-        },
-        projectId: this.projectId,
-      });
+      // Detect if we're in virtual mode (content in Neo4j, not on disk)
+      const isVirtualMode = this.config.contentSourceType === 'virtual';
+
+      if (isVirtualMode) {
+        // Build virtualFiles array from already-read content
+        const virtualFiles = toProcess.map(d => ({
+          path: d.file.absolutePath,
+          content: d.content!,
+        }));
+
+        console.log(`[FileProcessor] 🔄 Calling adapter.parse() with ${virtualFiles.length} virtual files`);
+        parseResult = await this.adapter.parse({
+          source: {
+            type: 'virtual',
+            virtualFiles,
+          },
+          projectId: this.projectId,
+          parserOptions: this.parserOptions,
+        });
+      } else {
+        console.log(`[FileProcessor] 🔄 Calling adapter.parse() with ${fileNames.length} files from disk`);
+        parseResult = await this.adapter.parse({
+          source: {
+            type: 'code',
+            root: parseRoot,
+            include: fileNames,
+          },
+          projectId: this.projectId,
+          parserOptions: this.parserOptions,
+        });
+      }
     } catch (err: any) {
       console.error(`[FileProcessor] ❌ Batch parse failed: ${err.message}`);
       // Transition all files to error state
@@ -750,18 +848,32 @@ export class FileProcessor {
 
   /**
    * Check if a file needs processing (hash changed)
+   *
+   * @param absolutePath - File path
+   * @param currentHash - Optional current hash (for optimization)
+   * @param fileUuid - Optional file UUID (required for virtual files)
    */
-  async needsProcessing(absolutePath: string, currentHash?: string): Promise<{
+  async needsProcessing(
+    absolutePath: string,
+    currentHash?: string,
+    fileUuid?: string
+  ): Promise<{
     needsProcessing: boolean;
     newHash: string;
     reason?: 'new' | 'changed' | 'error_retry';
   }> {
-    // Read current file content
+    // Read current file content using content provider
     let content: string;
     try {
-      content = await fs.readFile(absolutePath, 'utf-8');
+      const contentFile: ContentFileInfo = {
+        uuid: fileUuid || '',
+        absolutePath,
+        projectId: this.projectId,
+      };
+      content = await this.contentProvider.readContent(contentFile);
     } catch (err: any) {
-      if (err.code === 'ENOENT') {
+      // File doesn't exist (disk) or no content (virtual)
+      if (err.code === 'ENOENT' || err.message?.includes('No _rawContent')) {
         return { needsProcessing: false, newHash: '', reason: undefined };
       }
       throw err;

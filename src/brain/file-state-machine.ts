@@ -64,6 +64,8 @@ export interface FileStateInfo {
   stateUpdatedAt?: string;
   parsedContentHash?: string;
   embeddedContentHash?: string;
+  /** True if this is a virtual file (content stored in Neo4j _rawContent) */
+  isVirtual?: boolean;
 }
 
 export interface TransitionOptions {
@@ -200,6 +202,11 @@ export class FileStateMachine {
 
   /**
    * Get files in a specific state
+   *
+   * Supports both disk files (have absolutePath) and virtual files (have _rawContent).
+   * Returns files that have either:
+   * - An absolutePath (disk files)
+   * - A _rawContent property (virtual files stored in Neo4j)
    */
   async getFilesInState(
     projectId: string,
@@ -210,14 +217,16 @@ export class FileStateMachine {
     const result = await this.neo4jClient.run(
       `
       MATCH (f:File {projectId: $projectId})
-      WHERE f._state IN $states AND f.absolutePath IS NOT NULL
+      WHERE f._state IN $states
+        AND (f.absolutePath IS NOT NULL OR f._rawContent IS NOT NULL)
       RETURN f.uuid as uuid,
              f.absolutePath as file,
              f._state as state,
              f.errorType as errorType,
              f.errorMessage as errorMessage,
              f.retryCount as retryCount,
-             f._stateUpdatedAt as stateUpdatedAt
+             f._stateUpdatedAt as stateUpdatedAt,
+             f._rawContent IS NOT NULL as isVirtual
       ORDER BY f._stateUpdatedAt ASC
     `,
       { projectId, states }
@@ -231,6 +240,7 @@ export class FileStateMachine {
       errorMessage: r.get('errorMessage'),
       retryCount: r.get('retryCount')?.toNumber?.() || r.get('retryCount') || 0,
       stateUpdatedAt: r.get('stateUpdatedAt')?.toString(),
+      isVirtual: r.get('isVirtual') || false,
     }));
   }
 

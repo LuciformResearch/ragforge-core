@@ -331,6 +331,9 @@ export {
   // Orchestrator
   IngestionOrchestrator,
   createOrchestrator,
+  // Unified processor (for community-docs integration)
+  UnifiedProcessor,
+  createUnifiedProcessor,
 } from './ingestion/index.js';
 export type {
   // Parser types
@@ -369,6 +372,10 @@ export type {
   DuplicatePair,
   DeduplicationResult,
   DeduplicationConfig,
+  // Unified processor types
+  UnifiedProcessorConfig,
+  ProcessingStats,
+  RecoveryStats,
 } from './ingestion/index.js';
 
 // Entity extraction (GLiNER integration)
