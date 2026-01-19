@@ -2414,13 +2414,12 @@ export class UnifiedProcessor {
     const result = await this.neo4jClient.run(
       `
       UNWIND $files AS f
-      MERGE (file:File {uuid: f.uuid})
+      MERGE (file:File {absolutePath: f.filePath, projectId: $projectId})
       ON CREATE SET
+        file.uuid = f.uuid,
         file.file = f.filePath,
-        file.absolutePath = f.filePath,
         file.name = f.fileName,
         file.extension = f.extension,
-        file.projectId = $projectId,
         file._rawContent = f.content,
         file._rawContentHash = f.hash,
         file._state = 'discovered',
@@ -2433,15 +2432,15 @@ export class UnifiedProcessor {
         file.name = coalesce(file.name, f.fileName),
         file.extension = coalesce(file.extension, f.extension),
         file._rawContent = f.content,
+        file._previousHash = file._rawContentHash,
         file._rawContentHash = f.hash,
-        file._previousHash = file.hash,
         file._state = CASE
-          WHEN file._rawContentHash <> f.hash THEN 'discovered'
+          WHEN file._rawContentHash IS NULL OR file._rawContentHash <> f.hash THEN 'discovered'
           WHEN file._state = 'error' THEN 'discovered'
           ELSE file._state
         END,
         file._stateUpdatedAt = CASE
-          WHEN file._rawContentHash <> f.hash OR file._state = 'error' THEN datetime()
+          WHEN file._rawContentHash IS NULL OR file._rawContentHash <> f.hash OR file._state = 'error' THEN datetime()
           ELSE file._stateUpdatedAt
         END,
         file.isVirtual = true,
