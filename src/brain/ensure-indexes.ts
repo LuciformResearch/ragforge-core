@@ -274,6 +274,29 @@ export async function ensureBaseIndexes(
     'CREATE INDEX related_to_type IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.type)'
   );
 
+  // Unique constraints for MERGE operations
+  // File uniqueness on (absolutePath, projectId) - critical for incremental ingestion
+  const constraintQueries: string[] = [
+    'CREATE CONSTRAINT file_path_project_unique IF NOT EXISTS FOR (f:File) REQUIRE (f.absolutePath, f.projectId) IS UNIQUE',
+  ];
+
+  // Execute constraint queries first
+  for (const query of constraintQueries) {
+    try {
+      await neo4jClient.run(query);
+      stats.created++;
+    } catch (err: any) {
+      if (err.message?.includes('already exists') || err.message?.includes('equivalent')) {
+        stats.skipped++;
+      } else {
+        stats.errors++;
+        if (verbose) {
+          console.warn(`[Indexes] Constraint warning: ${err.message}`);
+        }
+      }
+    }
+  }
+
   // Execute all index queries
   for (const query of indexQueries) {
     try {
