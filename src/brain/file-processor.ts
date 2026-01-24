@@ -37,6 +37,9 @@ import {
   resolveAllReferences,
   createReferenceRelations,
   type ResolvedReference,
+  type FileExistenceChecker,
+  diskFileChecker,
+  createVirtualFileChecker,
 } from './reference-extractor.js';
 import {
   FileStateMachine,
@@ -151,6 +154,13 @@ export interface FileProcessorConfig {
    * These options are passed to DocumentParser and MediaParser for Vision-enhanced parsing.
    */
   parserOptions?: ParserOptionsConfig;
+
+  /**
+   * File existence checker for resolving import references.
+   * - For disk projects: uses fs.access (default)
+   * - For virtual projects: should use createVirtualFileChecker with known paths
+   */
+  fileChecker?: FileExistenceChecker;
 }
 
 // ============================================
@@ -198,6 +208,14 @@ export class FileProcessor {
    */
   setParserOptions(options: ParserOptionsConfig | undefined): void {
     this.parserOptions = options;
+  }
+
+  /**
+   * Update file existence checker (for virtual file support).
+   * For virtual ingestion, pass a checker created with createVirtualFileChecker()
+   */
+  setFileChecker(checker: FileExistenceChecker | undefined): void {
+    this.config.fileChecker = checker;
   }
 
   /**
@@ -1265,17 +1283,34 @@ export class FileProcessor {
       for (const [label, placeholders] of placeholdersByLabel) {
         if (placeholders.length === 0) continue;
 
-        await this.neo4jClient.run(`
-          UNWIND $nodes AS nodeData
-          MERGE (n:${label} {uuid: nodeData.uuid})
-          ON CREATE SET
-            n = nodeData.props,
-            n._pending = true,
-            n._state = 'linked',
-            n._linkedAt = datetime()
-          ON MATCH SET
-            n._pending = null
-        `, { nodes: placeholders });
+        // File nodes have UNIQUE constraint on (absolutePath, projectId), not uuid
+        // So we must MERGE on those properties instead
+        if (label === 'File') {
+          await this.neo4jClient.run(`
+            UNWIND $nodes AS nodeData
+            MERGE (n:File {absolutePath: nodeData.props.absolutePath, projectId: nodeData.props.projectId})
+            ON CREATE SET
+              n = nodeData.props,
+              n.uuid = nodeData.uuid,
+              n._pending = true,
+              n._state = 'linked',
+              n._linkedAt = datetime()
+            ON MATCH SET
+              n._pending = null
+          `, { nodes: placeholders });
+        } else {
+          await this.neo4jClient.run(`
+            UNWIND $nodes AS nodeData
+            MERGE (n:${label} {uuid: nodeData.uuid})
+            ON CREATE SET
+              n = nodeData.props,
+              n._pending = true,
+              n._state = 'linked',
+              n._linkedAt = datetime()
+            ON MATCH SET
+              n._pending = null
+          `, { nodes: placeholders });
+        }
 
         totalPlaceholders += placeholders.length;
         placeholderCounts.push(`${label}: ${placeholders.length}`);
@@ -1585,7 +1620,8 @@ export class FileProcessor {
 
     // Resolve references to absolute paths
     const projectPath = this.projectRoot || path.dirname(filePath);
-    const resolvedRefs = await resolveAllReferences(refs, filePath, projectPath);
+    const fileChecker = this.config.fileChecker || diskFileChecker;
+    const resolvedRefs = await resolveAllReferences(refs, filePath, projectPath, fileChecker);
 
     // Process each reference
     let created = 0;

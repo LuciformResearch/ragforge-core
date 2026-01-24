@@ -345,14 +345,14 @@ export class SearchService {
   // ============================================================================
 
   /**
-   * Grep search - regex pattern matching on _content field
+   * Grep search - regex pattern matching directly on File._rawContent
    *
-   * Searches indexed content using JavaScript regex (post-query filtering).
-   * Results include line numbers and optional context lines.
+   * Searches virtual file content (stored in Neo4j) using JavaScript regex.
+   * Results include accurate line numbers and optional context lines.
    *
    * @example
    * ```typescript
-   * const results = await searchService.grep({
+   * const results = await searchService.grepVirtual({
    *   pattern: 'async function.*Handler',
    *   glob: '**\/*.ts',
    *   ignoreCase: true,
@@ -360,7 +360,7 @@ export class SearchService {
    * });
    * ```
    */
-  async grep(options: GrepOptions): Promise<GrepResultSet> {
+  async grepVirtual(options: GrepOptions): Promise<GrepResultSet> {
     const {
       pattern,
       ignoreCase = false,
@@ -378,20 +378,20 @@ export class SearchService {
       throw new Error(`Invalid regex pattern: ${err.message}`);
     }
 
-    // Build filter clause
+    // Build filter clause for File nodes
     const { filterClause, filterParams } = this.buildFilterClause(filters);
 
-    // Query nodes with _content field
     // Use CONTAINS for initial filtering if pattern has a simple prefix
     const simplePrefix = pattern.match(/^[\w]+/)?.[0];
     const containsFilter = simplePrefix && simplePrefix.length >= 3
-      ? `AND n._content CONTAINS $simplePrefix`
+      ? `AND f._rawContent CONTAINS $simplePrefix`
       : '';
 
+    // Query File nodes directly - search on _rawContent
     const cypher = `
-      MATCH (n)
-      WHERE n._content IS NOT NULL ${filterClause} ${containsFilter}
-      RETURN n, labels(n) as labels
+      MATCH (f:File)
+      WHERE f._rawContent IS NOT NULL ${filterClause} ${containsFilter}
+      RETURN f
       LIMIT 5000
     `;
 
@@ -406,10 +406,9 @@ export class SearchService {
     let totalMatches = 0;
 
     for (const record of result.records) {
-      const node = record.get('n');
-      const labels = record.get('labels');
-      const content = node.properties._content as string;
-      const filePath = node.properties.absolutePath || node.properties.file || node.properties.path || '';
+      const fileNode = record.get('f');
+      const rawContent = fileNode.properties._rawContent as string;
+      const filePath = fileNode.properties.absolutePath || '';
 
       // Apply glob filter if specified
       if (glob && !this.matchGlob(filePath, glob)) {
@@ -417,16 +416,13 @@ export class SearchService {
       }
 
       // Split content into lines
-      const lines = content.split('\n');
+      const lines = rawContent.split('\n');
       const matches: GrepMatch[] = [];
-
-      // Get startLine from node to compute absolute line numbers
-      const startLine = (node.properties.startLine as number) || 1;
 
       // Reset regex for each file
       regex.lastIndex = 0;
 
-      // Search each line
+      // Search each line (1-indexed line numbers)
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         regex.lastIndex = 0;
@@ -434,7 +430,7 @@ export class SearchService {
 
         if (match) {
           const grepMatch: GrepMatch = {
-            line: startLine + i, // Absolute line number in original file
+            line: i + 1, // 1-indexed line number
             content: line,
             match: match[0],
           };
@@ -461,7 +457,7 @@ export class SearchService {
 
       if (matches.length > 0) {
         grepResults.push({
-          node: this.stripEmbeddingFields({ ...node.properties, labels }),
+          node: this.stripEmbeddingFields({ ...fileNode.properties, labels: fileNode.labels }),
           filePath,
           matches,
           totalLines: lines.length,
@@ -807,7 +803,11 @@ export class SearchService {
   }
 
   /**
-   * Resolve EmbeddingChunk matches to their parent nodes
+   * Resolve EmbeddingChunk matches to their parent nodes.
+   *
+   * For container types (class, interface, enum, namespace, module) whose _content
+   * is a "Members:" summary, use the parent's startLine/endLine instead of the chunk's
+   * (which would be wrong since they're relative to the summary, not the actual file).
    */
   private async resolveChunkMatches(
     chunkMatches: Map<string, { chunk: Record<string, any>; score: number; parentLabel: string }>,
@@ -824,6 +824,10 @@ export class SearchService {
       }
       byLabel.get(label)!.push(parentUuid);
     }
+
+    // Container types that have "Members:" summary in _content (from code-source-adapter.ts:3709)
+    // For these, chunk line numbers are relative to the summary, not the file
+    const containerTypes = new Set(['class', 'interface', 'enum', 'namespace', 'module']);
 
     // Fetch parent nodes
     for (const [label, parentUuids] of byLabel.entries()) {
@@ -842,21 +846,28 @@ export class SearchService {
           const chunk = match.chunk;
           const chunkScore = match.score;
 
+          // For container types, use parent's line range instead of chunk's
+          // because the chunk's line numbers are relative to the summary, not the file
+          const parentType = parentNode.type as string | undefined;
+          const useParentLineRange = parentType && containerTypes.has(parentType);
+
+          const matchedRange = {
+            startLine: useParentLineRange ? (parentNode.startLine ?? 1) : (chunk.startLine ?? 1),
+            endLine: useParentLineRange ? (parentNode.endLine ?? 1) : (chunk.endLine ?? 1),
+            startChar: useParentLineRange ? 0 : (chunk.startChar ?? 0),
+            endChar: useParentLineRange ? 0 : (chunk.endChar ?? 0),
+            chunkIndex: chunk.chunkIndex ?? 0,
+            chunkScore: chunkScore,
+            chunkText: chunk.text as string | undefined,
+            pageNum: chunk.pageNum as number | null | undefined,
+          };
+
           // Check if parent already exists - update score if chunk score is higher
           const existingIndex = uuidToIndex.get(parentUuid);
           if (existingIndex !== undefined) {
             if (chunkScore > allResults[existingIndex].score) {
               allResults[existingIndex].score = chunkScore;
-              allResults[existingIndex].matchedRange = {
-                startLine: chunk.startLine ?? 1,
-                endLine: chunk.endLine ?? 1,
-                startChar: chunk.startChar ?? 0,
-                endChar: chunk.endChar ?? 0,
-                chunkIndex: chunk.chunkIndex ?? 0,
-                chunkScore: chunkScore,
-                chunkText: chunk.text as string | undefined,
-                pageNum: chunk.pageNum as number | null | undefined,
-              };
+              allResults[existingIndex].matchedRange = matchedRange;
             }
             continue;
           }
@@ -866,16 +877,7 @@ export class SearchService {
             node: this.stripEmbeddingFields(parentNode),
             score: chunkScore,
             filePath: parentNode.absolutePath || parentNode.file || parentNode.path,
-            matchedRange: {
-              startLine: chunk.startLine ?? 1,
-              endLine: chunk.endLine ?? 1,
-              startChar: chunk.startChar ?? 0,
-              endChar: chunk.endChar ?? 0,
-              chunkIndex: chunk.chunkIndex ?? 0,
-              chunkScore: chunkScore,
-              chunkText: chunk.text as string | undefined,
-              pageNum: chunk.pageNum as number | null | undefined,
-            },
+            matchedRange,
           });
         }
       } catch (err: any) {
@@ -943,6 +945,8 @@ export class SearchService {
       });
 
       const allResults: ServiceSearchResult[] = [];
+      const chunkMatches = new Map<string, { chunk: Record<string, any>; score: number; parentLabel: string }>();
+      const uuidToIndex = new Map<string, number>();
 
       for (const record of result.records) {
         const node = record.get('n');
@@ -951,12 +955,32 @@ export class SearchService {
 
         if (minScore !== undefined && score < minScore) continue;
 
+        // Handle EmbeddingChunk: collect for later resolution to parent
+        if (node.labels.includes('EmbeddingChunk')) {
+          const parentUuid = rawNode.parentUuid;
+          const parentLabel = rawNode.parentLabel || 'Scope';
+          const existing = chunkMatches.get(parentUuid);
+          if (!existing || score > existing.score) {
+            chunkMatches.set(parentUuid, { chunk: rawNode, score, parentLabel });
+          }
+          continue;
+        }
+
+        uuidToIndex.set(rawNode.uuid, allResults.length);
         allResults.push({
           node: this.stripEmbeddingFields(rawNode),
           score,
           filePath: rawNode.absolutePath || rawNode.file || rawNode.path,
         });
       }
+
+      // Resolve EmbeddingChunk matches to parent nodes (same logic as vectorSearch)
+      if (chunkMatches.size > 0) {
+        await this.resolveChunkMatches(chunkMatches, uuidToIndex, allResults, params);
+      }
+
+      // Re-sort by score after adding chunk matches
+      allResults.sort((a, b) => b.score - a.score);
 
       return allResults;
     } catch (err: any) {

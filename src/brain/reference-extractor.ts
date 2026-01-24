@@ -34,6 +34,43 @@ export type RelationType =
   | 'MENTIONS_FILE'     // * → fichier mentionné (non résolu avec certitude)
   | 'PENDING_IMPORT';   // Non résolu
 
+/**
+ * File existence checker - can be disk-based or virtual (for GitHub ingestion)
+ * Returns true if the file exists at the given absolute path
+ */
+export type FileExistenceChecker = (absolutePath: string) => Promise<boolean>;
+
+/**
+ * Default disk-based file existence checker using fs.access
+ */
+export const diskFileChecker: FileExistenceChecker = async (absolutePath: string) => {
+  try {
+    await fs.access(absolutePath);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Create a virtual file existence checker from a Set of known file paths
+ * Used for GitHub/virtual ingestion where files don't exist on disk
+ */
+export function createVirtualFileChecker(knownPaths: Set<string>): FileExistenceChecker {
+  return async (absolutePath: string) => {
+    // Check exact match
+    if (knownPaths.has(absolutePath)) return true;
+    // Check with/without leading slash
+    if (knownPaths.has('/' + absolutePath)) return true;
+    if (absolutePath.startsWith('/') && knownPaths.has(absolutePath.slice(1))) return true;
+    // Check if path ends with any known path (for partial matching)
+    for (const known of knownPaths) {
+      if (absolutePath.endsWith(known) || known.endsWith(absolutePath)) return true;
+    }
+    return false;
+  };
+}
+
 export interface ExtractedReference {
   /** Source brute (e.g., "./utils", "../styles/main.css", "https://example.com") */
   source: string;
@@ -1099,10 +1136,15 @@ function isLocalImport(source: string): boolean {
 /**
  * Try to resolve a path with common extensions
  * Handles TypeScript ESM convention where imports use .js but files are .ts
+ *
+ * @param source - Import source path (e.g., "./utils", "../lib/helper.js")
+ * @param baseDir - Base directory to resolve from
+ * @param fileChecker - Function to check if file exists (disk or virtual)
  */
 async function resolveWithExtensions(
   source: string,
-  baseDir: string
+  baseDir: string,
+  fileChecker: FileExistenceChecker = diskFileChecker
 ): Promise<string | null> {
   const ext = path.extname(source);
 
@@ -1111,28 +1153,22 @@ async function resolveWithExtensions(
     const fullPath = path.resolve(baseDir, source);
 
     // Try the exact path first
-    try {
-      await fs.access(fullPath);
+    if (await fileChecker(fullPath)) {
       return fullPath;
-    } catch {
-      // TypeScript ESM: imports use .js but files are .ts/.tsx
-      if (ext === '.js' || ext === '.jsx') {
-        const tsExt = ext === '.js' ? '.ts' : '.tsx';
-        const tsPath = fullPath.replace(/\.(js|jsx)$/, tsExt);
-        try {
-          await fs.access(tsPath);
-          return tsPath;
-        } catch {
-          // Also try .tsx for .js imports
-          if (ext === '.js') {
-            const tsxPath = fullPath.replace(/\.js$/, '.tsx');
-            try {
-              await fs.access(tsxPath);
-              return tsxPath;
-            } catch {
-              // Fall through to extension search
-            }
-          }
+    }
+
+    // TypeScript ESM: imports use .js but files are .ts/.tsx
+    if (ext === '.js' || ext === '.jsx') {
+      const tsExt = ext === '.js' ? '.ts' : '.tsx';
+      const tsPath = fullPath.replace(/\.(js|jsx)$/, tsExt);
+      if (await fileChecker(tsPath)) {
+        return tsPath;
+      }
+      // Also try .tsx for .js imports
+      if (ext === '.js') {
+        const tsxPath = fullPath.replace(/\.js$/, '.tsx');
+        if (await fileChecker(tsxPath)) {
+          return tsxPath;
         }
       }
     }
@@ -1142,22 +1178,16 @@ async function resolveWithExtensions(
   const basePath = ext ? source.slice(0, -ext.length) : source;
   for (const codeExt of CODE_EXTENSIONS) {
     const fullPath = path.resolve(baseDir, basePath + codeExt);
-    try {
-      await fs.access(fullPath);
+    if (await fileChecker(fullPath)) {
       return fullPath;
-    } catch {
-      // Continue trying
     }
   }
 
   // Try as directory with index file
   for (const indexFile of INDEX_FILES) {
     const fullPath = path.resolve(baseDir, basePath, indexFile);
-    try {
-      await fs.access(fullPath);
+    if (await fileChecker(fullPath)) {
       return fullPath;
-    } catch {
-      // Continue trying
     }
   }
 
@@ -1166,18 +1196,24 @@ async function resolveWithExtensions(
 
 /**
  * Resolve a reference to an absolute path
+ *
+ * @param ref - Extracted reference to resolve
+ * @param sourceFilePath - Path of the file containing the reference
+ * @param projectPath - Root path of the project
+ * @param fileChecker - Optional file existence checker (defaults to disk-based)
  */
 export async function resolveReference(
   ref: ExtractedReference,
   sourceFilePath: string,
-  projectPath: string
+  projectPath: string,
+  fileChecker: FileExistenceChecker = diskFileChecker
 ): Promise<ResolvedReference | null> {
   if (!ref.isLocal) {
     return null; // Skip external packages
   }
 
   const sourceDir = path.dirname(sourceFilePath);
-  const absolutePath = await resolveWithExtensions(ref.source, sourceDir);
+  const absolutePath = await resolveWithExtensions(ref.source, sourceDir, fileChecker);
 
   if (!absolutePath) {
     return null; // Cannot resolve
@@ -1216,16 +1252,22 @@ export async function resolveReference(
 
 /**
  * Resolve all references from a file
+ *
+ * @param refs - Array of extracted references
+ * @param sourceFilePath - Path of the file containing the references
+ * @param projectPath - Root path of the project
+ * @param fileChecker - Optional file existence checker (defaults to disk-based)
  */
 export async function resolveAllReferences(
   refs: ExtractedReference[],
   sourceFilePath: string,
-  projectPath: string
+  projectPath: string,
+  fileChecker: FileExistenceChecker = diskFileChecker
 ): Promise<ResolvedReference[]> {
   const resolved: ResolvedReference[] = [];
 
   for (const ref of refs) {
-    const result = await resolveReference(ref, sourceFilePath, projectPath);
+    const result = await resolveReference(ref, sourceFilePath, projectPath, fileChecker);
     if (result) {
       resolved.push(result);
     }

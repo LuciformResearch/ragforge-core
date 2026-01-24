@@ -32,7 +32,7 @@ import { EntityExtractionClient } from './entity-extraction/client.js';
 import { createEntityExtractionTransform } from './entity-extraction/transform.js';
 import type { NodeState } from './state-types.js';
 import { type ErrorType } from '../brain/file-state-machine.js';
-import { resolvePendingImports } from '../brain/reference-extractor.js';
+import { resolvePendingImports, createVirtualFileChecker } from '../brain/reference-extractor.js';
 import {
   type IContentProvider,
   type ContentSourceType,
@@ -2289,6 +2289,13 @@ export class UnifiedProcessor {
       this.fileProcessor.setParserOptions(options.parserOptions);
     }
 
+    // 3b. Create virtual file checker from all file paths (for reference resolution)
+    // Without this, fs.access would fail for virtual paths like /virtual/xxx/github.com/...
+    const allVirtualPaths = new Set<string>(files.map(f => f.path));
+    const virtualFileChecker = createVirtualFileChecker(allVirtualPaths);
+    this.fileProcessor.setFileChecker(virtualFileChecker);
+    console.log(`[UnifiedProcessor] Set virtual file checker with ${allVirtualPaths.size} known paths`);
+
     // 4. Process through normal pipeline (discovered → parsed → linked)
     // The VirtualContentProvider will read from _rawContent
     const discoveredStats = await this.processDiscovered();
@@ -2313,7 +2320,10 @@ export class UnifiedProcessor {
       this.fileProcessor.setParserOptions(this.parserOptions);
     }
 
-    // 6. Propagate additional properties to all child nodes (Scope, etc.)
+    // 6b. Reset file checker (restore to disk-based for non-virtual processing)
+    this.fileProcessor.setFileChecker(undefined);
+
+    // 7. Propagate additional properties to all child nodes (Scope, etc.)
     if (options?.additionalProperties && Object.keys(options.additionalProperties).length > 0) {
       await this.propagatePropertiesToChildNodes(options.additionalProperties);
     }

@@ -74,6 +74,10 @@ export {
   createReferenceRelations,
   resolvePendingImports,
   resolveUnresolvedMentions,
+  // Virtual file support for reference resolution
+  diskFileChecker,
+  createVirtualFileChecker,
+  type FileExistenceChecker,
   type ReferenceType,
   type RelationType,
   type ExtractedReference,

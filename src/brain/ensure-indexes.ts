@@ -193,6 +193,7 @@ export const FULLTEXT_LABELS = [
   'DataSection',
   'WebDocument',
   'Entity',
+  'EmbeddingChunk',
 ] as const;
 
 /**
@@ -328,6 +329,7 @@ export async function ensureBaseIndexes(
 /**
  * Ensure fulltext index exists for unified search across all content types.
  * Uses the normalized _name, _content, _description properties.
+ * Also creates a dedicated fulltext index on File._rawContent for grep operations.
  */
 export async function ensureFulltextIndexes(
   neo4jClient: Neo4jClient,
@@ -340,6 +342,7 @@ export async function ensureFulltextIndexes(
     console.log('[Indexes] Ensuring fulltext indexes...');
   }
 
+  // Unified fulltext index on _name, _content, _description
   try {
     const labelsPart = FULLTEXT_LABELS.join('|');
     const query = `CREATE FULLTEXT INDEX unified_fulltext IF NOT EXISTS FOR (n:${labelsPart}) ON EACH [n._name, n._content, n._description]`;
@@ -359,6 +362,28 @@ export async function ensureFulltextIndexes(
     } else {
       stats.errors++;
       console.warn(`[Indexes] Fulltext index warning: ${err.message}`);
+    }
+  }
+
+  // Fulltext index on File._rawContent for grep operations
+  try {
+    const grepQuery = `CREATE FULLTEXT INDEX file_rawcontent_fulltext IF NOT EXISTS FOR (n:File) ON EACH [n._rawContent]`;
+
+    await neo4jClient.run(grepQuery);
+    stats.created++;
+
+    if (verbose) {
+      console.log('[Indexes] File _rawContent fulltext index ensured');
+    }
+  } catch (err: any) {
+    if (err.message?.includes('already exists') || err.message?.includes('equivalent index')) {
+      stats.skipped++;
+      if (verbose) {
+        console.log('[Indexes] File _rawContent fulltext index already exists');
+      }
+    } else {
+      stats.errors++;
+      console.warn(`[Indexes] File _rawContent fulltext index warning: ${err.message}`);
     }
   }
 
