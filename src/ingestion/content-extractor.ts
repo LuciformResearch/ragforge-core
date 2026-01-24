@@ -256,10 +256,13 @@ export class ContentExtractor {
     chunking: ChunkingConfig | undefined,
     options: ExtractOptions
   ): ChunkOptions {
+    // Convert old config format to new line-based chunking
+    // Old: chunkSize (chars), overlap (chars)
+    // New: maxChars, maxLines, overlapLines
     return {
-      chunkSize: options.chunkSize ?? chunking?.maxSize ?? 2000,
-      overlap: options.overlap ?? chunking?.overlap ?? 200,
-      strategy: chunking?.strategy === 'code' ? 'fixed' : chunking?.strategy ?? 'paragraph',
+      maxChars: options.chunkSize ?? chunking?.maxSize ?? 1500,
+      maxLines: 30,
+      overlapLines: 5,
     };
   }
 

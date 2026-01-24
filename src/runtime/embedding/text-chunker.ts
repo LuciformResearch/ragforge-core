@@ -1,19 +1,24 @@
 /**
  * Text Chunker for Embedding
  *
- * Splits large text into overlapping chunks for better embedding coverage.
- * Uses paragraph and sentence boundaries for natural splits.
+ * Simple line-based chunking optimized for code.
+ * Respects both character and line limits for TEI compatibility.
+ *
+ * TEI model limits (BAAI/bge-base-en-v1.5):
+ * - max_input_length: 512 tokens
+ * - ~4 chars per token = ~2048 chars max
+ * - Using 1500 chars for safe margin
  */
 
 export interface ChunkOptions {
-  /** Target chunk size in characters (default: 2000) */
-  chunkSize?: number;
-  /** Overlap between chunks in characters (default: 200) */
-  overlap?: number;
-  /** Minimum chunk size to keep (default: 100) */
+  /** Maximum lines per chunk (default: 30) */
+  maxLines?: number;
+  /** Maximum characters per chunk (default: 1500) */
+  maxChars?: number;
+  /** Number of lines to overlap between chunks (default: 5) */
+  overlapLines?: number;
+  /** Minimum chunk size in chars to keep (default: 50) */
   minChunkSize?: number;
-  /** Strategy for splitting: 'paragraph' | 'sentence' | 'fixed' (default: 'paragraph') */
-  strategy?: 'paragraph' | 'sentence' | 'fixed';
 }
 
 export interface TextChunk {
@@ -31,280 +36,134 @@ export interface TextChunk {
   endLine: number;
 }
 
-const DEFAULT_CHUNK_SIZE = 2000;
-const DEFAULT_OVERLAP = 200;
-const DEFAULT_MIN_CHUNK_SIZE = 100;
+const DEFAULT_MAX_LINES = 30;
+const DEFAULT_MAX_CHARS = 1500;
+const DEFAULT_OVERLAP_LINES = 5;
+const DEFAULT_MIN_CHUNK_SIZE = 50;
 
 /**
- * Build a map of character position to line number
- */
-function buildLineMap(text: string): { charToLine: number[]; lineStarts: number[] } {
-  const charToLine: number[] = new Array(text.length + 1);
-  const lineStarts: number[] = [0];
-  let currentLine = 1;
-
-  for (let i = 0; i < text.length; i++) {
-    charToLine[i] = currentLine;
-    if (text[i] === '\n') {
-      currentLine++;
-      lineStarts.push(i + 1);
-    }
-  }
-  charToLine[text.length] = currentLine;
-
-  return { charToLine, lineStarts };
-}
-
-/**
- * Get line number for a character position
- */
-function getLineForChar(charPos: number, charToLine: number[]): number {
-  return charToLine[Math.min(charPos, charToLine.length - 1)] || 1;
-}
-
-/**
- * Split text into overlapping chunks using natural boundaries
+ * Split text into overlapping chunks respecting both line and char limits.
+ * Optimized for code - uses line boundaries for clean splits.
  */
 export function chunkText(text: string, options: ChunkOptions = {}): TextChunk[] {
   const {
-    chunkSize = DEFAULT_CHUNK_SIZE,
-    overlap = DEFAULT_OVERLAP,
+    maxLines = DEFAULT_MAX_LINES,
+    maxChars = DEFAULT_MAX_CHARS,
+    overlapLines = DEFAULT_OVERLAP_LINES,
     minChunkSize = DEFAULT_MIN_CHUNK_SIZE,
-    strategy = 'paragraph',
   } = options;
 
-  // Build line mapping for the entire text
-  const { charToLine } = buildLineMap(text);
+  // Split text into lines, then split any super-long lines by maxChars
+  const rawLines = text.split('\n');
+  const lines: string[] = [];
+  for (const line of rawLines) {
+    if (line.length > maxChars) {
+      // Force-split long line into chunks of maxChars
+      for (let pos = 0; pos < line.length; pos += maxChars) {
+        lines.push(line.slice(pos, pos + maxChars));
+      }
+    } else {
+      lines.push(line);
+    }
+  }
+  const totalLines = lines.length;
 
-  // If text is small enough, return as single chunk
-  if (text.length <= chunkSize) {
-    const endLine = getLineForChar(text.length, charToLine);
+  // If text fits in one chunk, return as-is
+  if (text.length <= maxChars && totalLines <= maxLines) {
     return [{
       text,
       index: 0,
       startChar: 0,
       endChar: text.length,
       startLine: 1,
-      endLine,
+      endLine: totalLines,
     }];
   }
 
-  // Split into segments based on strategy
-  const segments = splitIntoSegments(text, strategy);
-
-  // Build chunks from segments with overlap
-  const rawChunks = buildChunksFromSegments(segments, {
-    chunkSize,
-    overlap,
-    minChunkSize,
-  });
-
-  // Add line numbers to chunks
-  return rawChunks.map(chunk => ({
-    ...chunk,
-    startLine: getLineForChar(chunk.startChar, charToLine),
-    endLine: getLineForChar(chunk.endChar - 1, charToLine), // -1 because endChar is exclusive
-  }));
-}
-
-/**
- * Split text into natural segments (paragraphs or sentences)
- */
-function splitIntoSegments(text: string, strategy: 'paragraph' | 'sentence' | 'fixed'): string[] {
-  if (strategy === 'fixed') {
-    // Just return the whole text, will be split by size later
-    return [text];
+  // Build line start positions for char offset calculation
+  const lineStartChars: number[] = [0];
+  for (let i = 0; i < lines.length; i++) {
+    lineStartChars.push(lineStartChars[i] + lines[i].length + 1); // +1 for \n
   }
 
-  if (strategy === 'paragraph') {
-    // Split by double newlines (paragraphs)
-    const paragraphs = text.split(/\n\s*\n/);
+  const chunks: TextChunk[] = [];
+  let lineIdx = 0;
 
-    // If paragraphs are still too large, split them into sentences
-    const result: string[] = [];
-    for (const para of paragraphs) {
-      if (para.length > DEFAULT_CHUNK_SIZE * 1.5) {
-        // Split large paragraph into sentences
-        result.push(...splitIntoSentences(para));
-      } else if (para.trim()) {
-        result.push(para);
+  while (lineIdx < totalLines) {
+    const chunkStartLine = lineIdx;
+    const chunkStartChar = lineStartChars[lineIdx];
+    let chunkLines: string[] = [];
+    let chunkChars = 0;
+
+    // Add lines until we hit a limit
+    while (lineIdx < totalLines && chunkLines.length < maxLines) {
+      const line = lines[lineIdx];
+      const lineLen = line.length + (lineIdx < totalLines - 1 ? 1 : 0); // +1 for \n except last
+
+      // Check if adding this line would exceed char limit
+      if (chunkChars + lineLen > maxChars && chunkLines.length > 0) {
+        break;
       }
+
+      chunkLines.push(line);
+      chunkChars += lineLen;
+      lineIdx++;
     }
-    return result;
-  }
 
-  // Sentence strategy
-  return splitIntoSentences(text);
-}
-
-/**
- * Split text into sentences.
- * Handles: . ! ? followed by space or newline.
- * Avoids splitting on: abbreviations, decimals, URLs.
- * Combines very short sentences (< 100 chars).
- */
-export function splitIntoSentences(text: string): string[] {
-  // Regex to split on sentence boundaries while preserving the delimiter
-  // Handles: . ! ? followed by space or newline
-  // Avoids splitting on: abbreviations (Mr., Dr., etc.), decimals, URLs
-  const sentenceRegex = /(?<=[.!?])\s+(?=[A-Z])|(?<=[.!?])\s*\n/g;
-
-  const sentences = text.split(sentenceRegex);
-
-  // Filter empty and combine very short sentences
-  const result: string[] = [];
-  let buffer = '';
-
-  for (const sentence of sentences) {
-    const trimmed = sentence.trim();
-    if (!trimmed) continue;
-
-    if (buffer.length + trimmed.length < 100) {
-      // Combine short sentences
-      buffer = buffer ? `${buffer} ${trimmed}` : trimmed;
-    } else {
-      if (buffer) {
-        result.push(buffer);
-      }
-      buffer = trimmed;
-    }
-  }
-
-  if (buffer) {
-    result.push(buffer);
-  }
-
-  return result;
-}
-
-/** Raw chunk without line numbers (internal use) */
-interface RawChunk {
-  text: string;
-  index: number;
-  startChar: number;
-  endChar: number;
-}
-
-/**
- * Build overlapping chunks from segments
- */
-function buildChunksFromSegments(
-  segments: string[],
-  options: { chunkSize: number; overlap: number; minChunkSize: number }
-): RawChunk[] {
-  const { chunkSize, overlap, minChunkSize } = options;
-  const chunks: RawChunk[] = [];
-
-  let currentChunk = '';
-  let currentStartChar = 0;
-  let globalOffset = 0;
-
-  for (let i = 0; i < segments.length; i++) {
-    const segment = segments[i];
-    const segmentWithSpace = currentChunk ? '\n\n' + segment : segment;
-
-    // Check if adding this segment would exceed chunk size
-    if (currentChunk.length + segmentWithSpace.length > chunkSize && currentChunk.length >= minChunkSize) {
-      // Save current chunk
+    // Create chunk
+    const chunkText = chunkLines.join('\n');
+    if (chunkText.length >= minChunkSize || chunks.length === 0) {
       chunks.push({
-        text: currentChunk,
+        text: chunkText,
         index: chunks.length,
-        startChar: currentStartChar,
-        endChar: currentStartChar + currentChunk.length,
+        startChar: chunkStartChar,
+        endChar: chunkStartChar + chunkText.length,
+        startLine: chunkStartLine + 1, // 1-based
+        endLine: chunkStartLine + chunkLines.length, // 1-based
       });
-
-      // Start new chunk with overlap
-      // Find overlap text from the end of current chunk
-      const overlapText = getOverlapText(currentChunk, overlap);
-      currentStartChar = currentStartChar + currentChunk.length - overlapText.length;
-      currentChunk = overlapText + (overlapText ? '\n\n' : '') + segment;
-    } else {
-      // Add segment to current chunk
-      currentChunk += segmentWithSpace;
     }
 
-    globalOffset += segment.length + (i < segments.length - 1 ? 2 : 0); // +2 for \n\n
-  }
-
-  // Don't forget the last chunk
-  if (currentChunk.length >= minChunkSize) {
-    chunks.push({
-      text: currentChunk,
-      index: chunks.length,
-      startChar: currentStartChar,
-      endChar: currentStartChar + currentChunk.length,
-    });
-  } else if (chunks.length > 0) {
-    // Append to previous chunk if too small
-    const lastChunk = chunks[chunks.length - 1];
-    lastChunk.text += '\n\n' + currentChunk;
-    lastChunk.endChar = lastChunk.startChar + lastChunk.text.length;
-  } else if (currentChunk.trim()) {
-    // Even if small, keep it if it's the only content
-    chunks.push({
-      text: currentChunk,
-      index: 0,
-      startChar: 0,
-      endChar: currentChunk.length,
-    });
+    // Apply overlap: go back N lines for next chunk
+    // But don't go back if we're at the end
+    if (lineIdx < totalLines) {
+      lineIdx = Math.max(chunkStartLine + 1, lineIdx - overlapLines);
+    }
   }
 
   return chunks;
 }
 
 /**
- * Get overlap text from the end of a chunk
- * Tries to break at natural boundaries (sentence, paragraph)
+ * Check if text needs chunking based on size thresholds
  */
-function getOverlapText(text: string, targetLength: number): string {
-  if (text.length <= targetLength) {
-    return text;
-  }
-
-  // Start from the position where we want overlap to begin
-  const startPos = text.length - targetLength;
-  let overlapStart = startPos;
-
-  // Look for natural break points after startPos
-  // Priority: paragraph > sentence > word
-
-  // Look for paragraph break
-  const paragraphBreak = text.indexOf('\n\n', startPos);
-  if (paragraphBreak !== -1 && paragraphBreak < startPos + targetLength / 2) {
-    overlapStart = paragraphBreak + 2;
-  } else {
-    // Look for sentence break
-    const sentenceMatch = text.slice(startPos).match(/[.!?]\s+/);
-    if (sentenceMatch && sentenceMatch.index !== undefined) {
-      overlapStart = startPos + sentenceMatch.index + sentenceMatch[0].length;
-    } else {
-      // Look for word break
-      const wordBreak = text.indexOf(' ', startPos);
-      if (wordBreak !== -1) {
-        overlapStart = wordBreak + 1;
-      }
-    }
-  }
-
-  return text.slice(overlapStart);
-}
-
-/**
- * Check if text needs chunking based on size threshold
- */
-export function needsChunking(text: string, threshold: number = DEFAULT_CHUNK_SIZE): boolean {
-  return text.length > threshold;
+export function needsChunking(
+  text: string,
+  maxChars: number = DEFAULT_MAX_CHARS,
+  maxLines: number = DEFAULT_MAX_LINES
+): boolean {
+  if (text.length > maxChars) return true;
+  const lineCount = text.split('\n').length;
+  return lineCount > maxLines;
 }
 
 /**
  * Estimate number of chunks for a text
  */
 export function estimateChunkCount(
-  textLength: number,
-  chunkSize: number = DEFAULT_CHUNK_SIZE,
-  overlap: number = DEFAULT_OVERLAP
+  text: string,
+  maxLines: number = DEFAULT_MAX_LINES,
+  overlapLines: number = DEFAULT_OVERLAP_LINES
 ): number {
-  if (textLength <= chunkSize) return 1;
-  const effectiveSize = chunkSize - overlap;
-  return Math.ceil((textLength - overlap) / effectiveSize);
+  const totalLines = text.split('\n').length;
+  if (totalLines <= maxLines) return 1;
+  const effectiveLines = maxLines - overlapLines;
+  return Math.ceil((totalLines - overlapLines) / effectiveLines);
+}
+
+/**
+ * Legacy exports for backward compatibility
+ */
+export function splitIntoSentences(text: string): string[] {
+  const sentenceRegex = /(?<=[.!?])\s+(?=[A-Z])|(?<=[.!?])\s*\n/g;
+  return text.split(sentenceRegex).filter(s => s.trim());
 }

@@ -98,7 +98,9 @@ export interface FormatOptions {
   includeSource?: boolean;
   /** Maximum number of results to include source for (default: 5) */
   maxSourceResults?: number;
-  /** Maximum lines of source to show per result (default: 20) */
+  /** Maximum lines of source for top 2 results (default: 60) */
+  maxSourceLinesTop?: number;
+  /** Maximum lines of source for other results (default: 20) */
   maxSourceLines?: number;
   /** Include the graph as ASCII tree (default: true) */
   includeGraph?: boolean;
@@ -121,6 +123,7 @@ export function formatAsMarkdown(
   const {
     includeSource = true,
     maxSourceResults = 5,
+    maxSourceLinesTop = 60,
     maxSourceLines = 20,
     includeGraph = true,
     maxGraphDepth = 2,
@@ -189,14 +192,50 @@ export function formatAsMarkdown(
       const content = getNodeContent(node, nodeType);
       if (content) {
         const contentLines = content.split('\n');
-        const truncatedContent = contentLines.slice(0, maxSourceLines).join('\n');
+        // Top 2 results get more lines
+        const linesToShow = i < 2 ? maxSourceLinesTop : maxSourceLines;
         // Detect language from file path, fallback to node.language
         const lang = detectLanguage(result.filePath || node.file || node.absolutePath) || node.language || '';
         lines.push('');
         lines.push('```' + lang);
-        lines.push(truncatedContent);
-        if (contentLines.length > maxSourceLines) {
-          lines.push(`... (${contentLines.length - maxSourceLines} more lines)`);
+
+        // If we have a matchedRange from a chunk match, show signature + matched chunk
+        if (result.matchedRange && result.matchedRange.startLine) {
+          const nodeStartLine = node.startLine || 1;
+          const chunkStartLine = result.matchedRange.startLine;
+          const chunkEndLine = result.matchedRange.endLine || chunkStartLine + linesToShow;
+
+          // Calculate line indices relative to content (0-indexed)
+          const chunkStartIdx = chunkStartLine - nodeStartLine;
+          const chunkEndIdx = chunkEndLine - nodeStartLine + 1;
+
+          if (chunkStartIdx > 3) {
+            // Show full signature (_name) if available, otherwise first 3 lines
+            const signature = node._name || node.name || contentLines.slice(0, 3).join('\n');
+            lines.push(signature);
+            const signatureLineCount = signature.split('\n').length;
+            lines.push(`\n... (lines ${nodeStartLine + signatureLineCount}-${chunkStartLine - 1} omitted)\n`);
+            // Show the matched chunk
+            const chunkContent = contentLines.slice(chunkStartIdx, Math.min(chunkEndIdx, chunkStartIdx + linesToShow));
+            lines.push(chunkContent.join('\n'));
+            if (chunkEndIdx < contentLines.length) {
+              lines.push(`... (${contentLines.length - chunkEndIdx} more lines)`);
+            }
+          } else {
+            // Chunk is near the start, show normally
+            const truncatedContent = contentLines.slice(0, linesToShow).join('\n');
+            lines.push(truncatedContent);
+            if (contentLines.length > linesToShow) {
+              lines.push(`... (${contentLines.length - linesToShow} more lines)`);
+            }
+          }
+        } else {
+          // No matchedRange, show from beginning
+          const truncatedContent = contentLines.slice(0, linesToShow).join('\n');
+          lines.push(truncatedContent);
+          if (contentLines.length > linesToShow) {
+            lines.push(`... (${contentLines.length - linesToShow} more lines)`);
+          }
         }
         lines.push('```');
       }

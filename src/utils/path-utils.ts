@@ -173,3 +173,72 @@ export const resolvePath = path.resolve;
  * Get directory name (just a re-export for convenience)
  */
 export const getDirName = path.dirname;
+
+/**
+ * Get relative path from one file/directory to another.
+ * Useful for displaying dependencies relative to their source file.
+ *
+ * @param from - Source directory (or file, will use its directory)
+ * @param to - Target file path
+ * @returns Relative path like './file.ts' or '../other/file.ts'
+ *
+ * @example
+ * getRelativePath('/github.com/org/repo/src/api/server.ts', '/github.com/org/repo/src/api/utils.ts')
+ * // => './utils.ts'
+ *
+ * getRelativePath('/github.com/org/repo/src/api/server.ts', '/github.com/org/repo/src/lib/helper.ts')
+ * // => '../lib/helper.ts'
+ *
+ * getRelativePath('/github.com/org/repo/src/api/', '/github.com/org/repo/src/api/utils.ts')
+ * // => './utils.ts'
+ */
+export function getRelativePath(from: string, to: string): string {
+  // Normalize to Unix paths for consistent comparison
+  const fromUnix = toUnixPath(from);
+  const toUnix = toUnixPath(to);
+
+  // Get directory of 'from' (if it's a file, get its parent)
+  const fromDir = fromUnix.endsWith('/') ? fromUnix.slice(0, -1) : getDirName(fromUnix);
+  const fromParts = fromDir.split('/').filter(Boolean);
+  const toParts = toUnix.split('/').filter(Boolean);
+
+  // Find common prefix length
+  let commonLen = 0;
+  while (
+    commonLen < fromParts.length &&
+    commonLen < toParts.length &&
+    fromParts[commonLen] === toParts[commonLen]
+  ) {
+    commonLen++;
+  }
+
+  // Build relative path
+  const upCount = fromParts.length - commonLen;
+  const remaining = toParts.slice(commonLen);
+
+  if (upCount === 0 && remaining.length > 0) {
+    return './' + remaining.join('/');
+  } else if (upCount > 0) {
+    return '../'.repeat(upCount) + remaining.join('/');
+  }
+
+  // Same directory or fallback
+  return './' + getFileName(to);
+}
+
+/**
+ * Get a short directory context string for display.
+ * Shows the last N segments of a directory path.
+ *
+ * @param dirPath - Full directory path
+ * @param segments - Number of segments to show (default: 2)
+ * @returns Short context like 'api/server' or 'src/utils'
+ *
+ * @example
+ * getShortDirContext('/github.com/org/repo/src/api/handlers')
+ * // => 'api/handlers'
+ */
+export function getShortDirContext(dirPath: string, segments: number = 2): string {
+  const parts = splitPath(dirPath);
+  return parts.slice(-segments).join('/');
+}

@@ -99,6 +99,10 @@ export interface SearchOptions {
   /** Regex patterns to exclude from results (applied to file path) */
   excludePatterns?: string[];
 
+  // Internal filters (not exposed in API)
+  /** Filter to specific node UUIDs (for dependency graph filtering) */
+  uuids?: string[];
+
   // Class boosting
   /**
    * Boost classes in results to surface them higher.
@@ -260,7 +264,7 @@ export class SearchService {
     const { filterClause: baseFilterClause, filterParams } = this.buildFilterClause(options.filters || []);
 
     // Combine with raw filter clause if provided
-    const filterClause = options.rawFilterClause
+    let filterClause = options.rawFilterClause
       ? `${baseFilterClause} ${options.rawFilterClause}`
       : baseFilterClause;
 
@@ -270,6 +274,12 @@ export class SearchService {
       limit: neo4j.int(limit),
       offset: neo4j.int(offset),
     };
+
+    // Add UUID filter if provided (for dependency graph filtering)
+    if (options.uuids && options.uuids.length > 0) {
+      filterClause += ' AND n.uuid IN $filterUuids';
+      params.filterUuids = options.uuids;
+    }
 
     let results: ServiceSearchResult[];
 
@@ -762,13 +772,20 @@ export class SearchService {
 
         // Handle EmbeddingChunk: collect for later normalization
         if (label === 'EmbeddingChunk') {
+          const parentLabel = rawNode.parentLabel;
+
+          // If labels filter is specified, only include chunks whose parent is in allowed labels
+          if (options.labels && options.labels.length > 0 && !options.labels.includes(parentLabel)) {
+            continue;
+          }
+
           const parentUuid = rawNode.parentUuid;
           const existing = chunkMatches.get(parentUuid);
           if (!existing || score > existing.score) {
             chunkMatches.set(parentUuid, {
               chunk: rawNode,
               score,
-              parentLabel: rawNode.parentLabel,
+              parentLabel,
             });
           }
           continue;
@@ -862,12 +879,18 @@ export class SearchService {
             pageNum: chunk.pageNum as number | null | undefined,
           };
 
-          // Check if parent already exists - update score if chunk score is higher
+          // Check if parent already exists
           const existingIndex = uuidToIndex.get(parentUuid);
           if (existingIndex !== undefined) {
-            if (chunkScore > allResults[existingIndex].score) {
-              allResults[existingIndex].score = chunkScore;
-              allResults[existingIndex].matchedRange = matchedRange;
+            // Always set matchedRange if we found a chunk (even if parent has higher score)
+            // This shows which part of the code matched the query
+            const existing = allResults[existingIndex];
+            if (!existing.matchedRange || chunkScore > (existing.matchedRange.chunkScore ?? 0)) {
+              existing.matchedRange = matchedRange;
+            }
+            // Update overall score if chunk score is higher
+            if (chunkScore > existing.score) {
+              existing.score = chunkScore;
             }
             continue;
           }
@@ -957,8 +980,14 @@ export class SearchService {
 
         // Handle EmbeddingChunk: collect for later resolution to parent
         if (node.labels.includes('EmbeddingChunk')) {
-          const parentUuid = rawNode.parentUuid;
           const parentLabel = rawNode.parentLabel || 'Scope';
+
+          // If labels filter is specified, only include chunks whose parent is in allowed labels
+          if (labels && labels.length > 0 && !labels.includes(parentLabel)) {
+            continue;
+          }
+
+          const parentUuid = rawNode.parentUuid;
           const existing = chunkMatches.get(parentUuid);
           if (!existing || score > existing.score) {
             chunkMatches.set(parentUuid, { chunk: rawNode, score, parentLabel });

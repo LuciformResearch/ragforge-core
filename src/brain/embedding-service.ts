@@ -32,20 +32,11 @@ import {
 import { DEFAULT_SKIP_EMBEDDING_TYPES } from '../ingestion/entity-extraction/client.js';
 
 /**
- * Threshold for chunking large content (in characters)
- * Content larger than this will be split into overlapping chunks
+ * Chunking is handled by text-chunker.ts with these defaults:
+ * - maxChars: 1500 (TEI limit: 512 tokens ≈ 2000 chars)
+ * - maxLines: 30 (better semantic coherence for code)
+ * - overlapLines: 5
  */
-const CHUNKING_THRESHOLD = 3000;
-
-/**
- * Chunk size for embeddings (target size per chunk)
- */
-const EMBEDDING_CHUNK_SIZE = 2000;
-
-/**
- * Overlap between chunks for context continuity
- */
-const EMBEDDING_CHUNK_OVERLAP = 200;
 
 /**
  * Named embedding types for semantic search
@@ -1549,8 +1540,8 @@ export class EmbeddingService {
         const providerMismatch = hasExistingEmbedding && existingProvider !== currentProvider;
         const modelMismatch = hasExistingEmbedding && existingModel !== currentModel;
 
-        // For content: check if needs chunking
-        if (isContentEmbedding && needsChunking(rawText, CHUNKING_THRESHOLD)) {
+        // For content: check if needs chunking (1500 chars or 30 lines)
+        if (isContentEmbedding && needsChunking(rawText)) {
           // Large content - create chunk tasks
           const text = rawText; // Don't truncate for chunking
           const hash = hashContent(text);
@@ -1582,12 +1573,8 @@ export class EmbeddingService {
           const textPreview = rawText.substring(0, 60).replace(/\n/g, ' ');
           console.log(`[EmbeddingService] Need embed (chunked): ${label}.${embeddingType} "${textPreview}..." (${reason})`);
 
-          // Create chunks
-          const chunks = chunkText(rawText, {
-            chunkSize: EMBEDDING_CHUNK_SIZE,
-            overlap: EMBEDDING_CHUNK_OVERLAP,
-            strategy: 'paragraph',
-          });
+          // Create chunks (line-based with char limit)
+          const chunks = chunkText(rawText);
 
           chunkedNodeUuids.add(uuid);
 

@@ -27,6 +27,9 @@ export interface TEIProviderOptions {
   truncate?: boolean;
 }
 
+// Rough estimate: 1 token ≈ 4 chars for code (conservative)
+const CHARS_PER_TOKEN = 4;
+
 export class TEIEmbeddingProvider {
   private baseUrl: string;
   private batchSize: number;
@@ -34,6 +37,8 @@ export class TEIEmbeddingProvider {
   private timeout: number;
   private truncate: boolean;
   private modelInfo: { model_id?: string; max_input_length?: number } | null = null;
+  private modelInfoFetched = false;
+  private truncationWarnings = 0;
 
   constructor(options: TEIProviderOptions = {}) {
     this.baseUrl = options.baseUrl || 'http://localhost:8081';
@@ -41,6 +46,35 @@ export class TEIEmbeddingProvider {
     this.concurrency = options.concurrency ?? 5;
     this.timeout = options.timeout ?? 30000;
     this.truncate = options.truncate ?? true;
+  }
+
+  /**
+   * Get max input length in tokens (fetches from TEI if not cached)
+   */
+  async getMaxInputLength(): Promise<number> {
+    if (!this.modelInfoFetched) {
+      await this.fetchModelInfo();
+    }
+    return this.modelInfo?.max_input_length ?? 512;
+  }
+
+  /**
+   * Fetch model info from TEI server
+   */
+  private async fetchModelInfo(): Promise<void> {
+    if (this.modelInfoFetched) return;
+    try {
+      const response = await fetch(`${this.baseUrl}/info`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.ok) {
+        this.modelInfo = await response.json() as { model_id?: string; max_input_length?: number };
+      }
+    } catch {
+      // Ignore - will use defaults
+    }
+    this.modelInfoFetched = true;
   }
 
   getProviderName(): string {
@@ -56,6 +90,29 @@ export class TEIEmbeddingProvider {
    * TEI endpoint: POST /embed with {"inputs": [...]}
    */
   private async embedBatch(texts: string[]): Promise<number[][]> {
+    // Fetch model info if not already done
+    if (!this.modelInfoFetched) {
+      await this.fetchModelInfo();
+    }
+
+    // Check for texts that will be truncated
+    const maxTokens = this.modelInfo?.max_input_length ?? 512;
+    const maxCharsEstimate = maxTokens * CHARS_PER_TOKEN;
+
+    for (const text of texts) {
+      if (text.length > maxCharsEstimate) {
+        this.truncationWarnings++;
+        if (this.truncationWarnings <= 5) {
+          console.warn(
+            `[TEI] ⚠️ Text will be truncated: ${text.length} chars > ~${maxCharsEstimate} chars (${maxTokens} tokens). ` +
+            `First 50 chars: "${text.slice(0, 50).replace(/\n/g, '\\n')}..."`
+          );
+        } else if (this.truncationWarnings === 6) {
+          console.warn(`[TEI] ⚠️ Suppressing further truncation warnings...`);
+        }
+      }
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeout);
 
